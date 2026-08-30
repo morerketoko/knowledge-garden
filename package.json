@@ -1,0 +1,17 @@
+{
+  "name": "knowledge-garden",
+  "version": "0.1.0",
+  "description": "Obsidian Knowledge Garden plugin (知识花园)",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs --watch",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.6.5",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,17 @@
+# Knowledge Garden 插件独立仓库 .gitignore
+# 重要：data.json 含用户本地 AI API Key，严禁推送
+data.json
+
+# 依赖与构建产物
+node_modules/
+*.log
+
+# 运行时缓存与损坏恢复文件
+cache/
+*.corrupt-*
+.tmp/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

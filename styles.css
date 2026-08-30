@@ -1,0 +1,402 @@
+/* Knowledge Garden — Phase 6 视觉系统。只使用 Obsidian 原生变量（亮暗主题自动兼容），全部样式限定在 .kg-dashboard 命名空间下（§5/6），不修改 Obsidian 全局 CSS。 */
+
+/* ---------- Visual Tokens（§6） ---------- */
+.kg-dashboard {
+  --kg-space-xs: 6px;
+  --kg-space-sm: 10px;
+  --kg-space-md: 16px;
+  --kg-space-lg: 24px;
+  --kg-space-xl: 36px;
+  --kg-card-radius: 16px;
+  --kg-card-blur: 14px;
+  --kg-content-width: 1480px;
+
+  height: 100%;
+  overflow-y: auto;
+}
+
+.kg-inner {
+  max-width: var(--kg-content-width);
+  margin: 0 auto;
+  padding: 24px 28px 80px;
+}
+
+/* 顶部工具条：仅保留刷新（Hero 承担标题/日期/设置，§14 保持简洁） */
+.kg-header {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--kg-space-xs);
+  margin-bottom: var(--kg-space-sm);
+}
+
+.kg-btn {
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 4px 12px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.kg-btn:hover { background: var(--interactive-hover); }
+.kg-btn:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 1px; }
+.kg-btn-primary { background: var(--interactive-accent); color: var(--text-on-accent); border-color: transparent; }
+.kg-btn-primary:hover { background: var(--interactive-accent-hover); }
+.kg-btn-icon { display: inline-flex; align-items: center; padding: 4px 8px; }
+.kg-btn.kg-loading { opacity: 0.6; pointer-events: none; }
+.kg-btn-on { background: var(--interactive-accent); color: var(--text-on-accent); border-color: transparent; }
+.kg-btn-on:hover { background: var(--interactive-accent-hover); }
+
+/* ---------- Hero（§8-14 / §71/72：clamp 高度不占满屏；纯主题背景兜底 §51） ---------- */
+.kg-hero {
+  position: relative;
+  height: clamp(260px, 34vh, 420px);
+  border-radius: var(--kg-card-radius);
+  overflow: hidden;
+  padding: 28px 30px;
+  margin-bottom: var(--kg-space-md);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background: linear-gradient(135deg, var(--background-secondary), var(--background-primary-alt));
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+}
+/* 遮罩（主题色，透明度由设置 0-0.8）+ 底部轻微渐变兜底（§13：0 时不至于文字看不清） */
+.kg-hero-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--background-primary);
+  pointer-events: none;
+}
+.kg-hero-shade {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 60%;
+  pointer-events: none;
+  background: linear-gradient(to top, color-mix(in srgb, var(--background-primary) 72%, transparent), transparent);
+}
+.kg-hero-title {
+  position: relative;
+  font-size: var(--font-ui-largest);
+  font-weight: 800;
+  line-height: 1.15;
+  padding-right: 140px; /* 右侧按钮区留白 */
+}
+.kg-hero-subtitle { position: relative; color: var(--text-muted); margin-top: 4px; padding-right: 140px; }
+.kg-hero-meta {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--kg-space-md);
+  margin-top: var(--kg-space-sm);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.kg-hero-actions {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  display: flex;
+  gap: var(--kg-space-xs);
+  z-index: 2;
+}
+.kg-hero-actions .kg-btn {
+  background: color-mix(in srgb, var(--background-primary) 80%, transparent);
+  backdrop-filter: blur(var(--kg-card-blur)) saturate(1.1);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .kg-hero-actions .kg-btn { background: var(--background-primary); }
+}
+
+/* ---------- 音乐播放器（§15-24：Hero 下方玻璃条；§42 fallback） ---------- */
+.kg-music {
+  display: flex;
+  align-items: center;
+  gap: var(--kg-space-md);
+  padding: 10px 16px;
+  margin: 4px 0 var(--kg-space-xl);
+  border-radius: var(--kg-card-radius);
+  background: color-mix(in srgb, var(--background-secondary) 88%, transparent);
+  border: 1px solid var(--background-modifier-border);
+  backdrop-filter: blur(var(--kg-card-blur)) saturate(1.15);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .kg-music { background: var(--background-secondary); }
+}
+.kg-music-main { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.kg-music-track { display: flex; align-items: baseline; gap: var(--kg-space-sm); min-width: 0; }
+.kg-music-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kg-music-time { color: var(--text-faint); font-size: var(--font-ui-smaller); white-space: nowrap; }
+.kg-music-seek { flex: 1; accent-color: var(--interactive-accent); }
+.kg-music-controls { display: flex; align-items: center; gap: 6px; }
+.kg-music-volume { width: 86px; accent-color: var(--interactive-accent); }
+.kg-music-empty { display: flex; align-items: center; gap: var(--kg-space-sm); color: var(--text-faint); font-size: var(--font-ui-smaller); }
+
+/* ---------- 区块 ---------- */
+.kg-section { margin-top: var(--kg-space-lg); }
+.kg-section-title { font-weight: 700; font-size: var(--font-ui-medium); margin-bottom: var(--kg-space-sm); color: var(--text-normal); }
+.kg-section-desc { color: var(--text-faint); font-size: var(--font-ui-smaller); margin-top: 6px; }
+.kg-section-title-row { display: flex; align-items: center; flex-wrap: wrap; gap: var(--kg-space-sm); margin-bottom: var(--kg-space-sm); }
+.kg-section-title-row .kg-section-title { margin-bottom: 0; flex: 1; }
+
+.kg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--kg-space-md); }
+
+/* ---------- 今日状态（§26：数字大、标签在下） ---------- */
+.kg-state-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.kg-card.kg-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 14px 16px;
+}
+.kg-card.kg-state .kg-state-count { font-size: 34px; font-weight: 800; line-height: 1.05; color: var(--text-normal); }
+.kg-card.kg-state .kg-state-label { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+
+/* ---------- 卡片（§41 轻阴影；§74 圆角克制） ---------- */
+.kg-card {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--kg-card-radius);
+  padding: 14px 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+.kg-card:hover { border-color: var(--background-modifier-border-hover); }
+
+.kg-area-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.kg-area-icon { font-size: 1.15em; }
+.kg-area-name { font-weight: 700; flex: 1; }
+.kg-area-count { color: var(--text-muted); font-size: var(--font-ui-smaller); background: var(--background-primary); border-radius: var(--radius-s); padding: 2px 8px; }
+.kg-area-sub { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-bottom: 8px; }
+.kg-area { cursor: pointer; }
+
+.kg-micro-list { display: flex; flex-direction: column; gap: 4px; }
+.kg-note-list { display: flex; flex-direction: column; gap: 4px; }
+.kg-note-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--kg-space-sm);
+  padding: 6px 10px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+.kg-note-item:hover { background: var(--background-modifier-hover); }
+.kg-note-item:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: -1px; }
+.kg-note-item .kg-note-title { font-weight: 600; }
+.kg-note-item .kg-note-meta { color: var(--text-faint); font-size: var(--font-ui-smaller); flex: 1; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.kg-empty { color: var(--text-faint); font-size: var(--font-ui-smaller); font-style: italic; }
+
+/* ---------- AI 奇想（§29：奇想 / 问题 / 连接合一） ---------- */
+.kg-ai-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--kg-space-md); margin-top: 4px; }
+.kg-ai-card { display: flex; flex-direction: column; gap: 6px; }
+.kg-ai-label { color: var(--interactive-accent); font-size: var(--font-ui-smaller); font-weight: 700; }
+.kg-ai-title { font-weight: 700; }
+.kg-ai-body { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-ai-notes { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--background-modifier-border); margin-top: 6px; padding-top: 6px; }
+
+/* ---------- 最近访问 ↔ 值得重新看看：两列（§39，<900px 自动变一列） ---------- */
+.kg-grid-two { display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--kg-space-xl); align-items: start; }
+.kg-grid-two > .kg-section { margin-top: var(--kg-space-lg); }
+
+/* ---------- 错误 / 缓存状态 / 复盘 ---------- */
+.kg-error {
+  border: 1px solid var(--background-modifier-error);
+  background: color-mix(in srgb, var(--background-modifier-error) 6%, var(--background-secondary));
+  border-radius: var(--radius-m);
+  padding: 10px 14px;
+  margin: 6px 0;
+  display: flex;
+  align-items: center;
+  gap: var(--kg-space-sm);
+  flex-wrap: wrap;
+}
+.kg-error-detail { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-error-note { color: var(--text-faint); font-size: var(--font-ui-smaller); width: 100%; }
+
+.kg-cache-status { color: var(--text-muted); font-size: var(--font-ui-smaller); margin: 4px 0 10px; }
+
+.kg-auto-block { margin: 8px 0 4px; padding: 8px 12px; background: var(--background-secondary); border-radius: 8px; }
+.kg-auto-line { color: var(--text-muted); font-size: var(--font-ui-smaller); margin: 2px 0; }
+
+/* ---------- 今日知识漫游（§31 高度自适应 + §32 subtle grid 背景） ---------- */
+.kg-graph-box {
+  position: relative;
+  height: clamp(520px, 62vh, 720px);
+  min-height: 520px;
+  max-height: 720px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--kg-card-radius);
+  background-color: var(--background-secondary);
+  background-image: radial-gradient(var(--background-modifier-border) 1px, transparent 1px);
+  background-size: 22px 22px;
+  overflow: hidden;
+  margin: 6px 0;
+}
+.kg-graph-svg { display: block; width: 100%; height: 100%; cursor: grab; }
+.kg-graph-svg:active { cursor: grabbing; }
+.kg-graph-tip {
+  position: absolute;
+  z-index: 10;
+  pointer-events: none;
+  max-width: 260px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 6px 10px;
+  box-shadow: var(--shadow-s);
+}
+.kg-graph-tip-head { font-weight: 600; font-size: var(--font-ui-smaller); color: var(--text-normal); }
+.kg-graph-tip-body { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-top: 2px; }
+
+.kg-gn rect { fill: var(--background-primary); stroke: var(--background-modifier-border); stroke-width: 1; transition: stroke 120ms ease, fill 120ms ease, opacity 120ms ease; }
+.kg-gn-label { fill: var(--text-normal); font-size: 12px; font-weight: 600; user-select: none; pointer-events: none; }
+.kg-gn:hover rect { stroke: var(--interactive-accent); }
+.kg-gn.kg-gn-question rect { stroke: var(--interactive-accent); stroke-width: 1.5; }
+.kg-gn.kg-gn-sel rect { stroke: var(--interactive-accent); stroke-width: 2; fill: var(--background-secondary-alt); }
+.kg-gn.kg-gn-path rect { stroke: var(--interactive-accent); }
+.kg-gn.kg-gn-dim { opacity: 0.35; }
+
+.kg-ge { fill: none; stroke: var(--background-modifier-border-hover); stroke-width: 1.5; transition: stroke 120ms ease, opacity 120ms ease; }
+.kg-ge.kg-ge-back { stroke-dasharray: 5 4; }
+.kg-ge:hover { stroke: var(--interactive-accent); }
+.kg-ge.kg-ge-path { stroke: var(--interactive-accent); stroke-width: 2.2; }
+.kg-ge.kg-ge-linked { stroke: var(--interactive-accent); opacity: 0.75; }
+.kg-ge.kg-ge-dim { opacity: 0.18; }
+.kg-graph-marker { fill: var(--background-modifier-border-hover); }
+.kg-graph-el { fill: var(--text-faint); font-size: 10px; user-select: none; pointer-events: none; transition: opacity 120ms ease; }
+.kg-graph-el-dim { opacity: 0.18; }
+
+.kg-graph-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+.kg-graph-toolbar .kg-graph-zoom { display: flex; gap: 4px; margin-right: auto; }
+.kg-graph-insight { margin-top: 10px; padding: 10px 12px; border-left: 2px solid var(--interactive-accent); background: var(--background-secondary); border-radius: var(--kg-card-radius); }
+.kg-graph-insight .kg-ai-body { margin-top: 4px; }
+.kg-graph-insight .kg-note-item { margin-top: 2px; }
+
+/* ---------- Phase 7：知识演化（§38/55：只有趋势箭头与主题胶囊，不放大图） ---------- */
+.kg-evolution-card {
+  margin-top: 6px;
+  padding: 12px 14px;
+  border-radius: var(--kg-card-radius);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kg-evo-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.kg-evo-label { font-size: 12px; color: var(--text-muted); min-width: 84px; }
+.kg-evo-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 10px; border-radius: 999px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  font-size: 13px; color: var(--text-normal);
+}
+.kg-evo-arrow { font-size: 13px; font-weight: 600; }
+.kg-evo-up { color: var(--interactive-accent); }
+.kg-evo-down { color: var(--text-faint); }
+.kg-evo-flat { color: var(--text-muted); }
+.kg-evo-link { color: var(--interactive-accent); }
+.kg-evo-question { font-size: 13px; color: var(--text-normal); font-style: italic; }
+.kg-evo-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+
+/* ---------- 响应式（§39/40/85/86） ---------- */
+@media (max-width: 900px) {
+  .kg-grid-two { grid-template-columns: 1fr; }
+  .kg-music { flex-wrap: wrap; }
+  .kg-music-volume { width: 100%; }
+  .kg-state-grid { grid-template-columns: repeat(2, 1fr); }
+  .kg-graph-box { height: 480px; min-height: 420px; }
+}
+@media (min-width: 1600px) {
+  .kg-inner { max-width: 1480px; } /* 宽屏不无限拉长（§40） */
+}
+
+/* ---------- 动画与无障碍（§43/44：120-250ms；prefers-reduced-motion 禁用） ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .kg-hero, .kg-card, .kg-btn, .kg-note-item, .kg-gn rect, .kg-ge, .kg-graph-el {
+    transition: none !important;
+  }
+}
+
+/* ---------- Phase 8：Review Center / 今日复习 ---------- */
+.kg-review { padding: 8px 0; }
+.kg-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.kg-review-progress { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-review-card { display: flex; flex-direction: column; gap: 8px; }
+.kg-review-title { font-size: var(--font-ui-medium); font-weight: 700; }
+.kg-review-meta { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-review-days { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+.kg-review-divider { border-top: 1px solid var(--background-modifier-border); margin: 6px 0; }
+.kg-review-question { background: var(--background-secondary); border-radius: 8px; padding: 10px 12px; }
+.kg-review-question-label { color: var(--text-muted); font-size: var(--font-ui-smaller); font-weight: 600; }
+.kg-review-question-text { margin-top: 4px; }
+.kg-review-qlabel { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-review-nav { justify-content: space-between; }
+.kg-review-done { text-align: center; gap: 8px; }
+.kg-review-done-title { font-size: var(--font-ui-large); font-weight: 700; }
+.kg-review-areas { color: var(--text-muted); font-weight: 600; }
+.kg-review-progress-line { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-bottom: var(--kg-space-sm); }
+.kg-review-more { margin-top: 2px; }
+/* ---------- Query Explorer（🔎 我的探索）---------- */
+.kg-query-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.kg-query-input {
+  flex: 1 1 260px; min-width: 200px;
+  background: var(--background-secondary); color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border); border-radius: 8px;
+  padding: 6px 10px; font-size: var(--font-ui-medium);
+}
+.kg-query-input:focus { border-color: var(--interactive-accent); }
+.kg-select {
+  background: var(--background-secondary); color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border); border-radius: 8px;
+  padding: 6px 8px; font-size: var(--font-ui-medium); max-width: 220px;
+}
+.kg-btn-sm { padding: 2px 8px; font-size: var(--font-ui-smaller); border-radius: 6px; }
+.kg-query-state { color: var(--text-muted); font-size: var(--font-ui-medium); padding: 6px 0; }
+.kg-query-history { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 4px; }
+.kg-query-history-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 4px 0; border-bottom: 1px solid var(--background-modifier-border);
+}
+.kg-query-history-q { color: var(--text-normal); font-size: var(--font-ui-medium); cursor: pointer; flex: 1 1 200px; }
+.kg-query-history-q:hover { color: var(--interactive-accent); }
+.kg-query-history-meta { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+/* ---------- Saved Exploration：收藏知识链路（Saved Exploration 阶段） ---------- */
+.kg-saved-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.kg-saved-list { display: flex; flex-direction: column; gap: 6px; }
+.kg-saved-card {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px; border: 1px solid var(--background-modifier-border);
+  border-radius: 6px; background: var(--background-secondary); cursor: pointer;
+}
+.kg-saved-card:hover { border-color: var(--interactive-accent); }
+.kg-saved-title { color: var(--text-normal); font-weight: 600; font-size: var(--font-ui-medium); }
+.kg-saved-path { color: var(--text-muted); font-size: var(--font-ui-smaller); word-break: break-all; }
+.kg-saved-editor { display: flex; flex-direction: column; gap: 8px; }
+.kg-saved-tags { flex: 1 1 200px; }
+.kg-modal { position: fixed; inset: 0; z-index: var(--layer-modal, 100); display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.45); }
+.kg-modal-card {
+  max-width: 520px; width: min(90%, 520px); max-height: 80vh; overflow: auto;
+  display: flex; flex-direction: column; gap: 10px;
+  border-radius: 8px; border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary); padding: 16px 18px;
+}
+
+/* ---------- Capture / Processing（Knowledge Garden 本阶段；0 AI 计数卡） ---------- */
+.kg-inbox-card { display: flex; flex-direction: column; gap: 6px; }
+.kg-inbox-title { font-size: var(--font-ui-medium); font-weight: 700; }
+.kg-inbox-grid { display: flex; gap: 14px; flex-wrap: wrap; }
+.kg-inbox-cell { display: flex; align-items: baseline; gap: 4px; }
+.kg-inbox-count { font-size: var(--font-ui-large); font-weight: 700; }
+.kg-inbox-label { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.kg-inbox-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.kg-capture-hint { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+.kg-capture-desc { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-bottom: 6px; }
