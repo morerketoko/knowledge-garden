@@ -81,6 +81,13 @@ export class DiagnosticsModal extends Modal {
       row.createSpan({ text: value });
     }
 
+
+    inner.createDiv({ cls: "kg-section-title-row" }).createDiv({ cls: "kg-section-title", text: "AI Workbench（Phase 15）" });
+    for (const [label, value] of this.workbenchLines()) {
+      const row = inner.createDiv({ cls: "kg-row" });
+      row.createSpan({ cls: "kg-review-qlabel", text: label });
+      row.createSpan({ text: value });
+    }
     inner.createDiv({ cls: "kg-section-title-row" }).createDiv({ cls: "kg-section-title", text: "操作" });
     const copyBtn = inner.createEl("button", { cls: "kg-btn", text: "复制诊断摘要" });
     copyBtn.addEventListener("click", () => this.copySummary());
@@ -132,6 +139,12 @@ export class DiagnosticsModal extends Modal {
       ["Indexed Notes", String(p.index.total())],
       ["Search Index", p.searchIndex.ready() ? "Indexed " + p.searchIndex.count() + " / " + p.searchIndex.getStatus().total + " · 就绪" : "Building…（" + p.searchIndex.getStatus().indexed + " / " + p.searchIndex.getStatus().total + "）"],
       ["Saved Explorations", p.saved.count() + " 条"],
+      // Phase 14（§一百九十四）：Exams / Saved Review Cards / Card Reviews / Exam AI Requests / Exam Web Requests（只显示数量与状态）
+      ["Exams", p.examStore.count() + " 场"],
+      ["Saved Review Cards", p.cards.count() + " 张"],
+      ["Card Reviews", p.cardReviews.count() + " 次"],
+      ["Exam AI Requests", (cacheStats.byType["note_exam"] ?? 0) + " 次生成（缓存条目） + " + (cacheStats.byType["exam_grading"] ?? 0) + " 次评分"],
+      ["Exam Web Requests", s.exam.webEnabled ? "Web 已开启（请求数并入上方 AI Requests）" : "Web 默认关闭（未启用）"],
       ["Knowledge Areas", s.knowledgeAreas.length ? s.knowledgeAreas.map((a) => a.name + (a.participateInAI ? "（AI）" : "")).join("、") : "（未配置）"],
       ["Activity Entries", String(p.activity.count())],
       ["AI Cache Entries", cacheStats.count + "（" + (cacheStats.byType["daily_curiosity"] ?? 0) + " 奇想 / " + (cacheStats.byType["connections"] ?? 0) + " 连接 / " + (cacheStats.byType["review_question"] ?? 0) + " 复习问题 / " + (cacheStats.byType["query_exploration"] ?? 0) + " 探索）"],
@@ -262,6 +275,40 @@ export class DiagnosticsModal extends Modal {
     return lines.join("\n");
   }
 
+
+  private workbenchLines(): [string, string][] {
+    const p = this.plugin;
+    const tasks = p.taskStore?.list() ?? [];
+    const byStatus: Record<string, number> = {};
+    for (const t of tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
+    const statusText = tasks.length ? Object.keys(byStatus).map((k) => k + "=" + byStatus[k]).join(" · ") : "（无）";
+    const src = p.sourceLedger?.stats();
+    const toolLog = p.workbenchToolLog ?? [];
+    const lc = p.latencyCollector;
+    const pl = p.promptLibraryStore;
+    const sessions = p.sessionStore ? p.sessionStore.list() : [];
+    const askStats = p.ai.requestStats();
+    const askTotal = (askStats.byFeature["workbench_ask"] ?? 0) + (askStats.byFeature["workbench_deep"] ?? 0) + (askStats.byFeature["workbench_research"] ?? 0);
+    const fmtLat = (mode: string, key: "ttft" | "total"): string => lc ? (lc.avg(mode, key) ?? "—") + "/" + (lc.p95(mode, key) ?? "—") : "未初始化";
+    return [
+      ["AI 任务数", String(tasks.length)],
+      ["任务状态分布", statusText],
+      ["知识项目数", String(p.projectStore?.projects?.length ?? 0)],
+      ["来源台账", src ? "共 " + src.total + "（Vault " + src.vault + " / Web " + src.web + " / 项目 " + src.project + " / 用户 " + src.user + "）" : "未初始化"],
+      ["工具调用总数", String(toolLog.length)],
+      ["工具调用失败", String(toolLog.filter((x) => !x.ok).length)],
+      ["Prompt Library", pl ? pl.count() + " 个（收藏 " + pl.templates.filter((t) => t.favorite).length + "）" : "未初始化"],
+      ["最近使用 Prompt", pl && pl.templates.length ? pl.templates.slice().sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0)).slice(0, 3).map((t) => t.name).join(" / ") : "（无）"],
+      ["Fast Rewrite 延迟(ms)", "Avg/P95 TTFT：" + fmtLat("fast", "ttft") + " · 请求 " + (lc ? lc.count("fast") : "未初始化")],
+      ["Deep Rewrite 延迟(ms)", "Avg/P95 TTFT：" + fmtLat("deep", "ttft") + " · 请求 " + (lc ? lc.count("deep") : "未初始化")],
+      ["Workbench Ask 请求", String(askTotal) + "（今日真实调用）"],
+      ["Workbench Session", String(sessions.length) + " 条追问链"],
+      // Phase 17 §123：Messages / Artifacts / Trace 统计（不含消息全文、API Key、reasoning §124-126）
+      ["Phase 17 消息气泡", String(sessions.reduce((a, s) => a + (s.messages?.length ?? 0), 0)) + " 条（User/Assistant）"],
+      ["Artifact 已保存", String(p.artifactStore?.count() ?? 0) + " 个（cache/artifacts.json）"],
+      ["Trace 工具动作", String(sessions.reduce((a, s) => a + (s.traceEvents?.length ?? 0), 0)) + " 条（只看高层行为摘要）"],
+    ];
+  }
   private async copySummary(): Promise<void> {
     const text = this.summaryText();
     try {

@@ -36,6 +36,16 @@ export function featureLabel(feature: AIFeature): string {
     writing_application: "写作·知识迁移/应用",
     writing_brainstorm: "写作·头脑风暴/反方/苏格拉底",
     writing_copy: "写作·普通改写",
+    note_exam_generation: "知识考试·生成（§106）",
+    note_exam_grading: "知识考试·评分（§106）",
+    workbench_ask: "AI 工作台·Ask（本地检索→带来源回答）",
+    workbench_deep: "AI 工作台·Knowledge Agent 深度（检索→阅读→证据→综合）",
+    workbench_research: "AI 工作台·Research Agent 深度分支",
+    research_planning: "AI 工作台·研究计划",
+    research_execution: "AI 工作台·研究执行（Agent Loop）",
+    project_planning: "AI 工作台·项目定义",
+    agent_tool_call: "AI 工作台·工具调用意图",
+    source_summarization: "AI 工作台·材料提炼/来源摘要",
   };
   return map[feature] ?? feature;
 }
@@ -67,6 +77,16 @@ export function cacheTypeForFeature(feature: AIFeature): string {
     writing_application: "copywriting",
     writing_brainstorm: "copywriting",
     writing_copy: "copywriting",
+    note_exam_generation: "note_exam",   // §40：考试生成缓存类型
+    note_exam_grading: "exam_grading",   // §108/164：评分缓存类型
+    workbench_ask: "workbench_ask",
+    workbench_deep: "workbench_deep",
+    workbench_research: "workbench_research",
+    research_planning: "research_plan",
+    research_execution: "research_search",
+    project_planning: "project_plan",
+    agent_tool_call: "agent_tool_call",
+    source_summarization: "research_summary",
   };
   return map[feature] ?? "connections";
 }
@@ -97,6 +117,16 @@ export function allFeatures(): AIFeature[] {
     "writing_application",
     "writing_brainstorm",
     "writing_copy",
+    "note_exam_generation", // Phase 14：生成考试（§一百零六）
+    "note_exam_grading",    // Phase 14：评分（§一百零六）
+    "workbench_ask", // Phase 15：Workbench Ask
+    "workbench_deep", // Phase 16：Knowledge Agent Deep
+    "workbench_research", // Phase 16：Research Agent Deep
+    "research_planning", // Phase 15：研究计划
+    "research_execution", // Phase 15：研究执行
+    "project_planning", // Phase 15：项目定义
+    "agent_tool_call", // Phase 15：Agent 工具调用
+    "source_summarization", // Phase 15：材料提炼
   ];
 }
 

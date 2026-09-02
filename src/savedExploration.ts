@@ -219,7 +219,7 @@ export function parseSavedFrontmatter(md: string): {
   if (!saved || !id) return null;
   return {
     id, title: title || "知识收藏",
-    source: (["daily_curiosity", "query_exploration", "connection", "manual", "anchor_exploration"] as const).includes(source as SavedExplorationSource) ? source as SavedExplorationSource : "query_exploration",
+    source: (["daily_curiosity", "query_exploration", "connection", "manual", "anchor_exploration", "workbench_ask"] as const).includes(source as SavedExplorationSource) ? source as SavedExplorationSource : "query_exploration",
     query: query || undefined, scope: scope || undefined, date: date || undefined, tags, nodes, edges,
     anchorPath: anchorPath || undefined,
   };

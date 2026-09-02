@@ -105,6 +105,19 @@ export class DashboardView extends ItemView {
     if (s.dashboard.showMusic && this.music) this.music.render();
 
     // ---- 2. 今日状态（§26：大数字卡片，视觉重点；本地规则推导，AI 不参与判定） ----
+
+    // ---- Phase 15：AI 工作台快速入口（Hero 后；§二百七十二 打开即进入，0 AI） ----
+    const wbSection = inner.createDiv({ cls: "kg-section" });
+    wbSection.createDiv({ cls: "kg-section-title", text: "AI 工作台" });
+    const wbRow = wbSection.createDiv({ cls: "kg-row kg-gap" });
+    const askBtn = wbRow.createEl("button", { cls: "kg-btn kg-btn-primary", text: "提问" });
+    askBtn.addEventListener("click", () => { this.plugin.openWorkbenchView("ask"); });
+    const rsBtn = wbRow.createEl("button", { cls: "kg-btn", text: "研究" });
+    rsBtn.addEventListener("click", () => { this.plugin.openWorkbenchView("research"); });
+    const pjBtn = wbRow.createEl("button", { cls: "kg-btn", text: "项目" });
+    pjBtn.addEventListener("click", () => { this.plugin.openWorkbenchView("project"); });
+    const resumeBtn = wbRow.createEl("button", { cls: "kg-btn", text: "继续最近任务" });
+    resumeBtn.addEventListener("click", () => { this.plugin.openWorkbenchResume(); });
     const stateSection = inner.createDiv({ cls: "kg-section" });
     stateSection.createDiv({ cls: "kg-section-title", text: "今日状态" });
     const counts = stateCounts(this.plugin.index.all(), (p) => this.plugin.activity.get(p), this.plugin.settings.activity);
@@ -233,6 +246,24 @@ export class DashboardView extends ItemView {
     savedSection.createDiv({ cls: "kg-section-title", text: "★ 收藏的知识链路" });
     this.renderSavedSection(savedSection);
 
+    // ---- Phase 17 §82：✦ 最近保存（最近 5 个 Artifact；0 AI §83） ----
+    const arts = this.plugin.artifactStore.recent(5);
+    if (arts.length) {
+      const artSection = inner.createDiv({ cls: "kg-section" });
+      artSection.createDiv({ cls: "kg-section-title", text: "✦ 最近保存" });
+      const artList = artSection.createDiv({ cls: "kg-note-list" });
+      for (const a of arts) {
+        artList.createEl("div", { cls: "kg-note-row" }, (row) => {
+          const link = row.createEl("a", { text: "📎 " + (a.title || "AI 产物"), cls: "kg-note-link" });
+          link.addEventListener("click", () => {
+            const f = this.app.vault.getAbstractFileByPath(a.vaultPath);
+            if (f instanceof TFile) void this.app.workspace.getLeaf(false).openFile(f);
+            else new Notice("文件不存在：" + a.vaultPath);
+          });
+          row.createSpan({ cls: "kg-note-path", text: a.vaultPath });
+        });
+      }
+    }
     // ---- 6/7. 最近访问 ↔ 值得重新看看（两列，§39 小窗口自动变一列） ----
     const two = inner.createDiv({ cls: "kg-grid-two" });
     if (s.dashboard.showRecentAccess) {
@@ -249,6 +280,8 @@ export class DashboardView extends ItemView {
     if (s.dashboard.showForgotten) {
       this.renderReviewCenter(two);
     }
+    // Phase 14（§一百二十九/一百三十）：📚 我的复习卡（统计 + 最近 5 张 + 查看全部；0 AI）
+    this.renderReviewCardsSection(two);
 
     // ---- 8. 最近复盘（§36：上一次 / 今日 / 下次；使用 Phase 4 Scheduler 状态） ----
     const revSection = inner.createDiv({ cls: "kg-section" });
@@ -279,6 +312,33 @@ export class DashboardView extends ItemView {
       row.createSpan({ cls: "kg-note-meta", text: r.path });
       row.addEventListener("click", () => this.openNote(r.path));
     }
+  }
+
+  /** Phase 14（§一百二十九/一百三十）：📚 我的复习卡 —— 统计（最近掌握 / 需要复习）+ 最近 5 张 + 查看全部（0 AI）。
+   *  点击卡片/查看全部 → openCardsView（§一百二十九）；绝不触发 AI、不修改访问数据。 */
+  private renderReviewCardsSection(parent: HTMLElement): void {
+    const cards = this.plugin.cards.all();
+    const section = parent.createDiv({ cls: "kg-section" });
+    const head = section.createDiv({ cls: "kg-section-title-row" });
+    head.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
+    const allBtn = head.createEl("button", { cls: "kg-btn", text: "查看全部" });
+    allBtn.addEventListener("click", () => { void this.plugin.openCardsView(); });
+    const masteryMap: Record<string, string> = { forgot: "😵 没想起来", hard: "😕 很困难", good: "🙂 基本掌握", easy: "😎 很熟练" };
+    const goodCount = cards.filter((c) => c.mastery === "good" || c.mastery === "easy").length;
+    const needCount = cards.filter((c) => !c.mastery || c.mastery === "hard" || c.mastery === "forgot").length;
+    section.createDiv({ cls: "kg-section-desc", text: "最近掌握：🙂 " + goodCount + " · 需要复习：😕 " + needCount + "（复习卡来自「📝 构建知识考试」后收藏题目；0 AI）" });
+    const list = section.createDiv({ cls: "kg-note-list" });
+    if (cards.length === 0) {
+      list.createDiv({ cls: "kg-empty", text: "还没有收藏复习卡。在任何笔记右键 →「📝 构建知识考试」→ 作答后把题目收藏为复习卡。" });
+      return;
+    }
+    for (const c of cards.slice(0, 5)) {
+      const row = list.createDiv({ cls: "kg-note-item" });
+      row.createSpan({ cls: "kg-note-title", text: c.question.slice(0, 46) });
+      row.createSpan({ cls: "kg-note-meta", text: "《" + this.plugin.basename(c.sourcePath) + "》" + (c.mastery ? " · " + (masteryMap[c.mastery] ?? c.mastery) : " · 未复习") });
+      row.addEventListener("click", () => { void this.plugin.openCardsView(); });
+    }
+    if (cards.length > 5) section.createDiv({ cls: "kg-empty", text: "…共 " + cards.length + " 张，点击「查看全部」浏览。" });
   }
 
   /** Phase 8：今日复习卡（§三十七/七十五）：数据源=本地 Review Queue（§十/六十四），绝不触发 AI（Test 14）。

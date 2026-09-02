@@ -9,7 +9,7 @@
  * - 缓存：翻译/文案的 cache key 由调用方构造（含用户输入/路由相关部件，§八十一~一百零二）；
  *   调用 plugin.ai.generateForFeature(feature, messages, { customKeyParts, maxTokens })。
  */
-import { App, Component, Editor, Menu, Modal, Notice, Setting, TFile, TFolder, MarkdownView } from "obsidian";
+import { App, Component, Editor, Menu, Modal, Notice, Setting, TFile, TFolder, MarkdownView, ToggleComponent, TextAreaComponent } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
 import { buildTranslationSystem, WRITING_TASKS, buildWritingAssistantSystem, WRITING_PROMPT_VERSION, writingTaskLabel } from "./prompts";
 import { collectWebContext, fingerprintWeb } from "./webContext";
@@ -26,6 +26,9 @@ import { requiresPlan, buildPlanSystem, buildPlanUserRequest, parsePlanText, bui
 import { createEditProposal, detectConflict, lineDiff } from "./safeApply";
 import { ANCHOR_COUNT_DEFAULT, ANCHOR_LOCAL_LIMIT_DEFAULT, anchorScopePaths, anchorTokens, buildAnchorCacheKey } from "./anchorExplorer";
 import type { AIFeature, QueryExplorationResult } from "./types";
+import { promptFingerprint } from "./promptLibrary";
+import { LatencyTracker } from "./latency";
+import { PromptLibraryModal, PromptSaveModal } from "./promptLibraryUi";
 
 /** 右键时的菜单上下文快照（§二十/一百一十五：创建菜单时捕获，点击回调只读快照） */
 export interface NoteMenuContext {
@@ -120,6 +123,13 @@ export class NoteToolbox extends Component {
   }
 
   private populate(menu: Menu, ctx: NoteMenuContext): void {
+    // Phase 14 §一百七十一：📝 构建知识考试（放菜单最前，符合「最终菜单」顺序；打开构建器 0 AI）
+    menu.addItem((item) =>
+      item
+        .setTitle("📝 构建知识考试")
+        .setIcon("graduation-cap")
+        .onClick(() => void this.plugin.openExamBuilder(ctx.file))
+    );
     const label = this.isInKnowledgeFolder(ctx.file.path) ? "✦ 整理 / 提炼此知识" : "✦ 提炼到知识库";
     menu.addItem((item) =>
       item
@@ -416,6 +426,22 @@ class WritingAssistantModal extends Modal {
   private planResult: { feature: AIFeature; steps: string[] } | null = null;
   private modelLabelEl: HTMLElement | null = null;
   private skillTogglesEl: HTMLElement | null = null;
+  /** Phase 16 §二十五：Fast / Deep 模式（默认 Fast；Deep 才允许整篇/相关/Workspace/Skill/Web） */
+  private mode: "fast" | "deep" = "fast";
+  /** Phase 16 §九~十七：当前 Prompt Library 选择（null = 未使用） */
+  private promptId: string | null = null;
+  /** Phase 16 §二十八：取消（AbortController） */
+  private abortCtrl: AbortController | null = null;
+  private forceRun = false;
+  private modeFastEl: HTMLElement | null = null;
+  private modeDeepEl: HTMLElement | null = null;
+  private promptSelEl: HTMLSelectElement | null = null;
+  private promptFavBtnEl: HTMLElement | null = null;
+  private deepOnlyAreaEl: HTMLElement | null = null;
+  private instrInputEl: TextAreaComponent | null = null;
+  private liveEl: HTMLElement | null = null;
+  private runBtnEl: HTMLButtonElement | null = null;
+  private cancelBtnEl: HTMLElement | null = null;
 
   constructor(
     app: App,
@@ -429,6 +455,8 @@ class WritingAssistantModal extends Modal {
     else if (preset && preset.context === "note") { this.ctxSel = false; this.ctxNote = true; this.ctxRelated = false; }
     else if (preset && preset.context === "note+related") { this.ctxSel = false; this.ctxNote = true; this.ctxRelated = true; }
     this.autoRun = !!(preset && preset.autoRun);
+    // Phase 16 §二十四：快捷入口（整篇/相关知识）默认进入深度模式；普通打开默认快速
+    if (preset && preset.context && preset.context !== "selection") this.mode = "deep";
     this.wsId = plugin.settings.currentWorkspaceId;
     const curWs = plugin.currentWorkspace();
     this.skills = curWs && curWs.skills ? curWs.skills.slice() : [];
@@ -488,13 +516,32 @@ class WritingAssistantModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.createEl("h3", { text: "✎ AI 写作助手" });
+    // Phase 16 §二十五~二十六：Mode 切换 + Prompt Library（§九~十七）
+    const modeRow = contentEl.createDiv({ cls: "kg-toolbox-row" });
+    modeRow.createSpan({ cls: "kg-review-qlabel", text: "Mode：" });
+    this.modeFastEl = modeRow.createEl("button", { cls: "kg-btn kg-btn-primary", text: "⚡ 快速" });
+    this.modeDeepEl = modeRow.createEl("button", { cls: "kg-btn", text: "🧠 深度" });
+    this.modeFastEl.addEventListener("click", () => this.setMode("fast"));
+    this.modeDeepEl.addEventListener("click", () => this.setMode("deep"));
+    const promptRow = contentEl.createDiv({ cls: "kg-toolbox-row" });
+    promptRow.createSpan({ cls: "kg-review-qlabel", text: "Prompt：" });
+    this.promptSelEl = promptRow.createEl("select", { cls: "kg-select", attr: { "aria-label": "提示词库" } });
+    this.refreshPromptSelect();
+    this.promptSelEl.addEventListener("change", () => this.applyPrompt(this.promptSelEl ? this.promptSelEl.value || null : null));
+    this.promptFavBtnEl = promptRow.createEl("button", { cls: "kg-btn", text: "☆ 收藏为提示词" });
+    this.promptFavBtnEl.addEventListener("click", () => void this.togglePromptFavorite());
+    promptRow.createEl("button", { cls: "kg-btn", text: "管理" }).addEventListener("click", () => {
+      new PromptLibraryModal(this.app, this.plugin, (id) => this.applyPrompt(id)).open();
+    });
+    this.deepOnlyAreaEl = contentEl.createDiv();
+    this.deepOnlyAreaEl.style.display = "none";
     if (this.ctx.selectedText) {
       contentEl.createDiv({ cls: "kg-toolbox-note", text: "对象：选中文本（" + this.ctx.selectedText.length + " 字）" });
     } else {
       contentEl.createDiv({ cls: "kg-toolbox-note", text: "未检测到选中文本，将使用当前笔记作为上下文（§八十八 提示：不自动覆盖原文）。" });
     }
     // Phase 13 §一百二十一：Workspace | Skill | Model 顶部统一
-    const topRow = contentEl.createDiv({ cls: "kg-toolbox-row" });
+    const topRow = this.deepOnlyAreaEl.createDiv({ cls: "kg-toolbox-row" });
     topRow.createSpan({ cls: "kg-review-qlabel", text: "当前空间：" });
     const wsSel = topRow.createEl("select", { cls: "kg-select", attr: { "aria-label": "当前工作空间" } });
     wsSel.createEl("option", { value: "", text: "默认（不使用 Workspace）" });
@@ -507,17 +554,17 @@ class WritingAssistantModal extends Modal {
       this.refreshSkillToggles();
       this.refreshModelLabel();
     });
-    const skillRow = contentEl.createDiv({ cls: "kg-toolbox-row" });
+    const skillRow = this.deepOnlyAreaEl.createDiv({ cls: "kg-toolbox-row" });
     skillRow.createSpan({ cls: "kg-review-qlabel", text: "Skill：" });
     this.skillTogglesEl = skillRow.createDiv({ cls: "kg-toolbox-inline" });
     this.refreshSkillToggles();
-    this.modelLabelEl = contentEl.createDiv({ cls: "kg-toolbox-note" });
+    this.modelLabelEl = this.deepOnlyAreaEl.createDiv({ cls: "kg-toolbox-note" });
     this.refreshModelLabel();
     // Context Preview（§一百二十二~一百二十三：默认折叠）
-    const ctxDetails = contentEl.createEl("details");
+    const ctxDetails = this.deepOnlyAreaEl.createEl("details");
     ctxDetails.createEl("summary", { text: "Context Preview（默认折叠）" });
     ctxDetails.createDiv({ cls: "kg-toolbox-note", text: this.contextSummaryLine() });
-    new Setting(contentEl).setName("先制定计划（Plan Mode）").setDesc("仅复杂任务（文献综合/研究问题/批判性分析/论证/提炼）支持；先预览计划，确认后才执行（§七十/七十二/一百三十六）。")
+    new Setting(this.deepOnlyAreaEl).setName("先制定计划（Plan Mode）").setDesc("仅复杂任务（文献综合/研究问题/批判性分析/论证/提炼）支持；先预览计划，确认后才执行（§七十/七十二/一百三十六）。")
       .addToggle((t) => t.setValue(this.planOn).onChange((v) => { this.planOn = v; }));
     // 目的（§二十七）
     new Setting(contentEl).setName("目的").addDropdown((d) => {
@@ -525,9 +572,8 @@ class WritingAssistantModal extends Modal {
       d.setValue(this.task).onChange((v) => { this.task = v; this.refreshModelLabel(); });
     });
     // 上下文多选（§五十六~五十九；§一百一十：默认只发选中文本）
-    new Setting(contentEl).setName("上下文").setDesc("只发送明确勾选的内容；整篇笔记 / 相关知识（≤8）仅在勾选时发送（§一百一十/一百一十一）。")
-      .addToggle((tg) => tg.setValue(this.ctxSel).setTooltip("选中文本").onChange((v) => { this.ctxSel = v; }))
-      .addToggle((tg) => tg.setValue(this.ctxNote).setTooltip("当前整篇笔记").onChange((v) => { this.ctxNote = v; }))
+    new Setting(contentEl).setName("上下文").setDesc("⚡ 快速模式只发送选中文本；整篇 / 相关 / 已确认关系 / 收藏链路仅🧠深度模式可用（§二十二/二十四）。").addToggle((tg) => tg.setValue(this.ctxSel).setTooltip("选中文本").onChange((v) => { this.ctxSel = v; }));
+    new Setting(this.deepOnlyAreaEl).setName("上下文（深度模式）").setDesc("整篇笔记 / 相关知识（≤8）/ 已确认关系 / 收藏链路仅在🧠深度模式发送（§二十四）。").addToggle((tg) => tg.setValue(this.ctxNote).setTooltip("当前整篇笔记").onChange((v) => { this.ctxNote = v; }))
       .addToggle((tg) => tg.setValue(this.ctxRelated).setTooltip("相关知识（≤8 篇）").onChange((v) => { this.ctxRelated = v; }))
       .addToggle((tg) => tg.setValue(this.ctxRel).setTooltip("已确认关系（user_confirmed）").onChange((v) => { this.ctxRel = v; }))
       .addToggle((tg) => tg.setValue(this.ctxSaved).setTooltip("收藏链路（最近 ≤2 条）").onChange((v) => { this.ctxSaved = v; }));
@@ -581,9 +627,9 @@ class WritingAssistantModal extends Modal {
       d.setValue(this.outputFormat).onChange((v) => { this.outputFormat = v as typeof this.outputFormat; });
     });
     // 附加要求（§八十一）
-    new Setting(contentEl).setName("附加要求").addTextArea((t) => t.setPlaceholder("例如：只基于原文改写，不要新增观点 / 输出 3 个版本").onChange((v) => { this.instruction = v.trim(); }));
+    new Setting(contentEl).setName("附加要求").addTextArea((t) => { this.instrInputEl = t; t.setPlaceholder("例如：只基于原文改写，不要新增观点 / 输出 3 个版本").onChange((v) => { this.instruction = v.trim(); }); });
     // 联网上下文（§六十三：默认 OFF；网页仅参考）
-    new Setting(contentEl).setName("联网上下文").setDesc("默认关闭；网页内容是不可信输入，仅作参考，不会覆盖你的指令（§九十二）").addDropdown((d) => {
+    new Setting(this.deepOnlyAreaEl).setName("联网上下文").setDesc("仅🧠深度模式可用（§二十四）；默认关闭；网页内容是不可信输入，仅作参考（§九十二）").addDropdown((d) => {
       const providers = (this.plugin.settings.webSearch?.providers ?? []).filter((x) => x && x.type === "api");
       d.addOption("off", "○ 关闭（默认）");
       d.addOption("url", "● 使用指定 URL");
@@ -598,20 +644,85 @@ class WritingAssistantModal extends Modal {
         if (this.includeSrcEl) this.includeSrcEl.style.display = "";
       });
     });
-    this.urlAreaEl = contentEl.createDiv({ cls: "kg-toolbox-hidden" });
+    this.urlAreaEl = this.deepOnlyAreaEl.createDiv({ cls: "kg-toolbox-hidden" });
     this.urlAreaEl.style.display = "none";
     new Setting(this.urlAreaEl).setName("URL（每行一个，最多 5 个）").addTextArea((t) => t.setPlaceholder("https://example.com/article").onChange((v) => { this.urls = v; }));
     // 附来源（§六十六：Web OFF → 禁用；Web ON → 默认勾选）
-    this.includeSrcEl = contentEl.createDiv({ cls: "kg-toolbox-hidden" });
+    this.includeSrcEl = this.deepOnlyAreaEl.createDiv({ cls: "kg-toolbox-hidden" });
     this.includeSrcEl.style.display = "none";
     new Setting(this.includeSrcEl).setName("附来源").setDesc("勾选后：引用网页内容时附真实 URL + 检索时间（§三十四/六十四）")
       .addToggle((tg) => tg.setValue(false).onChange((v) => { this.includeSources = v; }));
     // 生成
     const runBtn = contentEl.createEl("button", { cls: "kg-btn kg-btn-primary", text: "生成" });
+    this.runBtnEl = runBtn;
     runBtn.addEventListener("click", () => void this.run(runBtn));
+    const cancelBtn = contentEl.createEl("button", { cls: "kg-btn", text: "取消" });
+    this.cancelBtnEl = cancelBtn;
+    cancelBtn.style.display = "none";
+    cancelBtn.addEventListener("click", () => { this.abortCtrl?.abort(); });
     this.boxEl = contentEl.createDiv({ cls: "kg-toolbox-out" });
     this.boxEl.style.display = "none";
     if (this.autoRun) void this.run(runBtn);
+  }
+
+  /** Phase 16 §二十五：Mode 切换（默认 Fast；Deep 才显示整篇/相关/Web/Skill/Workspace 区） */
+  private setMode(m: "fast" | "deep"): void {
+    this.mode = m;
+    if (this.modeFastEl) this.modeFastEl.className = m === "fast" ? "kg-btn kg-btn-primary" : "kg-btn";
+    if (this.modeDeepEl) this.modeDeepEl.className = m === "deep" ? "kg-btn kg-btn-primary" : "kg-btn";
+    if (this.deepOnlyAreaEl) this.deepOnlyAreaEl.style.display = m === "fast" ? "none" : "";
+  }
+
+  /** Phase 16 §九：Prompt 下拉填充（★ 收藏优先；0 AI） */
+  private refreshPromptSelect(): void {
+    if (!this.promptSelEl) return;
+    const sel = this.promptSelEl;
+    sel.empty();
+    sel.createEl("option", { value: "", text: "（无 Prompt）" });
+    const favs = this.plugin.promptLibraryStore.templates.filter((t) => t.favorite);
+    const rest = this.plugin.promptLibraryStore.templates.filter((t) => !t.favorite);
+    for (const t of [...favs, ...rest]) sel.createEl("option", { value: t.id, text: (t.favorite ? "★ " : "") + t.name });
+    sel.value = this.promptId ?? "";
+  }
+
+  /** Phase 16 §十：应用 Prompt = activate（填回附加要求，不自动发送；§十五搜索 0 AI）；usageCount++（§十四） */
+  private applyPrompt(id: string | null): void {
+    this.promptId = id;
+    const t = id ? this.plugin.promptLibraryStore.templates.find((x) => x.id === id) : undefined;
+    if (t) {
+      this.instruction = t.prompt;
+      if (this.instrInputEl) this.instrInputEl.setValue(t.prompt);
+      this.plugin.promptLibraryStore.touch(t.id);
+      new Notice("已应用提示词「" + t.name + "」（未自动发送；可继续编辑后生成）。");
+    } else {
+      this.instruction = "";
+      if (this.instrInputEl) this.instrInputEl.setValue("");
+    }
+    if (this.promptSelEl) this.promptSelEl.value = id ?? "";
+    if (this.promptFavBtnEl) this.promptFavBtnEl.setText(t && t.favorite ? "★ 已收藏" : "☆ 收藏为提示词");
+  }
+
+  /** Phase 16 §十一/十六：收藏当前 Prompt；未收藏时弹窗新建（名称/描述/标签） */
+  private togglePromptFavorite(): void {
+    if (this.promptId) {
+      const t = this.plugin.promptLibraryStore.templates.find((x) => x.id === this.promptId);
+      if (!t) { new Notice("提示词不存在（可能已删除）。"); return; }
+      this.plugin.promptLibraryStore.setFavorite(t.id, !t.favorite);
+      this.refreshPromptSelect();
+      this.applyPrompt(t.id);
+      return;
+    }
+    new PromptSaveModal(this.app, this.plugin, (name, description, category, tags) => {
+      const created = this.plugin.promptLibraryStore.create({ name, description: description || undefined, prompt: this.instruction.trim(), tags, category, favorite: true });
+      if (created) {
+        this.promptId = created.id;
+        this.refreshPromptSelect();
+        this.applyPrompt(created.id);
+        new Notice("已收藏为提示词「" + created.name + "」：之后可一键应用。");
+      } else {
+        new Notice("保存失败：请检查名称与内容。");
+      }
+    }).open();
   }
 
   private resolvedAudience(): string { return this.audience === "自定义" ? (this.audienceCustom || "通用") : this.audience; }
@@ -662,7 +773,13 @@ class WritingAssistantModal extends Modal {
     this.busy = true;
     btn.textContent = "进行中…";
     btn.setAttribute("disabled", "true");
+    const tracker = new LatencyTracker();
     try {
+      const isFast = this.mode === "fast";
+      if (isFast) { this.ctxSel = true; this.ctxNote = false; this.ctxRelated = false; this.ctxRel = false; this.ctxSaved = false; this.webMode = "off"; }
+      if (isFast && !this.ctx.selectedText) { new Notice("⚡ 快速模式只处理选中文本：请先选中内容，或切换到🧠深度模式。"); return; }
+      this.abortCtrl = new AbortController();
+      if (this.cancelBtnEl) this.cancelBtnEl.style.display = "";
       const blocks: { label: string; content: string }[] = [];
       let source = "";
       if (this.ctx.selectedText && this.ctxSel) {
@@ -712,7 +829,7 @@ class WritingAssistantModal extends Modal {
       // Phase 13 §十二/§一百零六：Workspace Instructions + Skill 自动加载（用户可关闭 Skill；§一百零六）
       const ws = this.wsId ? this.plugin.settings.workspaces.find((x) => x.id === this.wsId) : undefined;
       const wsInstr = workspaceInstructions(ws);
-      const skillInstr = buildSkillInstructions(this.skills, this.plugin.settings.skillRegistry ?? [], (id) => this.plugin.readSkill(id));
+      const skillInstr = isFast ? "" : buildSkillInstructions(this.skills, this.plugin.settings.skillRegistry ?? [], (id) => this.plugin.readSkill(id));
       // Phase 13 §一百三十五：复杂任务 Plan Mode（只生成计划；确认后才执行；§七十二/一百三十六）
       let planInstr = "";
       if (this.planOn && requiresPlan(feature)) {
@@ -759,6 +876,8 @@ class WritingAssistantModal extends Modal {
       // 缓存 key（§七十五~七十九：task / 上下文 / Web / 模型(配置指纹) 任一变化 → Miss；同输入 → Hit）
       const ctxHash = fingerprintKey(blocks.map((b) => b.label + "~" + textHash(b.content)));
       const customKeyParts = [
+        "mode:" + this.mode,
+        "prompt:" + (this.promptId ? promptFingerprint(this.plugin.promptLibraryStore.templates.find((x) => x.id === this.promptId) ?? { name: "", description: "", prompt: "" }) : "none"),
         "task:" + this.task,
         "src-hash:" + textHash(source),
         "ctx:" + ctxHash,
@@ -778,9 +897,19 @@ class WritingAssistantModal extends Modal {
       ];
       const task = this.plugin.taskEngine.create(feature, { label: writingTaskLabel(this.task) });
       this.plugin.taskEngine.setStatus(task.taskId, "running");
-      const outcome = await this.plugin.ai.generateForFeature(feature, messages, { customKeyParts, maxTokens: 2000 });
+      this.liveEl = this.boxEl.createEl("pre", { cls: "kg-toolbox-result" });
+      this.liveEl.textContent = "生成中…（Streaming；可随时取消）";
+      this.boxEl.style.display = "";
+      const outcome = await this.plugin.ai.generateForFeatureStream(feature, messages, {
+        customKeyParts,
+        maxTokens: isFast ? 1000 : 2000,
+        force: this.forceRun,
+        signal: this.abortCtrl ? this.abortCtrl.signal : undefined,
+        onDelta: (d) => { if (this.liveEl) this.liveEl.textContent += d; },
+        onFirstToken: () => tracker.mark("firstTokenAt"),
+      });
       this.plugin.taskEngine.setStatus(task.taskId, outcome.ok ? "success" : "error");
-      if (!outcome.ok) { new Notice("写作助手失败：" + outcome.error.message); return; }
+      if (!outcome.ok) { new Notice(outcome.error.code === "CANCELLED" ? "已取消。" : "写作助手失败：" + outcome.error.message); return; }
       this.result = outcome.data;
       this.sourceNote = source;
       this.renderOutput();
@@ -788,6 +917,10 @@ class WritingAssistantModal extends Modal {
       new Notice("写作助手出错：" + String((e as Error)?.message || e));
     } finally {
       this.busy = false;
+      this.forceRun = false;
+      if (this.cancelBtnEl) this.cancelBtnEl.style.display = "none";
+      const smm = tracker.summary();
+      this.plugin.latencyCollector?.record(this.mode === "fast" ? "fast" : "deep", smm);
       btn.textContent = "生成";
       btn.removeAttribute("disabled");
     }
@@ -800,6 +933,10 @@ class WritingAssistantModal extends Modal {
     const pre = this.boxEl.createEl("pre", { cls: "kg-toolbox-result" });
     pre.textContent = this.result ?? "";
     const row = this.boxEl.createDiv({ cls: "kg-toolbox-actions" });
+    row.createEl("button", { cls: "kg-btn", text: "重新生成（强制）" }).addEventListener("click", () => {
+      this.forceRun = true;
+      if (this.runBtnEl) void this.run(this.runBtnEl);
+    });
     row.createEl("button", { cls: "kg-btn", text: "复制" }).addEventListener("click", () => {
       void navigator.clipboard.writeText(this.result ?? "").then(() => new Notice("已复制。")).catch(() => new Notice("复制失败，请手动复制。"));
     });

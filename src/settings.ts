@@ -2,7 +2,7 @@ import { App, Modal, PluginSettingTab, Setting, normalizePath, Notice } from "ob
 import { pickRandomImage } from "./mediaHelper";
 import type KnowledgeGardenPlugin from "./main";
 import type { DiscoveryScopeMode, KnowledgeArea, QueryScopeMode, ReviewQueueSize } from "./types";
-import type { AIFeature, AIActionCategory, AIFunctionConfig, AIProfile, KnowledgeWorkspace, ModelMetadata, PermissionValue, PluginSettings, ProfileDraft, SkillSummary, StateBrowseScopeMode } from "./types";
+import type { AIFeature, AIActionCategory, AIFunctionConfig, AIProfile, KnowledgeWorkspace, ModelMetadata, PermissionValue, PluginSettings, ProfileDraft, SkillSummary, StateBrowseScopeMode, ExamMode, ExamDifficulty, ExamAnswerMode } from "./types";
 import { allFeatures, featureLabel, resolveAIFunctionRoute, DEFAULT_PROFILE_ID, applyProfileDraft, copyProfileTemplate, createProfileFromDraft, draftFromProfile, profileUsage, validateProfileDraft } from "./aiRouting";
 import { defaultWorkspace, workspaceInstructions } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
@@ -199,7 +199,80 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
     }
     new Setting(containerEl).setName("保护规则").setDesc("仍被功能使用的 Profile 禁止删除（§一百三十七）。")
 
-    // ---------- Phase 13：Workspaces / Skills / Models & Capabilities / Permissions / Context ----------
+    // ---------- Phase 14（§一百七十三~一百七十九）：Knowledge Exam 设置（默认 Web OFF / 相关知识 OFF / AI 自动评分 OFF） ----------
+  new Setting(containerEl).setName("Knowledge Exam（知识考试）").setHeading()
+    .setDesc("右键笔记 → 「📝 构建知识考试」：AI 只按原文出题（默认不联网）→ 卡片式作答 → 先答后示 → 四档自评 → AI 评分（默认按需触发）→ 双指标掌握度 → 薄弱点 → 收藏复习卡。作答 / 自评 / 收藏 / 复习全部 0 AI（§一百八十五/二百零六）；考试只记录 lastReviewedAt，绝不碰 lastAccessedAt（§一百五十一/二百七十）。");
+  const examGenRoute = resolveAIFunctionRoute("note_exam_generation", s.aiProfiles ?? [], s.aiFunctionConfig ?? [], s.defaultProfileId);
+  const examGradeRoute = resolveAIFunctionRoute("note_exam_grading", s.aiProfiles ?? [], s.aiFunctionConfig ?? [], s.defaultProfileId);
+  new Setting(containerEl).setName("Generation Profile（出题，§一百七十三）")
+    .setDesc("当前：" + examGenRoute.profileId + " → " + examGenRoute.model + "。写法与「Feature → Profile → Model」同一机制：只在 aiFunctionConfig 里存 feature+profileId，换 Profile 即缓存失效（§一百零六/一百六十四）。")
+    .addDropdown((d) => {
+      d.addOption("", "按功能路由默认（当前：" + examGenRoute.profileId + "）");
+      for (const p of s.aiProfiles ?? []) d.addOption(p.id, p.name || p.id);
+      d.setValue((s.aiFunctionConfig ?? []).find((c) => c.feature === "note_exam_generation")?.profileId ?? "").onChange(async (v) => {
+        if (!v) stripFunctionConfig(s, "note_exam_generation", "profileId");
+        else upsertFunctionConfig(s, "note_exam_generation", { profileId: v });
+        await this.plugin.saveSettings();
+        void this.display();
+      });
+    });
+  new Setting(containerEl).setName("Grading Profile（评分，§一百七十三）")
+    .setDesc("当前：" + examGradeRoute.profileId + " → " + examGradeRoute.model + "。")
+    .addDropdown((d) => {
+      d.addOption("", "按功能路由默认（当前：" + examGradeRoute.profileId + "）");
+      for (const p of s.aiProfiles ?? []) d.addOption(p.id, p.name || p.id);
+      d.setValue((s.aiFunctionConfig ?? []).find((c) => c.feature === "note_exam_grading")?.profileId ?? "").onChange(async (v) => {
+        if (!v) stripFunctionConfig(s, "note_exam_grading", "profileId");
+        else upsertFunctionConfig(s, "note_exam_grading", { profileId: v });
+        await this.plugin.saveSettings();
+        void this.display();
+      });
+    });
+  new Setting(containerEl).setName("考试方式 · 默认（§一百七十六）").setDesc("holistic = 把整篇笔记当一个知识单元整体考察；custom = 只考你输入的主题。").addDropdown((d) => {
+    d.addOption("holistic", "AI 整体性考察");
+    d.addOption("custom", "自定义主题");
+    d.setValue(s.exam.defaultMode).onChange(async (v) => { s.exam.defaultMode = v as ExamMode; await this.plugin.saveSettings(); });
+  });
+  new Setting(containerEl).setName("题目数量 · 默认").addText((t) => t.setPlaceholder("5").setValue(String(s.exam.defaultCount)).onChange(async (v) => {
+    const n = parseInt(v, 10);
+    if (!Number.isNaN(n) && n >= 1 && n <= 30) { s.exam.defaultCount = n; await this.plugin.saveSettings(); }
+    else new Notice("题目数量需为 1~30 的整数。");
+  }));
+  new Setting(containerEl).setName("难度 · 默认").addDropdown((d) => {
+    d.addOption("easy", "简单 · 概念核对");
+    d.addOption("medium", "中等 · 理解与应用");
+    d.addOption("hard", "困难 · 批判与迁移");
+    d.setValue(s.exam.defaultDifficulty).onChange(async (v) => { s.exam.defaultDifficulty = v as ExamDifficulty; await this.plugin.saveSettings(); });
+  });
+  new Setting(containerEl).setName("答案来源 · 默认").addDropdown((d) => {
+    d.addOption("source_preferred", "原文优先（原文不足时可简述）");
+    d.addOption("source_only", "只用原文（禁止外部知识）");
+    d.addOption("web_allowed", "允许联网补充（配合下方 Web 开关）");
+    d.setValue(s.exam.defaultAnswerMode).onChange(async (v) => { s.exam.defaultAnswerMode = v as ExamAnswerMode; await this.plugin.saveSettings(); });
+  });
+  new Setting(containerEl).setName("Web 联网 · 默认关闭（§一百七十五）").setDesc("OFF：AI 只根据原文出题，不读取网页（安全默认）。").addToggle((t) => t.setValue(s.exam.webEnabled).onChange(async (v) => { s.exam.webEnabled = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("相关知识上下文 · 默认关闭（§三十二/三十三）").setDesc("OFF：不把其他笔记塞进出题上下文，保证题目聚焦当前笔记。").addToggle((t) => t.setValue(s.exam.relatedNotesEnabled).onChange(async (v) => { s.exam.relatedNotesEnabled = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("AI 自动评分 · 默认关闭（§二百二十七）").setDesc("OFF：作答后按需点「AI 评估」，0~1 次 Token，不自动消耗。").addToggle((t) => t.setValue(s.exam.autoGrade).onChange(async (v) => { s.exam.autoGrade = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("Card Mode · 默认开启（§七十二）").setDesc("ON：考试以卡片式逐题作答（先答后示）。").addToggle((t) => t.setValue(s.exam.cardMode !== false).onChange(async (v) => { s.exam.cardMode = v; await this.plugin.saveSettings(); }));
+
+
+  // ---------- Phase 15：AI Workbench（§二百五十七/二百五十八；模型走功能级路由，不在代码写死） ----------
+  new Setting(containerEl).setName("AI Workbench（AI 工作台）").setHeading()
+    .setDesc("提问 / 研究 / 项目 三种模式；Web 默认关闭；写操作必须用户确认（§三百零六）。");
+  new Setting(containerEl).setName("启用").addToggle((t) => t.setValue(s.workbench.enabled).onChange(async (v) => { s.workbench.enabled = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("Agent 最大步数（§二百五十八）").addDropdown((d) => {
+    d.addOption("5", "5 · 轻量浏览");
+    d.addOption("8", "8 · 默认");
+    d.addOption("12", "12 · 深入调研");
+    d.setValue(String(s.workbench.maxSteps)).onChange(async (v) => { s.workbench.maxSteps = parseInt(v, 10); await this.plugin.saveSettings(); });
+  });
+  new Setting(containerEl).setName("单任务最多搜索").setDesc("研究任务内搜索次数上限（默认 5）。").addText((t) => t.setPlaceholder("5").setValue(String(s.workbench.maxQueries)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isNaN(n) && n >= 1 && n <= 30) { s.workbench.maxQueries = n; await this.plugin.saveSettings(); } }));
+  new Setting(containerEl).setName("单任务最多抓页").setDesc("Web 抓取页数上限（默认 10）。").addText((t) => t.setPlaceholder("10").setValue(String(s.workbench.maxPages)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isNaN(n) && n >= 1 && n <= 50) { s.workbench.maxPages = n; await this.plugin.saveSettings(); } }));
+  new Setting(containerEl).setName("单任务正文上限").setDesc("累计读取/抓取字符上限（默认 20000）。").addText((t) => t.setPlaceholder("20000").setValue(String(s.workbench.maxChars)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isNaN(n) && n >= 1000 && n <= 100000) { s.workbench.maxChars = n; await this.plugin.saveSettings(); } }));
+  new Setting(containerEl).setName("批量写入上限").setDesc("一次确认最多应用 N 个 Vault 写入（默认 5；写操作仍逐个需确认）。").addDropdown((d) => { d.addOption("1", "1 · 最保守"); d.addOption("5", "5 · 默认"); d.addOption("10", "10 · 批量场景"); d.setValue(String(s.workbench.maxBatchWrites)).onChange(async (v) => { s.workbench.maxBatchWrites = parseInt(v, 10); await this.plugin.saveSettings(); }); });
+  new Setting(containerEl).setName("Web 默认关闭（§四十二/八十五）").setDesc("OFF：Web 默认 ask，研究时勾选「本次启用」才允许；不改写权限。").addToggle((t) => t.setValue(s.workbench.webEnabledByDefault).onChange(async (v) => { s.workbench.webEnabledByDefault = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("历史保留条数").setDesc("任务/问题历史最多保存 N 条（默认 20；只存元数据，不存 Prompt/密钥/网页正文）。").addText((t) => t.setPlaceholder("20").setValue(String(s.workbench.historyLimit)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isNaN(n) && n >= 5 && n <= 100) { s.workbench.historyLimit = n; await this.plugin.saveSettings(); } }));
+  // ---------- Phase 13：Workspaces / Skills / Models & Capabilities / Permissions / Context ----------
     new Setting(containerEl).setName("AI Workspaces（知识工作空间）").setHeading()
       .setDesc("Workspace = 当前进行某一类知识活动时的稳定 AI 上下文（Scope + Instructions + Skills + 默认 Profile，§二~§十五）。只创建数据，不改变全局 Discovery Scope（§七）。");
     new Setting(containerEl).setName("当前工作空间")

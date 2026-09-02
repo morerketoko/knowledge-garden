@@ -5,7 +5,7 @@ import { SearchIndex, extractAliases, extractHeadings, tokenizeText } from "./se
 import { QueryHistoryStore } from "./queryHistory";
 import { QUERY_MAX_LENGTH, buildQueryCacheKey, parseQuery, queryScopePaths, rankSearchResults, selectQueryCandidates } from "./queryExplorer";
 import { PROMPT_VERSIONS } from "./ai/service";
-import type { DiscoveryScope, KnowledgeWorkspace, QueryExplorationResult, QueryScopeMode, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource } from "./types";
+import type { DiscoveryScope, KnowledgeWorkspace, QueryExplorationResult, QueryScopeMode, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource, NoteExam, ExamSessionState, SavedReviewCard, MasteryRating, ExamQuestionType } from "./types";
 import type { ActivityEntry, KGState } from "./types";
 import { defaultProfileFrom, resolveAIFunctionRoute, resolveAIFunctionRouteWithWorkspace, routeFingerprint, routeFingerprintWithWorkspace } from "./aiRouting";
 import { defaultWorkspace, resolveWorkspace, workspaceFingerprint } from "./workspace";
@@ -22,6 +22,14 @@ import { ReviewManager } from "./review";
 import { ActivityStore } from "./activity";
 import { ReviewCenterStore, buildReviewQueue, dailyPeriodKey, markCompleted, markSkipped, markSnoozed, nextActiveIndex, pruneQueue, safeResumeIndex, sessionFinished } from "./reviewCenter";
 import { ReviewSessionView, VIEW_TYPE_REVIEW } from "./reviewSession";
+
+/* ================= Phase 14：Note Exam / Review Cards ================= */
+import { ExamSessionView, VIEW_TYPE_EXAM } from "./examView";
+import { CardsView, VIEW_TYPE_CARDS } from "./cardsView";
+import { examMarkdown, cardMarkdown, examMarkdownPath, cardMarkdownPath, examFingerprint, newExamId, newCardId, examDirPath, cardsDirPath, parseExamMarkdown, parseCardMarkdown, ExamStore, ReviewCardStore, ExamSessionStore, CardReviewStore } from "./examStore";
+import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamResumeIndex, selfMasteryPercent, aiMasteryPercent, masteryLabel, masteryGapHint, weakConceptsOf, strongConceptsOf, type ExamProgressStats } from "./examEngine";
+import { ExamBuildModal, type ExamBuildParams } from "./examView";
+import { collectWebContext } from "./webContext";
 import { ReviewScheduler } from "./scheduler";
 import { forgottenCandidates } from "./knowledgeState";
 import { DashboardView, VIEW_TYPE_KG } from "./dashboard";
@@ -43,6 +51,15 @@ import type { KnowledgeRelationship, RelationshipEvidence } from "./types";
 import { buildCaptureMarkdown, parseCaptureFrontmatter, captureBody, captureFilePath, captureDate, urlFingerprint } from "./capture";
 import { buildKnowledgeMarkdown, buildProcessingMarkdown, kgDate, parseCandidateFrontmatter, processingAiRegion, replaceProcessingAiRegion, setFrontmatterStatus, sourceVersionFor } from "./knowledgeProcessor";
 import { CaptureFormModal, UrlCaptureModal, CaptureConfirmModal, type CaptureFormInput } from "./captureUi";
+import { SourceLedger } from "./sourceLedger";
+import { WorkbenchTaskStore, WorkbenchProjectStore } from "./workbenchStore";
+import { WorkbenchService } from "./workbenchService";
+import { WorkbenchSessionStore } from "./workbenchSession";
+import { ArtifactStore } from "./artifactStore";
+import { PromptLibraryStore, seedPromptLibrary } from "./promptLibrary";
+import { LatencyCollector } from "./latency";
+import * as path from "path";
+import { AIWorkbenchView, VIEW_TYPE_AI_WORKBENCH } from "./workbenchView";
 
 /** Discovery Scope：discoveryPrep 的返回结构（AIPrep 的 Discovery 变体，含 scope 指纹 / 选择版本 / 展示上下文） */
 interface DiscoveryPrepResult {
@@ -118,6 +135,19 @@ export default class KnowledgeGardenPlugin extends Plugin {
   toolbox!: NoteToolbox;
   /** Phase 13 §七十七~八十六：统一 AI 任务状态（Diagnostics / Cancellation / Progress） */
   taskEngine = new AITaskEngine();
+
+  /** Phase 14：考试索引（cache/exams.json + Knowledge Garden/Exams/*.md，§一百四十六） */
+  examStore!: ExamStore;
+  /** Phase 14：收藏复习卡索引（cache/cards.json + Knowledge Garden/Review Cards/*.md，§一百四十六） */
+  cards!: ReviewCardStore;
+  /** Phase 14：考试会话（cache/exam-sessions.json，§一百八十七 可恢复） */
+  examSessions!: ExamSessionStore;
+  /** Phase 14：复习卡复习历史（cache/card-reviews.json，§九十一/二百一十四） */
+  cardReviews!: CardReviewStore;
+  /** 最近一次打开的考试 id（Dashboard/命令「打开当前笔记考试」用） */
+  lastExamId: string | null = null;
+  /** 考试生成失败原因（保留旧考试时展示重试，§五十/五十一） */
+  examError: string | null = null;
   /** Phase 13 §二十三：Skills 正文预读缓存（vault-relative relPath → 文本；readSkill 同步读） */
   private skillFileCache = new Map<string, string>();
   /** Phase 11：状态浏览「上次随机打开」只存内存（§一百八十九：绝不持久化） */
@@ -126,6 +156,21 @@ export default class KnowledgeGardenPlugin extends Plugin {
   saved!: SavedExplorationStore;
   /** Phase 10：知识关系（AI 建议 → 用户确认 → 长期结构；cache/relationships.json + Relationships/*.md） */
   relationships!: RelationshipStore;
+  /** Phase 15：AI Workbench（service + 存储；§五十/二百六十四） */
+  sourceLedger!: SourceLedger;
+  taskStore!: WorkbenchTaskStore;
+  projectStore!: WorkbenchProjectStore;
+  workbenchService!: WorkbenchService;
+  /** Phase 16 §65-67：Workbench Ask 追问 Session 存储 */
+  sessionStore!: WorkbenchSessionStore;
+  /** Phase 17 §14-15：Message Artifact 索引（cache/artifacts.json；独立于 AI Cache §79） */
+  artifactStore!: ArtifactStore;
+  /** Phase 16 §四~十七：Prompt Library 存储（Markdown = Source of Truth；cache/prompts.json = 统计缓存） */
+  promptLibraryStore!: PromptLibraryStore;
+  /** Phase 16 §十九~二十：Latency 收集器（cache/latency.json；只存 mode/ttft/total/时间戳） */
+  latencyCollector!: LatencyCollector;
+  /** Phase 15 §二百一十六：工具调用日志（Diagnostics 展示；只记 toolId/结果/时间，不记网页正文/参数原文） */
+  workbenchToolLog: { toolId: string; ok: boolean; at: number }[] = [];
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -152,6 +197,15 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const evolutionCorrupt = this.evolution.load();
     this.evolution.setKeepWeeks(this.settings.evolution.keepWeeks);
     this.reviewCenter = new ReviewCenterStore(baseDir);
+
+    this.examStore = new ExamStore(baseDir);
+    const examCorrupt = this.examStore.load();
+    this.cards = new ReviewCardStore(baseDir);
+    const cardsCorrupt = this.cards.load();
+    this.examSessions = new ExamSessionStore(baseDir);
+    const examSessionsCorrupt = this.examSessions.load();
+    this.cardReviews = new CardReviewStore(baseDir);
+    const cardReviewsCorrupt = this.cardReviews.load();
     const reviewCorrupt = this.reviewCenter.load();
     this.discovery = new DiscoveryStore(baseDir);
     const discoveryCorrupt = this.discovery.load();
@@ -165,6 +219,23 @@ export default class KnowledgeGardenPlugin extends Plugin {
     // Phase 13 §二十三/一百四十八：启动时轻量预读 Skills（Knowledge Garden/Skills/<id>/SKILL.md + 资源）；
     // 只读文件不扫描 Vault：workspace 切换不触发扫描。
     void this.preloadSkills();
+    // Phase 15：Workbench 存储与服务（§五十/六十四/二百六十四；损坏隔离沿用 Recovery 模式）
+    this.sourceLedger = new SourceLedger(baseDir);
+    const workbenchCorrupt = this.sourceLedger.load();
+    this.taskStore = new WorkbenchTaskStore(baseDir);
+    const tasksCorrupt = this.taskStore.load();
+    this.projectStore = new WorkbenchProjectStore(baseDir);
+    const projectsCorrupt = this.projectStore.load();
+    this.workbenchService = new WorkbenchService(this);
+    this.sessionStore = new WorkbenchSessionStore(baseDir);
+    const sessionCorrupt = this.sessionStore.load();
+    this.artifactStore = new ArtifactStore(baseDir);
+    const artifactCorrupt = this.artifactStore.load();
+    this.promptLibraryStore = new PromptLibraryStore(baseDir);
+    const promptCorrupt = this.promptLibraryStore.load();
+    seedPromptLibrary(this.promptLibraryStore);
+    this.latencyCollector = new LatencyCollector(path.join(baseDir, "cache", "latency.json"));
+    this.latencyCollector.load();
 
     this.reviews = new ReviewManager(
       this.app,
@@ -195,6 +266,20 @@ export default class KnowledgeGardenPlugin extends Plugin {
       new Notice("复习队列已损坏，已隔离并重建当前队列。");
     }
     if (discoveryCorrupt) new Notice("知识发现曝光数据已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
+    if (workbenchCorrupt) new Notice("来源台账已损坏，已隔离重建（原文件保留为 .corrupt-*）。");
+    if (tasksCorrupt) new Notice("AI 任务数据已损坏，已隔离重建。");
+    if (projectsCorrupt) new Notice("知识项目索引已损坏，已隔离重建（Projects/*.md 仍可恢复）。");
+
+    if (examCorrupt) {
+      void this.reindexExams(); // §一百九十六：exams.json 损坏 → 从 Exams/*.md 恢复（0 AI）
+      new Notice("考试索引已损坏，已隔离；正在从 Exams/*.md 恢复（0 AI）。");
+    }
+    if (cardsCorrupt) {
+      void this.reindexCards(); // §一百九十六：cards.json 损坏 → 从 Review Cards/*.md 恢复（0 AI）
+      new Notice("复习卡索引已损坏，已隔离；正在从 Review Cards/*.md 恢复（0 AI）。");
+    }
+    if (examSessionsCorrupt) new Notice("考试会话已损坏，已隔离重建（原文件保留为 .corrupt-*）。");
+    if (cardReviewsCorrupt) new Notice("复习卡复习记录已损坏，已隔离重建。");
     if (queryHistoryCorrupt) new Notice("最近探索历史已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
     if (savedCorrupt) {
       new Notice("收藏索引已损坏，原文件已隔离（.corrupt-*）；正在从收藏 Markdown 重新建立索引（§四十一/四十三）。");
@@ -213,7 +298,12 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.registerView(VIEW_TYPE_KG, (leaf) => new DashboardView(leaf, this));
     this.registerView(VIEW_TYPE_SAVED, (leaf) => new SavedExplorationView(leaf, this));
     this.registerView(VIEW_TYPE_REVIEW, (leaf) => new ReviewSessionView(leaf, this));
+
+    this.registerView(VIEW_TYPE_EXAM, (leaf) => new ExamSessionView(leaf, this));
+    this.registerView(VIEW_TYPE_CARDS, (leaf) => new CardsView(leaf, this));
+    this.registerView(VIEW_TYPE_AI_WORKBENCH, (leaf) => new AIWorkbenchView(leaf, this));
     this.addRibbonIcon("flower-2", "打开知识花园", () => { void this.activateView(); });
+    this.addRibbonIcon("bot", "打开 AI 工作台（提问 / 研究 / 项目）", () => { this.openWorkbenchView(); });
 
     this.addCommand({ id: "kg-open-dashboard", name: "打开知识花园 Dashboard", callback: () => { void this.activateView(); } });
     this.addCommand({ id: "kg-refresh", name: "刷新知识索引与 Dashboard", callback: () => { void this.refreshAll(); } });
@@ -273,8 +363,31 @@ export default class KnowledgeGardenPlugin extends Plugin {
     // Phase 12 §八十七：写作助手 / 研究问题 / 应用思路 均可从命令面板运行
     this.addCommand({ id: "kg-writing-assistant", name: "AI 写作助手：当前笔记（学术/论证/批判/研究/应用/头脑风暴）", callback: () => { const f = this.app.workspace.getActiveFile(); if (f instanceof TFile) this.toolbox.openWritingAssistant(f.path); else new Notice("当前没有打开的笔记。"); } });
     this.addCommand({ id: "kg-research-questions", name: "从当前笔记生成研究问题", callback: () => { const f = this.app.workspace.getActiveFile(); if (f instanceof TFile) this.toolbox.runQuickResearchQuestion({ file: f, editor: null, selectedText: "" }); else new Notice("当前没有打开的笔记。"); } });
+
+    // Phase 14 §一百七十：考试 / 复习卡命令（构建 / 重新生成 / 打开 / 查看收藏；入口只读，0 AI）
+    this.addCommand({ id: "kg-exam-build", name: "知识花园：构建当前笔记考试", callback: () => { this.openExamBuilderForActive(); } });
+    this.addCommand({ id: "kg-exam-rebuild", name: "知识花园：重新生成当前笔记考试（跳过 AI 缓存）", callback: () => { void this.regenerateExamForActive(); } });
+    this.addCommand({ id: "kg-exam-open", name: "知识花园：打开当前笔记考试", callback: () => { void this.openExamForActive(); } });
+    this.addCommand({ id: "kg-cards-open", name: "知识花园：查看收藏复习卡", callback: () => { void this.openCardsView(); } });
     this.addCommand({ id: "kg-application-ideas", name: "从当前笔记生成应用思路", callback: () => { const f = this.app.workspace.getActiveFile(); if (f instanceof TFile) this.toolbox.runQuickApplication({ file: f, editor: null, selectedText: "" }); else new Notice("当前没有打开的笔记。"); } });
+    this.addCommand({ id: "kg-wb-open", name: "打开 Knowledge Garden AI 工作台（提问/研究/项目）", callback: () => { this.openWorkbenchView(); } });
+    this.addCommand({ id: "kg-wb-ask", name: "向 Knowledge Garden 提问", callback: () => { this.openWorkbenchView("ask"); } });
+    this.addCommand({ id: "kg-wb-research", name: "开始知识研究（计划→确认→执行）", callback: () => { this.openWorkbenchView("research"); } });
+    this.addCommand({ id: "kg-wb-project", name: "建立知识项目", callback: () => { this.openWorkbenchView("project"); } });
+    this.addCommand({ id: "kg-wb-resume", name: "继续最近 AI 任务", callback: () => { this.openWorkbenchResume(); } });
+    this.addCommand({ id: "kg-wb-tasks", name: "查看 AI 任务", callback: () => { this.openWorkbenchTasks(); } });
     this.toolbox.registerMenuHandlers();
+    // Phase 15 §二百七十三：右键笔记/选中文本 → AI 工作台（不覆盖原生菜单）
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (!(file instanceof TFile) || file.extension !== "md") return;
+      menu.addItem((item) => item.setTitle("知识花园：以此笔记向 AI 提问").setIcon("bot").onClick(() => { this.openWorkbenchView("ask", file.path); }));
+      menu.addItem((item) => item.setTitle("知识花园：以此笔记开始研究").setIcon("search").onClick(() => { this.openWorkbenchView("research", file.path); }));
+    }));
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor) => {
+      const sel = typeof editor.getSelection === "function" ? (editor.getSelection() ?? "") : "";
+      if (!sel.trim()) return;
+      menu.addItem((item) => item.setTitle("知识花园：向 AI 提问选中内容").setIcon("bot").onClick(() => { this.openWorkbenchView("ask", sel.slice(0, 4000)); }));
+    }));
 
     // 增量索引：Vault 事件 → 单文件更新，不整库重扫
     this.registerEvent(this.app.vault.on("create", (file) => {
@@ -307,6 +420,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
       this.index.removeFile(oldPath);
       this.searchIndex.rename(oldPath, file.path);
       this.saved.migratePaths(oldPath, file.path); // §十八：收藏引用跟随 rename（0 AI）
+
+    this.examStore.migratePaths(oldPath, file.path);  // Phase 14：考试来源跟随 rename（0 AI）
+    this.cards.migratePaths(oldPath, file.path);      // Phase 14：复习卡来源跟随 rename（0 AI）
       this.relationships.migratePaths(oldPath, file.path); // Phase 10：关系引用跟随 rename（0 AI，§五十九）
       if (file.extension === "md") {
         void this.index.updateFile(file).then(() => { this.pruneActivity(); });
@@ -1933,4 +2049,583 @@ export default class KnowledgeGardenPlugin extends Plugin {
       (leaf.view as unknown as { scheduleRender(): void }).scheduleRender();
     }
   }
+
+
+  /* ================= Phase 14：Note Exam / Review Cards（§二百四十一 完成条件） ================= */
+
+  /** 笔记正文内容指纹（Phase 14 §四十一：长度 + 前 2000 字符参与 sourceVersion） */
+  private examContentHash(src: string): string {
+    return fingerprintKey(["content", String(src.length), src.slice(0, 2000)]);
+  }
+
+  /** 从笔记正文提取 http(s) URL 抓取网页上下文（§一百零三 web_allowed + webEnabled 时；失败降级为空） */
+  private async collectWebContextForExam(src: string): Promise<string[]> {
+    try {
+      const urls = [...(src ?? "").matchAll(/https?:\/\/[^\s"'<>()]+/g)]
+        .map((m) => m[0])
+        .filter((u) => /^https?:\/\//i.test(u))
+        .slice(0, 5);
+      if (!urls.length) return [];
+      const res = await collectWebContext(urls);
+      return res.pages.map((pg) => "### " + pg.url + "\n" + pg.text);
+    } catch {
+      return [];
+    }
+  }
+  /** 打开「构建知识考试」Modal（右键/命令入口，§七） */
+  openExamBuilder(file: TFile): void {
+    new ExamBuildModal(this, file, (p) => { void this.buildExamForNote(file, p); }).open();
+  }
+
+  /** 以当前活跃笔记打开构建 Modal（命令入口） */
+  openExamBuilderForActive(): void {
+    const f = this.app.workspace.getActiveFile();
+    if (!(f instanceof TFile)) { new Notice("当前没有打开的笔记。"); return; }
+    this.openExamBuilder(f);
+  }
+
+  /** 生成考试（§一百一十四：force=true 重新生成；AI 失败保留旧 Exam §五十一） */
+  async buildExamForNote(file: TFile, p: ExamBuildParams): Promise<void> {
+    if (!file) { new Notice("没有可考试的笔记。"); return; }
+    try { await this.ensureVaultFolder(examDirPath()); } catch { /* ignore */ }
+    const src = await this.app.vault.cachedRead(file);
+    const sourceVersion = fingerprintKey(["note", file.path, String(src.length), this.examContentHash(src)]);
+    const webContextLines: string[] = [];
+    if (p.answerMode === "web_allowed" && p.webEnabled) {
+      const wc = await this.collectWebContextForExam(src);
+      webContextLines.push(...wc);
+    }
+    const skill = this.examSkillInstructions();
+    const ctxHash = fingerprintKey([file.path, sourceVersion, JSON.stringify({ topic: p.topic ?? "", count: p.questionCount, difficulty: p.difficulty ?? "medium", answerMode: p.answerMode, web: p.webEnabled })]);
+    const wsFp = workspaceFingerprint(this.currentWorkspace());
+    const skillFp = fingerprintKey(["skill", skill ?? "none"]);
+    const out = await this.ai.generateExam({
+      sourcePath: file.path,
+      sourceVersion,
+      noteTitle: file.basename,
+      noteText: src.slice(0, 24000),
+      mode: p.mode,
+      topic: p.topic,
+      questionCount: p.questionCount,
+      difficulty: p.difficulty,
+      answerMode: p.answerMode,
+      webEnabled: p.webEnabled,
+      webContextLines,
+      skillInstructions: skill ?? undefined,
+      workspaceFingerprint: wsFp,
+      skillFingerprint: skillFp,
+      contextHash: ctxHash,
+    }, p.force ?? false);
+    if (!out.ok) {
+      this.examError = out.error?.message ?? "考试生成失败";
+      const old = this.examStore.findBySource(file.path);
+      if (old.length) {
+        new Notice("AI 生成失败，保留已有考试（" + this.examError + "）。");
+        this.lastExamId = old[0].id;
+        await this.openExamSession(old[0].id);
+        return;
+      }
+      new Notice("AI 生成失败：" + this.examError + "。可去 设置→AI 检查 Key/网络后重试。");
+      return;
+    }
+    const questions = filterValidExamQuestions(out.data.questions, p.questionCount);
+    if (!questions.length) {
+      this.examError = "AI 返回的题目全部无效";
+      new Notice("考试生成失败：" + this.examError + "。");
+      return;
+    }
+    const fp = examFingerprint({ sourcePath: file.path, sourceVersion, mode: p.mode, topic: p.topic, questionCount: p.questionCount, difficulty: p.difficulty, answerMode: p.answerMode });
+    let exam = this.examStore.findByFingerprint(fp);
+    if (exam && !p.force) {
+      new Notice("已有同参数考试（0 AI），直接打开。");
+      this.lastExamId = exam.id;
+      await this.openExamSession(exam.id);
+      return;
+    }
+    if (exam && p.force) {
+      this.examStore.update(exam.id, { questions, coverageTopics: out.data.coverageTopics, examVersion: (exam.examVersion ?? 1) + 1, updatedAt: Date.now() });
+      const updated = this.examStore.get(exam.id)!;
+      await this.writeExamMarkdown(updated);
+      this.lastExamId = updated.id;
+      await this.openExamSession(updated.id);
+      return;
+    }
+    const now = Date.now();
+    const newexam: NoteExam = {
+      id: newExamId(),
+      sourcePath: file.path,
+      sourceVersion,
+      title: (out.data.title || file.basename + " 知识考试").trim().slice(0, 80),
+      mode: p.mode,
+      topic: p.topic,
+      questionCount: p.questionCount,
+      difficulty: p.difficulty,
+      answerMode: p.answerMode,
+      questions,
+      examVersion: 1,
+      coverageTopics: out.data.coverageTopics,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.examStore.add(newexam);
+    await this.writeExamMarkdown(newexam);
+    this.lastExamId = newexam.id;
+    this.examError = null;
+    this.rerenderDashboard();
+    new Notice("考试已生成：" + newexam.title + "（" + questions.length + " 题）。");
+    await this.openExamSession(newexam.id);
+  }
+
+  /** 写入 Exam Markdown（§一百一十八；0 AI 的恢复源） */
+  async writeExamMarkdown(e: NoteExam): Promise<void> {
+    try {
+      await this.ensureVaultFolder(examDirPath());
+      const body = examMarkdown(e) + "\n";
+      const p = examMarkdownPath(e);
+      const existing = this.app.vault.getAbstractFileByPath(normalizePath(p));
+      if (existing instanceof TFile) await this.app.vault.modify(existing, body);
+      else await this.app.vault.create(p, body);
+    } catch (err) {
+      new Notice("写入考试 Markdown 失败：" + String((err as Error)?.message ?? err));
+    }
+  }
+
+  /** 打开最近一次考试/当前笔记考试（命令入口） */
+  async openExamForActive(): Promise<void> {
+    const f = this.app.workspace.getActiveFile();
+    if (f instanceof TFile) {
+      const list = this.examStore.findBySource(f.path);
+      if (list.length) { this.lastExamId = list[0].id; await this.openExamSession(list[0].id); return; }
+      new Notice("这篇笔记还没有考试。右键 → 📝 构建知识考试。");
+      return;
+    }
+    if (this.lastExamId) { await this.openExamSession(this.lastExamId); return; }
+    const recent = this.examStore.all();
+    if (recent.length) { this.lastExamId = recent[0].id; await this.openExamSession(recent[0].id); return; }
+    new Notice("还没有生成过考试。");
+  }
+
+  /** 打开考试会话视图（若已有 running/completed 会话则恢复 §一百八十八；否则新建 Card 模式会话 §七十二） */
+  async openExamSession(examId: string, force = false): Promise<void> {
+    const exam = this.examStore.get(examId);
+    if (!exam) { new Notice("考试不存在（收藏卡不受影响）。"); return; }
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM);
+    let st = this.examSessions.get(examId);
+    if (!st || force) {
+      st = {
+        examId,
+        mode: this.settings.exam.cardMode !== false ? "card" : "exam",
+        currentIndex: 0,
+        answers: [],
+        status: "running",
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      this.examSessions.upsert(st);
+    }
+    if (leaves.length > 0) {
+      this.app.workspace.revealLeaf(leaves[0]);
+      this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
+      (leaves[0].view as ExamSessionView).refresh();
+      return;
+    }
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) { new Notice("无法创建考试窗口。"); return; }
+    await leaf.setViewState({ type: VIEW_TYPE_EXAM, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** 重新生成考试（§一百一十四/二百五十七：force=true，跳过缓存） */
+  /** Phase 14 §一百七十：重新生成当前笔记考试（跳过 AI 缓存；无考试则打开构建器；不修改访问数据） */
+  async regenerateExamForActive(): Promise<void> {
+    const f = this.app.workspace.getActiveFile();
+    if (!(f instanceof TFile)) { new Notice("请先打开一篇笔记。"); return; }
+    const list = this.examStore.findBySource(f.path);
+    if (!list.length) { this.openExamBuilderForActive(); return; }
+    await this.regenerateExam(list[0].id);
+  }
+  async regenerateExam(examId: string): Promise<void> {
+    const e = this.examStore.get(examId);
+    if (!e) { new Notice("考试不存在。"); return; }
+    const f = this.app.vault.getAbstractFileByPath(normalizePath(e.sourcePath));
+    if (!(f instanceof TFile)) { new Notice("原笔记不存在，无法重新生成。"); return; }
+    await this.buildExamForNote(f, {
+      mode: e.mode, topic: e.topic, questionCount: e.questionCount, difficulty: e.difficulty ?? "medium",
+      answerMode: e.answerMode, webEnabled: e.answerMode === "web_allowed", cardMode: this.settings.exam.cardMode !== false,
+      force: true,
+    });
+  }
+
+  /** 用户作答开放/选择/判断题（§一百八十六：答案保存在本地 Session，不进 AI Cache §一百九十一） */
+  answerExamQuestion(examId: string, questionId: string, answer: string): void {
+    const st = this.examSessions.get(examId);
+    if (!st) return;
+    const idx = st.answers.findIndex((a) => a.questionId === questionId);
+    const rec = idx >= 0 ? st.answers[idx] : { questionId, answeredAt: Date.now() };
+    rec.answer = answer;
+    rec.answeredAt = Date.now();
+    rec.skipped = false;
+    if (idx >= 0) st.answers[idx] = rec; else st.answers.push(rec);
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+  }
+
+  /** 自评（§五十七/一百八十二：😵😕🙂😎；选择后才允许下一题 §一百八十三） */
+  selfRateExamQuestion(examId: string, questionId: string, rating: MasteryRating): void {
+    const st = this.examSessions.get(examId);
+    if (!st) return;
+    const idx = st.answers.findIndex((a) => a.questionId === questionId);
+    const rec = idx >= 0 ? st.answers[idx] : { questionId, answeredAt: Date.now() };
+    rec.selfRating = rating;
+    rec.answeredAt = Date.now();
+    if (idx >= 0) st.answers[idx] = rec; else st.answers.push(rec);
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+  }
+
+  /** 跳过（§一百八十四/一百八十五：记为 skipped，不自动评分） */
+  skipExamQuestion(examId: string, questionId: string): void {
+    const st = this.examSessions.get(examId);
+    if (!st) return;
+    const idx = st.answers.findIndex((a) => a.questionId === questionId);
+    const rec = idx >= 0 ? st.answers[idx] : { questionId, skipped: true, answeredAt: Date.now() };
+    rec.skipped = true;
+    rec.answeredAt = Date.now();
+    if (idx >= 0) st.answers[idx] = rec; else st.answers.push(rec);
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+  }
+
+  /** 按需 AI 评分（§二百二十七/二百二十八：默认不自动触发；评分进 exam_grading cache §一百零八） */
+  async gradeExamQuestion(examId: string, questionId: string): Promise<{ aiScore?: number; aiAssessment?: string } | null> {
+    const e = this.examStore.get(examId);
+    const st = this.examSessions.get(examId);
+    if (!e || !st) return null;
+    const q = e.questions.find((x) => x.id === questionId);
+    const a = st.answers.find((x) => x.questionId === questionId);
+    if (!q || !a || typeof a.answer !== "string") return null;
+    const out = await this.ai.gradeExamAnswer({
+      examId, questionId,
+      question: q.question,
+      referenceAnswer: q.referenceAnswer,
+      sourceEvidence: q.sourceEvidence,
+      userAnswer: a.answer.slice(0, 4000),
+      hasWeb: (q as { webSources?: unknown[] }).webSources?.length ? true : false,
+    });
+    if (!out.ok) { new Notice("AI 评分失败：" + (out.error?.message ?? "未知")); return null; }
+    const g = out.data;
+    a.aiScore = Math.max(1, Math.min(5, Math.round(g.score)));
+    a.aiAssessment = [
+      "AI 评估：" + g.correctness + "（" + g.score + "/5）",
+      ...(g.strengths.length ? ["答对：" + g.strengths.join("；")] : []),
+      ...(g.missing.length ? ["遗漏：" + g.missing.join("；")] : []),
+      ...(g.misconceptions.length ? ["误解：" + g.misconceptions.join("；")] : []),
+    ].join("\n");
+    a.gradedAt = Date.now();
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+    this.rerenderExamSession();
+    return { aiScore: a.aiScore, aiAssessment: a.aiAssessment };
+  }
+
+  /** 下一题 index（§一百八十三：自评后推进；完成返回 null） */
+  examNextIndex(examId: string): number | null {
+    const e = this.examStore.get(examId);
+    const st = this.examSessions.get(examId);
+    if (!e || !st) return null;
+    const total = e.questions.length;
+    if (examSessionFinished(st, total)) return null;
+    const next = st.currentIndex + 1;
+    return next < total ? next : null;
+  }
+
+  /** 推进会话到指定 index（§一百八十八） */
+  advanceExamSession(examId: string, next: number): void {
+    const st = this.examSessions.get(examId);
+    if (!st) return;
+    st.currentIndex = next;
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+    this.rerenderExamSession();
+  }
+
+  /** 考试模式：全部完成后统一揭示答案并完成（§一百八十一） */
+  completeExamAll(examId: string): void {
+    const e = this.examStore.get(examId);
+    const st = this.examSessions.get(examId);
+    if (!e || !st) return;
+    const answered = st.answers.filter((a) => !a.skipped && (typeof a.answer === "string" || a.selfRating));
+    for (const q of e.questions) {
+      if (!st.answers.some((a) => a.questionId === q.id)) {
+        st.answers.push({ questionId: q.id, skipped: true, answeredAt: Date.now() });
+      }
+    }
+    st.status = "completed";
+    st.completedAt = Date.now();
+    st.updatedAt = Date.now();
+    this.examSessions.upsert(st);
+    this.rerenderExamSession();
+    new Notice("考试完成（" + answered.length + " 题作答，跳过 " + (e.questions.length - answered.length) + " 题）。结果只保存在本地；不自动调用 markReviewed（§二百零七）。");
+  }
+
+  /** 重新参加（§一百三十七/一百三十八：同一套题，新会话，0 AI） */
+  retakeExamSession(examId: string): void {
+    const e = this.examStore.get(examId);
+    if (!e) return;
+    this.examSessions.upsert({
+      examId,
+      mode: this.settings.exam.cardMode !== false ? "card" : "exam",
+      currentIndex: 0,
+      answers: [],
+      status: "running",
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    this.rerenderExamSession();
+    new Notice("已开始重新参加（同一套题，新会话，0 AI）。");
+  }
+
+  /** 完成页数据：进度 / 自评掌握 / AI 评估 / 薄弱点（§六十三~六十五） */
+  examSummaryData(examId: string): {
+    progress: ExamProgressStats;
+    self: number | null; ai: number | null; label: string;
+    weak: string[]; strong: string[]; gap: string | null;
+  } {
+    const e = this.examStore.get(examId);
+    const st = this.examSessions.get(examId);
+    const empty = { progress: { total: 0, answered: 0, skipped: 0, rated: 0, graded: 0 }, self: null, ai: null, label: "-", weak: [], strong: [], gap: null };
+    if (!e || !st) return empty;
+    const progress = examProgress(e, st.answers);
+    const self = selfMasteryPercent(st.answers);
+    const ai = aiMasteryPercent(st.answers);
+    return {
+      progress,
+      self,
+      ai,
+      label: self !== null ? masteryLabel(self) : "-",
+      weak: weakConceptsOf(e, st.answers),
+      strong: strongConceptsOf(e, st.answers),
+      gap: masteryGapHint(self, ai),
+    };
+  }
+
+  /** 将本次考试计为复习（§九十八/二百零七：用户显式选择才调用 activity.markReviewed；不 recordAccess §二百零七） */
+  markExamAsReviewed(examId: string): void {
+    const e = this.examStore.get(examId);
+    if (!e) return;
+    this.activity.markReviewed(e.sourcePath);
+    this.rerenderDashboard();
+    new Notice("已将《" + e.title + "》计为复习（只更新 lastReviewedAt/reviewCount，不记录访问）。");
+  }
+
+  /** 收藏一张卡（§一百四十七 快照：0 AI；独立于 AI Cache / Exam §七十七/七十八/七十九） */
+  async saveReviewCard(input: {
+    sourcePath: string; sourceVersion: string; examId?: string;
+    question: string; answer: string; explanation?: string;
+    questionType: ExamQuestionType; sourceEvidence?: string[]; concept?: string; tags?: string[];
+  }): Promise<void> {
+    const dup = this.cards.all().find((c) => c.sourcePath === input.sourcePath && c.question === input.question);
+    if (dup) { new Notice("这张卡已收藏过（不重复，0 AI）。"); return; }
+    try { await this.ensureVaultFolder(cardsDirPath()); } catch { /* ignore */ }
+    const now = Date.now();
+    const card: SavedReviewCard = {
+      id: newCardId(),
+      sourcePath: input.sourcePath,
+      sourceVersion: input.sourceVersion,
+      examId: input.examId,
+      question: input.question.trim().slice(0, 240),
+      answer: input.answer.trim().slice(0, 3000),
+      explanation: input.explanation?.trim().slice(0, 1200),
+      questionType: input.questionType,
+      sourceEvidence: input.sourceEvidence,
+      concept: input.concept,
+      tags: input.tags,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.cards.add(card);
+    try {
+      const p = cardMarkdownPath(card);
+      const existing = this.app.vault.getAbstractFileByPath(normalizePath(p));
+      if (existing instanceof TFile) await this.app.vault.modify(existing, cardMarkdown(card) + "\n");
+      else await this.app.vault.create(p, cardMarkdown(card) + "\n");
+    } catch (err) {
+      new Notice("写入复习卡 Markdown 失败：" + String((err as Error)?.message ?? err));
+    }
+    this.rerenderDashboard();
+    new Notice("已收藏复习卡（0 AI）：" + card.question.slice(0, 40) + (input.examId ? "（来自考试 " + input.examId.slice(0, 8) + "…）" : ""));
+  }
+
+  /** 收藏考试中全部题目为卡（§一百二十二/一百二十四：第一版直接收藏，用户随后在卡视图删除不需要的） */
+  async saveAllCardsFromExam(examId: string): Promise<void> {
+    const e = this.examStore.get(examId);
+    if (!e) return;
+    let saved = 0;
+    for (const q of e.questions) {
+      const dup = this.cards.all().find((c) => c.sourcePath === e.sourcePath && c.question === q.question);
+      if (dup) continue;
+      await this.saveReviewCard({
+        sourcePath: e.sourcePath, sourceVersion: e.sourceVersion, examId: e.id,
+        question: q.question, answer: q.referenceAnswer, explanation: q.explanation,
+        questionType: q.type, sourceEvidence: q.sourceEvidence, concept: q.concept,
+      });
+      saved++;
+    }
+    new Notice("已收藏 " + saved + " 张复习卡（0 AI；可在复习卡视图删除不需要的）。");
+  }
+
+  /** 删除收藏卡（§一百一十二：0 AI；只删卡 Markdown + 索引，绝不删原笔记 §一百四十二） */
+  async deleteCard(cardId: string): Promise<void> {
+    const c = this.cards.get(cardId);
+    if (!c) { new Notice("复习卡不存在。"); return; }
+    const f = this.app.vault.getAbstractFileByPath(normalizePath(cardMarkdownPath(c)));
+    if (f instanceof TFile) await this.app.vault.trash(f, true);
+    this.cards.remove(cardId);
+    this.rerenderDashboard();
+    new Notice("已删除复习卡（0 AI）。");
+  }
+
+  /** 记录复习卡复习（§九十一/二百一十四：0 AI；不调 markReviewed §二百零七） */
+  recordCardReview(cardId: string, rating: MasteryRating): void {
+    const c = this.cards.get(cardId);
+    if (!c) return;
+    const now = Date.now();
+    c.mastery = rating;
+    c.reviewCount = (c.reviewCount ?? 0) + 1;
+    c.lastReviewedAt = now;
+    this.cards.update(c.id, { mastery: rating, reviewCount: c.reviewCount, lastReviewedAt: now });
+    this.cardReviews.add({ cardId, reviewedAt: now, rating });
+    this.rerenderDashboard();
+    new Notice("复习卡已记录（" + rating + "，0 AI；不修改原笔记复习状态）。");
+  }
+
+  /** 打开我的复习卡 View（§八十四：搜索/来源/掌握度；首页最近 5 张 §一百三十） */
+  async openCardsView(): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS);
+    if (leaves.length > 0) {
+      this.app.workspace.revealLeaf(leaves[0]);
+      this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
+      (leaves[0].view as CardsView).refresh();
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: VIEW_TYPE_CARDS, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** Exam 会话视图刷新 */
+  rerenderExamSession(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM)) {
+      (leaf.view as ExamSessionView).refresh();
+    }
+  }
+
+  /** 当前考试会话（视图读取） */
+  getActiveExamSession(): ExamSessionState | null {
+    if (!this.lastExamId) return null;
+    return this.examSessions.get(this.lastExamId) ?? null;
+  }
+
+  /** Dashboard 进度文案（§一百五十） */
+  getExamProgressText(exam: NoteExam, st: ExamSessionState): string {
+    const p = examProgress(exam, st.answers);
+    return "已答 " + p.answered + " / " + p.total + (p.skipped ? " · 跳过 " + p.skipped : "");
+  }
+
+  /** 最近 5 张收藏卡（Dashboard §八十二） */
+  recentCards(limit = 5): SavedReviewCard[] {
+    return this.cards.all().slice(0, limit);
+  }
+
+  /** 考试 Skill 指令（§三十六：内置指令，不额外调 AI） */
+  private examSkillInstructions(): string | null {
+    return "如何构建覆盖全面且能区分真正理解与机械记忆的考试：避免重复题、避免只考表面事实、增加关系/应用/边界考察、题目必须可从指定来源回答。";
+  }
+
+  /** Phase 15：打开 AI 工作台（§二百七十二；mode=ask/research/project；initialText 预填） */
+  openWorkbenchView(mode?: "ask" | "research" | "project", initialText?: string): void {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_WORKBENCH);
+    if (leaves.length) {
+      this.app.workspace.revealLeaf(leaves[0]);
+      this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
+      if (mode) (leaves[0].view as AIWorkbenchView).preset(mode, initialText ?? "");
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf("tab");
+    void leaf.setViewState({ type: VIEW_TYPE_AI_WORKBENCH, active: true }).then(() => {
+      const v = leaf.view;
+      if (v instanceof AIWorkbenchView && mode) v.preset(mode, initialText ?? "");
+    });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** Phase 15：继续最近 AI 任务（打开工作台研究模式） */
+  openWorkbenchResume(): void { this.openWorkbenchView("research"); }
+
+  /** Phase 15：查看 AI 任务（打开工作台任务历史） */
+  openWorkbenchTasks(): void { this.openWorkbenchView(); }
+
+  /** Phase 15 §二百一十六：工具调用日志（只记 toolId/结果/时间；不记参数原文/网页正文） */
+  logWorkbenchToolCall(toolId: string, ok: boolean, _summary: string): void {
+    this.workbenchToolLog.push({ toolId, ok, at: Date.now() });
+    if (this.workbenchToolLog.length > 200) this.workbenchToolLog.splice(0, this.workbenchToolLog.length - 200);
+  }
+
+  /** Phase 15：当前启用 Skills 摘要（ws.skills + registry enabled；只读，不调 AI） */
+  selectedSkillsText(): string {
+    const ws = this.currentWorkspace();
+    const wsSkills = ws?.skills ?? [];
+    const reg = this.settings.skillRegistry ?? [];
+    const enabled = reg.filter((s) => s.enabled).map((s) => s.id);
+    const ids = [...new Set([...wsSkills, ...enabled])];
+    const lines = ids.map((id) => {
+      const s = reg.find((r) => r.id === id) ?? BUILTIN_SKILL_SUMMARIES.find((b) => b.id === id);
+      return "- " + (s?.name ?? id) + (s?.description ? "：" + s.description : "");
+    });
+    return lines.length ? lines.join("\n") : "（未启用 Skills）";
+  }
+
+  /** Phase 16 §46：当前启用 Skill ID 列表（Workspace skills + registry enabled；对称于 selectedSkillsText） */
+  selectedSkillIds(): string[] {
+    const ws = this.currentWorkspace();
+    const wsSkills = ws?.skills ?? [];
+    const reg = this.settings.skillRegistry ?? [];
+    const enabled = reg.filter((s) => s.enabled).map((s) => s.id);
+    return Array.from(new Set([...wsSkills, ...enabled]));
+  }
+
+  /** reindex：exams.json 损坏 → 从 Exams/*.md 恢复（§一百九十六/二百零四；0 AI） */
+  async reindexExams(): Promise<void> {
+    const dir = this.app.vault.getAbstractFileByPath(normalizePath(examDirPath()));
+    if (!(dir instanceof TFolder)) { this.examStore.replaceAll([]); return; }
+    const files = dir.children.filter((f): f is TFile => f instanceof TFile && f.extension === "md");
+    const entries: NoteExam[] = [];
+    for (const f of files) {
+      try {
+        const md = await this.app.vault.adapter.read(f.path);
+        const parsed = parseExamMarkdown(md);
+        if (parsed.exam) entries.push(parsed.exam);
+      } catch { /* 跳过损坏文件 */ }
+    }
+    this.examStore.replaceAll(entries);
+    this.rerenderDashboard();
+  }
+
+  /** reindex：cards.json 损坏 → 从 Review Cards/*.md 恢复（§一百九十六；0 AI） */
+  async reindexCards(): Promise<void> {
+    const dir = this.app.vault.getAbstractFileByPath(normalizePath(cardsDirPath()));
+    if (!(dir instanceof TFolder)) { this.cards.replaceAll([]); return; }
+    const files = dir.children.filter((f): f is TFile => f instanceof TFile && f.extension === "md");
+    const entries: SavedReviewCard[] = [];
+    for (const f of files) {
+      try {
+        const md = await this.app.vault.adapter.read(f.path);
+        const parsed = parseCardMarkdown(md);
+        if (parsed.card) entries.push(parsed.card);
+      } catch { /* 跳过 */ }
+    }
+    this.cards.replaceAll(entries);
+    this.rerenderDashboard();
+  }
+
 }

@@ -85,6 +85,90 @@ export class SiliconFlowProvider {
     }
   }
 
+  /** Phase 16 §26-29：流式输出（SSE）。AbortController 由调用方持有（取消按钮 §28）；
+   *  首个 token（TTFT，§19）通过 onFirstToken 回调记录；增量通过 onDelta 回调。
+   *  流失败由调用方回退普通 chat（§27：禁止重复发起两次相同请求——回退只在 stream 尚未拿到完整结果时执行）。 */
+  async stream(
+    messages: ChatMessage[],
+    opts: ChatOptions,
+    signal?: AbortSignal,
+    onDelta?: (delta: string) => void,
+    onFirstToken?: (at: number) => void
+  ): Promise<ChatResult> {
+    if (!this.cfg.apiKey) throw new AIError("尚未配置 API Key：请到 设置 → AI 中填写。", "MISSING_KEY");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutSec * 1000);
+    if (signal) {
+      const onAbort = () => ctrl.abort();
+      signal.addEventListener("abort", onAbort);
+      (ctrl.signal as unknown as { _kgSignal?: AbortSignal })._kgSignal = signal;
+    }
+    let res: Response;
+    try {
+      res = await fetch(this.endpoint(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + this.cfg.apiKey,
+        },
+        body: JSON.stringify({
+          model: this.cfg.model,
+          messages,
+          temperature: opts.temperature,
+          max_tokens: opts.maxTokens,
+          stream: true,
+        }),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      const msg = this.classifyNetworkError(e, opts.timeoutSec);
+      throw new AIError(msg, msg.indexOf("超时") >= 0 ? "TIMEOUT" : "NETWORK");
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+      try { await res.text(); } catch { /* 丢弃：不把响应体回显（防 Authorization 泄漏） */ }
+      throw new AIError(httpErrorMessage(res.status), "HTTP_" + res.status);
+    }
+    if (!res.body) throw new AIError("网络响应没有可读取的流。", "NETWORK");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let full = "";
+    let firstTokenEmitted = false;
+    let doneSaw = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        for (;;) {
+          const nl = buffer.indexOf("\n");
+          if (nl < 0) break;
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!line || !line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { doneSaw = true; break; }
+          try {
+            const chunk = JSON.parse(payload) as { choices?: { delta?: { content?: string } }[] };
+            const delta = chunk.choices?.[0]?.delta?.content ?? "";
+            if (delta) {
+              if (!firstTokenEmitted && onFirstToken) { onFirstToken(Date.now()); firstTokenEmitted = true; }
+              if (onDelta) onDelta(delta);
+              full += delta;
+            }
+          } catch { /* 跳过非 JSON 行 */ }
+        }
+        if (doneSaw) break;
+      }
+    } finally {
+      void reader.releaseLock();
+    }
+    if (!full.trim()) throw new AIError("API 流式返回为空。", "EMPTY");
+    return { content: full, model: this.cfg.model };
+  }
+
   async testConnection(): Promise<void> {
     await this.chat(
       [{ role: "user", content: "请只回复四个字：连接成功。" }],

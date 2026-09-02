@@ -1,14 +1,17 @@
 import { AIError, SiliconFlowProvider, type ChatMessage, type ChatOptions } from "./provider";
 import { AICache, fingerprintKey } from "./cache";
+import { extractJsonBlockText, parseExamGeneration, parseExamGrading, examCacheDataValid } from "./parsers";
 import { buildConnectionsSystem, buildCuriositySystem, buildDailyReviewUser, buildMonthlyEvolutionUser, buildQuarterlyEvolutionUser, buildQueryExplorationSystem, buildWeeklyReviewUser, type DiscoveryPromptContext, type EvolutionPromptInput, type WeeklyReviewInput } from "../prompts";
 import { buildReviewQuestionsSystem, buildReviewQuestionsUser } from "../prompts";
 import { buildCaptureProcessingSystem } from "../prompts";
+import { buildExamGenerationSystem, buildExamGradingSystem, buildExamGradingUser, EXAM_GENERATION_PROMPT_VERSION, EXAM_GRADING_PROMPT_VERSION, type ExamGenerationInput } from "../prompts";
 import { filterValidQuestions } from "../reviewCenter";
 import { PROCESSING_TYPE_CAPTURE, PROCESSING_VERSION, parseProcessingResult } from "../knowledgeProcessor";
 import { filterConnectionEdges, filterConnectionNodes } from "../knowledgeGraph";
 import { parseQueryExplorationText } from "../queryExplorer";
 import { cacheTypeForFeature } from "../aiRouting";
 import { ANCHOR_PROMPT_VERSION, COPYWRITING_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION, buildAnchorExplorationSystem } from "../prompts";
+import { WORKBENCH_ASK_PROMPT_VERSION, KNOWLEDGE_ASK_PROMPT_VERSION, RESEARCH_PLAN_PROMPT_VERSION, RESEARCH_EXECUTION_PROMPT_VERSION, PROJECT_DEFINITION_PROMPT_VERSION, AGENT_TOOL_CALL_PROMPT_VERSION, SOURCE_SUMMARIZATION_PROMPT_VERSION } from "../prompts";
 import type {
   AIConfig,
   AIFeature,
@@ -23,6 +26,8 @@ import type {
   KnowledgeCandidate,
   ReviewCacheData,
   LongTermReflectionData,
+  ExamAnswerMode,
+  ExamQuestion,
   ReviewQuestion,
 } from "../types";
 
@@ -46,6 +51,17 @@ export const PROMPT_VERSIONS: Record<AICacheType, string> = {
   translation: TRANSLATION_PROMPT_VERSION, // Phase 11：右键翻译（feature 独立路由）
   copywriting: COPYWRITING_PROMPT_VERSION, // Phase 11：文案生成（feature 独立路由）
   anchor_exploration: ANCHOR_PROMPT_VERSION, // Phase 11：Anchor 探索（复用 Query schema）
+  note_exam: EXAM_GENERATION_PROMPT_VERSION,     // Phase 14：考试生成（§四十）
+  exam_grading: EXAM_GRADING_PROMPT_VERSION,     // Phase 14：考试评分（§一百零八）
+  workbench_ask: WORKBENCH_ASK_PROMPT_VERSION,        // Phase 15：Workbench Ask（§一百四十九）
+  workbench_deep: KNOWLEDGE_ASK_PROMPT_VERSION,        // Phase 16：Knowledge Agent Deep（检索→阅读→证据→综合）
+  workbench_research: KNOWLEDGE_ASK_PROMPT_VERSION,    // Phase 16：Research Agent Deep 分支
+  research_plan: RESEARCH_PLAN_PROMPT_VERSION,         // Phase 15：研究计划（§二十一~二十四）
+  research_search: RESEARCH_EXECUTION_PROMPT_VERSION,  // Phase 15：研究执行/检索（Agent Loop §七十七）
+  research_summary: SOURCE_SUMMARIZATION_PROMPT_VERSION, // Phase 15：材料提炼/来源摘要（§一百零五）
+  research_synthesis: RESEARCH_PLAN_PROMPT_VERSION,    // Phase 15：研究综合（复用计划版；语义不同则升版）
+  project_plan: PROJECT_DEFINITION_PROMPT_VERSION,     // Phase 15：项目定义（§三十一）
+  agent_tool_call: AGENT_TOOL_CALL_PROMPT_VERSION,     // Phase 15：Agent 工具意图（§一百四十八）
 };
 
 /** cacheType → AIFeature（路由/统计反推用） */
@@ -64,6 +80,17 @@ const FEATURE_BY_TYPE: Record<AICacheType, AIFeature> = {
   translation: "translation",
   copywriting: "copywriting",
   anchor_exploration: "anchor_exploration",
+  note_exam: "note_exam_generation",
+  exam_grading: "note_exam_grading",
+  workbench_ask: "workbench_ask",
+  workbench_deep: "workbench_deep",
+  workbench_research: "workbench_research",
+  research_plan: "research_planning",
+  research_search: "research_execution",
+  research_summary: "source_summarization",
+  research_synthesis: "research_execution",
+  project_plan: "project_planning",
+  agent_tool_call: "agent_tool_call",
 };
 
 function featureForType(type: AICacheType): AIFeature {
@@ -93,6 +120,8 @@ export interface AICallOpts {
   query?: string;
   /** Phase 8：一次复习 Session 最多生成问题数（§五十六：默认 5） */
   reviewQuestionMax?: number;
+  /** Phase 14 Hotfix：考试生成目标题数上限（validate 传给 parser 作过滤上限，Hotfix §五） */
+  examQuestionMax?: number;
   /** Phase 11：Anchor 探索（§三十）：以当前笔记为中心 */
   anchorTitle?: string;
   anchorPath?: string;
@@ -135,28 +164,6 @@ function filterPaths(notes: unknown, allowed: string[]): { path: string; reason:
   return out;
 }
 
-/** 提取文本中从第一个 { 到第一个闭合 } 之间的 JSON 块（兼容 code fence 包裹，§五十三） */
-export function extractJsonBlockText(text: string): string | null {
-  const i = text.indexOf("{");
-  const j = text.lastIndexOf("}");
-  if (i < 0 || j <= i) return null;
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let k = i; k <= j; k++) {
-    const ch = text[k];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === "\"") inStr = false;
-      continue;
-    }
-    if (ch === "\"") inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) return text.slice(i, k + 1); }
-  }
-  return null;
-}
 
 /** Phase 8：解析并校验 AI 复习问题（§五十三/五十四）。JSON 非法或过滤后无有效问题 → 抛错（只进 error 缓存，Test 12） */
 export function parseReviewQuestionsText(raw: string, allowedPaths: string[], maxQuestions = 5): ReviewQuestion[] {
@@ -259,7 +266,7 @@ export class AIService {
     if (!force) {
       const hit = this.cache.get(key);
       if (hit) {
-        if (hit.status === "success" && hit.data !== undefined) {
+        if (hit.status === "success" && hit.data !== undefined && examCacheDataValid(req.type, hit.data)) {
           console.info("[KnowledgeGarden][AI] cache hit", req.type);
           return { ok: true, data: hit.data as T, fromCache: true, model: hit.model };
         }
@@ -329,6 +336,10 @@ export class AIService {
 
   private errorCode(e: AIError): string {
     const m = e.message;
+    if (m.includes("考试") && m.includes("JSON")) return "EXAM_INVALID_JSON";
+    if (m.includes("考试") && m.includes("字段")) return "EXAM_INVALID_SCHEMA";
+    if (m.includes("无有效题目")) return "EXAM_NO_VALID_QUESTIONS";
+    if (m.includes("评分")) return "EXAM_GRADING_INVALID";
     if (m.includes("尚未配置") || m.includes("API Key")) return "MISSING_KEY";
     if (m.includes("超时") || /timeout/i.test(m)) return "TIMEOUT";
     if (m.includes("API 返回错误")) return "HTTP_ERROR";
@@ -359,6 +370,22 @@ export class AIService {
       const ar = this.parseQueryExploration(content, req.candidatePaths);
       if (!ar) throw new AIError("AI 返回的 Anchor 关联 JSON 非法，或没有有效节点，已校验拒绝。请重试。");
       return ar as unknown as T;
+    }
+    if (req.type === "note_exam") {
+      return parseExamGeneration(content, req.examQuestionMax) as unknown as T;
+    }
+    if (req.type === "exam_grading") {
+      return parseExamGrading(content) as unknown as T;
+    }
+    // Phase 15：Workbench 系列（Ask/研究/项目/Agent）——领域解析链在 service 之外（workbenchParsers / agentLoop）。
+    // validate 只做「合法 JSON 门禁」后原样透传 content；否则会掉入下方 markdown fallback、返回 {markdown,model} 对象，
+    // 导致下游 parser 对对象调用 (content ?? "").trim() 崩溃（Hotfix 根因：trim is not a function）。
+    if (req.type === "workbench_ask" || req.type === "workbench_deep" || req.type === "workbench_research" || req.type === "research_plan" || req.type === "research_search"
+      || req.type === "research_summary" || req.type === "research_synthesis" || req.type === "project_plan"
+      || req.type === "agent_tool_call") {
+      const block = this.extractJsonBlock(content);
+      if (!block) throw new AIError("AI 返回的 Workbench 结果不是合法 JSON，已校验拒绝。请重试。");
+      return content as unknown as T;
     }
     if (req.type === "translation" || req.type === "copywriting") {
       const tx = content.trim();
@@ -735,6 +762,120 @@ export class AIService {
     }, opts.force ?? false);
   }
 
+  /**
+   * Phase 16 §二十六~二十九 / 三十~三十一：Streaming 优先的写作入口（Fast/Deep Rewrite）。
+   * - 缓存命中 → 直接返回全量（AI Request = 0，§三十一）。
+   * - Miss → provider.stream（onDelta 实时渲染；onFirstToken 记 TTFT）；stream 抛错 → 仅回退一次普通 chat（§二十七）。
+   * - 用户取消（AbortController，§二十八）→ 返回 CANCELLED 且不写缓存（取消不是 AI 失败，不污染 error cache）。
+   */
+  async generateForFeatureStream(
+    feature: AIFeature,
+    messages: ChatMessage[],
+    opts: {
+      maxTokens?: number;
+      customKeyParts: string[];
+      force?: boolean;
+      signal?: AbortSignal;
+      onDelta?: (delta: string) => void;
+      onFirstToken?: (at: number) => void;
+    }
+  ): Promise<AIOutcome<string>> {
+    const type = cacheTypeForFeature(feature) as AICacheType;
+    const req: AIGenerateRequest = {
+      type,
+      feature,
+      candidateLines: [],
+      candidatePaths: [],
+      areaLines: [],
+      dateLabel: "",
+      candidateSig: "",
+      areaSig: "",
+      periodKey: "",
+      customKeyParts: opts.customKeyParts,
+      messages,
+      chatOpts: this.chatOpts(feature, opts.maxTokens),
+      allowReview: false,
+    };
+    const key = this.buildKey(req);
+    const kf = opts.force ? key + ":force" : key;
+    if (!opts.force) {
+      const hit = this.cache.get(key);
+      if (hit && hit.status === "success" && typeof hit.data === "string") {
+        console.info("[KnowledgeGarden][AI] cache hit (stream)", type);
+        return { ok: true, data: hit.data as string, fromCache: true, model: hit.model };
+      }
+      if (hit && hit.status === "error" && hit.error) {
+        console.info("[KnowledgeGarden][AI] cache hit error (stream)", type);
+        return { ok: false, error: hit.error, fromCache: true };
+      }
+    }
+    const existing = this.inFlight.get(kf) as Promise<AIOutcome<string>> | undefined;
+    if (existing) return existing;
+    const promise = this.requestOnceStream(req, key, opts);
+    this.inFlight.set(kf, promise as Promise<AIOutcome<unknown>>);
+    try { return await promise; } finally { this.inFlight.delete(kf); }
+  }
+
+  private async requestOnceStream(
+    req: AIGenerateRequest,
+    key: string,
+    opts: { signal?: AbortSignal; onDelta?: (delta: string) => void; onFirstToken?: (at: number) => void }
+  ): Promise<AIOutcome<string>> {
+    this.recordRequest(req.type);
+    const now = Date.now();
+    const route = this.routeFor(req.feature ?? featureForType(req.type));
+    const provider = this.provider(req.feature ?? featureForType(req.type));
+    try {
+      let content: string;
+      let model: string;
+      try {
+        const res = await provider.stream(req.messages, req.chatOpts, opts.signal, opts.onDelta, opts.onFirstToken);
+        content = res.content;
+        model = res.model;
+      } catch {
+        // §二十七：stream 失败 → 回退普通 chat（仅一次；stream 正常时绝不重复发起两个请求）
+        const res = await provider.chat(req.messages, req.chatOpts);
+        content = res.content;
+        model = res.model;
+      }
+      const data = this.validate<string>(content, req);
+      this.cache.put({
+        key,
+        type: req.type,
+        createdAt: now,
+        updatedAt: now,
+        model,
+        promptVersion: PROMPT_VERSIONS[req.type],
+        candidateFingerprint: req.candidateSig,
+        configFingerprint: this.configFingerprint(req.feature ?? featureForType(req.type)),
+        status: "success",
+        data: data as AICacheEntry["data"],
+      } as AICacheEntry<any>);
+      console.info("[KnowledgeGarden][AI] cache miss -> success (stream)", req.type);
+      return { ok: true, data, fromCache: false, model };
+    } catch (e) {
+      if (opts.signal && opts.signal.aborted) {
+        return { ok: false, error: { code: "CANCELLED", message: "已取消当前请求。" }, fromCache: false };
+      }
+      const err = e instanceof AIError ? e : new AIError(String((e as Error)?.message || "未知错误"));
+      const info: AICacheErrorInfo = { code: this.errorCode(err), message: err.message };
+      this.cache.put({
+        key,
+        type: req.type,
+        createdAt: now,
+        updatedAt: now,
+        model: route.model,
+        promptVersion: PROMPT_VERSIONS[req.type],
+        candidateFingerprint: req.candidateSig,
+        configFingerprint: this.configFingerprint(req.feature ?? featureForType(req.type)),
+        status: "error",
+        error: info,
+      } as AICacheEntry<any>);
+      console.info("[KnowledgeGarden][AI] cache miss -> error (stream)", req.type, info.code);
+      return { ok: false, error: info, fromCache: false };
+    }
+  }
+
   // ---------- Phase 11：AI 请求统计（今日调用次数；本地诊断，不记 Key/Prompt/网页正文） ----------
   private statDayKey = "";
   private statByFeature = new Map<string, number>();
@@ -768,4 +909,128 @@ export class AIService {
     if (!hit) return "none";
     return hit.status === "success" ? "success" : "error";
   }
+
+
+  /** Phase 14 §一百一十四~一百一十六：生成笔记知识考试（§40/41 cache key：sourcePath+sourceVersion+mode+topic+count+difficulty+answerMode+model+promptVersion+contextHash+workspace+skill+web）。 */
+  async generateExam(
+    opts: {
+      sourcePath: string;
+      sourceVersion: string;
+      noteTitle: string;
+      noteText: string;                    // 已按 Context Policy 截断
+      mode: "holistic" | "custom";
+      topic?: string;
+      questionCount: number;
+      difficulty?: "easy" | "medium" | "hard";
+      answerMode: ExamAnswerMode;
+      webEnabled: boolean;
+      webContextLines?: string[];          // web_allowed 时的外部补充
+      skillInstructions?: string;          // Exam Skill（可选）
+      workspaceFingerprint?: string;       // §四十六：Workspace 参与 → 缓存失效
+      skillFingerprint?: string;           // §四十六
+      contextHash?: string;                // §四十一：Exam Context Hash
+    },
+    force = false
+  ): Promise<AIOutcome<{ title: string; coverageTopics?: string[]; questions: ExamQuestion[] }>> {
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: buildExamGenerationSystem({
+          mode: opts.mode,
+          topic: opts.topic,
+          questionCount: opts.questionCount,
+          difficulty: opts.difficulty,
+          answerMode: opts.answerMode,
+          noteTitle: opts.noteTitle,
+          noteText: opts.noteText,
+          webContextLines: opts.webContextLines,
+          skillInstructions: opts.skillInstructions,
+        }),
+      },
+      { role: "user", content: "请只输出符合 schema 的 JSON。若原文信息不足，题目的 referenceAnswer 明确写“原文没有足够信息回答该题”，不要编造。" },
+    ];
+    return this.exec<{ title: string; coverageTopics?: string[]; questions: ExamQuestion[] }>({
+      type: "note_exam",
+      feature: "note_exam_generation",
+      candidateLines: [],
+      candidatePaths: [opts.sourcePath],
+      areaLines: [],
+      dateLabel: "",
+      candidateSig: fingerprintKey([opts.sourcePath, opts.sourceVersion]),
+      areaSig: "",
+      periodKey: "",
+      customKeyParts: [
+        "exam",
+        opts.sourcePath,
+        opts.sourceVersion,
+        opts.mode,
+        opts.topic ?? "",
+        String(opts.questionCount),
+        opts.difficulty ?? "medium",
+        opts.answerMode,
+        "web:" + (opts.webEnabled ? "1" : "0"),
+        "ws:" + (opts.workspaceFingerprint ?? ""),
+        "skill:" + (opts.skillFingerprint ?? ""),
+        "ctx:" + (opts.contextHash ?? ""),
+      ],
+        examQuestionMax: opts.questionCount,
+      messages,
+      chatOpts: this.chatOpts("note_exam_generation", 3000),
+      allowReview: false,
+    }, force);
+  }
+
+  /** Phase 14 §一百五十九/一百六十二：开放题按需 AI 评分（§164 cache 不含 API Key；答案/参考变 → miss）。 */
+  async gradeExamAnswer(
+    opts: {
+      examId: string;
+      questionId: string;
+      question: string;
+      referenceAnswer: string;
+      sourceEvidence?: string[];
+      userAnswer: string;
+      hasWeb?: boolean;
+      model?: string; // 信息性
+      workspaceFingerprint?: string;
+      skillFingerprint?: string;
+    },
+    force = false
+  ): Promise<AIOutcome<{ correctness: "correct" | "partial" | "wrong"; score: number; strengths: string[]; missing: string[]; misconceptions: string[] }>> {
+    const messages: ChatMessage[] = [
+      { role: "system", content: buildExamGradingSystem() },
+      {
+        role: "user",
+        content: buildExamGradingUser({
+          question: opts.question,
+          referenceAnswer: opts.referenceAnswer,
+          sourceEvidence: opts.sourceEvidence,
+          userAnswer: opts.userAnswer,
+          hasWeb: opts.hasWeb,
+        }),
+      },
+    ];
+    return this.exec<{ correctness: "correct" | "partial" | "wrong"; score: number; strengths: string[]; missing: string[]; misconceptions: string[] }>({
+      type: "exam_grading",
+      feature: "note_exam_grading",
+      candidateLines: [],
+      candidatePaths: [],
+      areaLines: [],
+      dateLabel: "",
+      candidateSig: fingerprintKey([opts.examId, opts.questionId, opts.referenceAnswer]),
+      areaSig: "",
+      periodKey: "",
+      customKeyParts: [
+        "grade",
+        opts.examId,
+        opts.questionId,
+        fingerprintKey([opts.referenceAnswer, opts.userAnswer]), // §一百零九/一百六十五：答案或参考变化 → miss
+        "ws:" + (opts.workspaceFingerprint ?? ""),
+        "skill:" + (opts.skillFingerprint ?? ""),
+      ],
+      messages,
+      chatOpts: this.chatOpts("note_exam_grading", 1200),
+      allowReview: false,
+    }, force);
+  }
 }
+

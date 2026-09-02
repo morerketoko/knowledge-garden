@@ -170,7 +170,18 @@ export type AIFeature =
   | "writing_research"    // 研究问题 / 文献综合 / 假设
   | "writing_application" // 知识迁移 / 应用
   | "writing_brainstorm"  // 头脑风暴 / 反方 / 苏格拉底
-  | "writing_copy";       // 普通改写 / 润色 / 自定义
+  | "writing_copy"        // 普通改写 / 润色 / 自定义
+  | "note_exam_generation" // Phase 14：笔记知识考试生成（功能级独立路由 §106）
+  | "note_exam_grading"
+  // Phase 15：AI Workbench（§一百四十九：Feature 级独立路由）
+  | "workbench_ask"
+  | "workbench_deep"      // Phase 16：Knowledge Agent 深度回答（检索→阅读→证据→综合）
+  | "workbench_research"  // Phase 16：Research Agent 深度分支
+  | "research_planning"
+  | "research_execution"
+  | "project_planning"
+  | "agent_tool_call"
+  | "source_summarization";
 
 /** AI Provider 类型：第一版仅 OpenAI-compatible（SiliconFlow 等，见 ProviderId） */
 export type AIProviderType = "openai_compatible";
@@ -367,8 +378,12 @@ export interface PluginSettings {
   /** 全局权限策略（§九十：默认 LOCAL_READ allow、写入/关系/外网 ask、删除 deny） */
   permissionsPolicy: Partial<Record<AIActionCategory, PermissionValue>>;
   webSearch: WebSearchConfig;
+  /** Phase 14：知识考试配置（考点生成/评分 Profile、默认参数、Web 默认关闭 §165/176） */
+  exam: ExamConfig;
   /** Phase 13.5 §14/15/17：全局默认 Profile ID。缺省 → 回退 DEFAULT_PROFILE_ID="default"，兼容 Phase 11 迁移行为。 */
   defaultProfileId?: string;
+  /** Phase 15：AI Workbench 配置（§二百五十八；Web 默认关闭 §四十二） */
+  workbench: WorkbenchConfig;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -457,12 +472,36 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   aiProfiles: [], // 首次启动由旧 settings.ai 自动迁移生成 default（§一百三十九），见 main.loadSettings
   aiFunctionConfig: [],
   webSearch: { providers: [] },
+  // Phase 14：知识考试（§176 默认：holistic / 5 题 / 中等 / 原文优先 / 卡片模式 / Web 关闭）
+  exam: {
+    generationProfileId: "",
+    gradingProfileId: "",
+    defaultMode: "holistic",
+    defaultCount: 5,
+    defaultDifficulty: "medium",
+    defaultAnswerMode: "source_preferred",
+    webEnabled: false,
+    relatedNotesEnabled: false,
+    autoGrade: false,
+    cardMode: true,
+  },
   // Phase 13：Workspace / Skills / Capability / Permission（默认跟随旧行为，§一百二十九）
   workspaces: [],
   currentWorkspaceId: null,
   skillRegistry: [],
   modelMetadata: [],
   permissionsPolicy: {},
+  // Phase 15：AI Workbench（§二百五十八；Web 默认关闭 §四十二；批量写默认 5 §七十五）
+  workbench: {
+    enabled: true,
+    maxSteps: 8,               // 5 / 8 / 12（§二百五十八）
+    maxQueries: 5,             // 默认 5（§四十四）
+    maxPages: 10,              // 默认 10（§四十六）
+    maxChars: 20000,           // 默认 20000（§五十五）
+    maxBatchWrites: 5,         // 1 / 5 / 10（§七十五）
+    webEnabledByDefault: false, // Web 必须显式启用（§四十二/二百五十八）
+    historyLimit: 20,          // 任务/问题历史保留条数（§一百九十三）
+  },
 };
 export function todayKey(date = new Date()): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
@@ -548,7 +587,18 @@ export type AICacheType =
   | "knowledge_processing"
   | "translation"
   | "copywriting"
-  | "anchor_exploration";
+  | "anchor_exploration"
+  | "note_exam"        // Phase 14：考试生成缓存（§40/41）
+  | "exam_grading"
+  | "workbench_ask"
+  | "workbench_deep"      // Phase 16：Knowledge Agent 深度回答（检索→阅读→证据→综合）
+  | "workbench_research"  // Phase 16：Research Agent 深度分支
+  | "research_plan"
+  | "research_search"
+  | "research_summary"
+  | "research_synthesis"
+  | "project_plan"
+  | "agent_tool_call";
 
 export interface AICacheErrorInfo {
   /** TIMEOUT | NETWORK | HTTP_<status> | INVALID_JSON | EMPTY_RESPONSE | MISSING_KEY | OTHER */
@@ -904,7 +954,7 @@ export interface QueryHistoryFile {
 /** ---------- Saved Exploration / 收藏知识链路（Saved Exploration 阶段） ---------- */
 
 /** 收藏来源（九：奇想 / 主动探索 / 知识连接；manual 预留） */
-export type SavedExplorationSource = "daily_curiosity" | "query_exploration" | "connection" | "manual" | "anchor_exploration";
+export type SavedExplorationSource = "daily_curiosity" | "query_exploration" | "connection" | "manual" | "anchor_exploration" | "workbench_ask";
 
 /** 收藏节点快照（六：保存完整快照，不依赖 AI Cache） */
 export interface SavedExplorationNode {
@@ -1074,3 +1124,381 @@ export interface SuggestedRelationship {
   reason?: string;
 }
 
+
+
+/* ================= Phase 14：Note Exam / Review Cards / Mastery（§一~§二百四十五） ================= */
+/** 考试题型（§十九 + §二十一 counterexample） */
+export type ExamQuestionType =
+  | "recall"            // 回忆 / 复述
+  | "explanation"       // 解释机制（为什么 / 怎么工作）
+  | "comparison"        // 比较 / 异同
+  | "application"       // 应用 / 迁移
+  | "true_false"        // 判断（不能靠措辞猜，§二十四）
+  | "multiple_choice"   // 选择（干扰项来自真实误区，§二十三）
+  | "counterexample";   // 反例 / 边界条件（§二十一）
+
+/** 答案来源模式（§十五：source_only / source_preferred / web_allowed） */
+export type ExamAnswerMode = "source_only" | "source_preferred" | "web_allowed";
+export type ExamDifficulty = "easy" | "medium" | "hard";
+export type ExamMode = "holistic" | "custom";
+
+/** 自评 / 掌握度（§五十七：😵😕🙂😎 → forgot/hard/good/easy） */
+export type MasteryRating = "forgot" | "hard" | "good" | "easy";
+
+/** Web 补充来源（§十八：真实 URL，绝不伪造） */
+export interface ExamSource {
+  title: string;
+  url: string;
+  retrievedAt: number;
+}
+
+/** 考试题目（§二十五结构） */
+export interface ExamQuestion {
+  id: string;
+  type: ExamQuestionType;
+  question: string;
+  options?: string[];       // multiple_choice 选项 A/B/C/D
+  correctAnswer?: string;   // 选择 / 判断的客观答案（本地展示用）
+  referenceAnswer: string;  // 参考答案（source-grounded；web_allowed 可含外部补充）
+  explanation?: string;     // 解释 / 为什么
+  sourceEvidence?: string[];// 原文关键短句证据（≤300 字/条，§二十六/二十七）
+  sourcePath: string;       // 来源原笔记 path（§一百三十三）
+  webSources?: ExamSource[];// 外部补充来源（仅 web_allowed）
+  difficulty?: ExamDifficulty;
+  concept?: string;         // 考点概念（Weak Areas / 收藏卡标签用，§六十五）
+}
+
+/** 一份知识考试（§三结构：绑定一篇原始笔记） */
+export interface NoteExam {
+  id: string;
+  sourcePath: string;
+  sourceVersion: string;    // 生成时源笔记内容指纹（§三/41/42：源变化 → 缓存失效）
+  title: string;
+  mode: ExamMode;
+  topic?: string;           // custom 主题
+  questionCount: number;
+  difficulty?: ExamDifficulty;
+  answerMode: ExamAnswerMode;
+  questions: ExamQuestion[];
+  examVersion: number;      // 重新生成 +1（§一百四十）
+  coverageTopics?: string[];// 主要覆盖主题（§二百二十/二百二十一，不冒充 100% 覆盖）
+  createdAt: number;
+  updatedAt: number;
+  generatedModel?: string;  // 生成所用模型（信息性，不入 Key 外泄）
+}
+
+/** 用户对单题的作答（§五十六 / 一百八十六） */
+export interface ExamAnswer {
+  questionId: string;
+  answer?: string;
+  selfRating?: MasteryRating;
+  aiScore?: number;              // AI 评分 0-5（按需触发 §二百二十七）
+  aiCorrectness?: "correct" | "partial" | "wrong";
+  aiAssessment?: string;         // AI 评价（本地 Markdown 保存 §一百九十二）
+  skipped?: boolean;
+  answeredAt?: number;
+  gradedAt?: number;
+}
+
+/** 考试会话状态（§五十五 / 一百八十七 持久化） */
+export interface ExamSessionState {
+  examId: string;
+  mode: "card" | "exam";      // §七十一：Card Mode / Exam Mode
+  currentIndex: number;
+  answers: ExamAnswer[];
+  status: "pending" | "running" | "completed" | "abandoned"; // §一百八十九
+  startedAt: number;
+  updatedAt: number;
+  completedAt?: number;
+}
+
+/** 收藏复习卡（§七十六：完整快照，独立于 AI Cache / Exam，可随 Vault 恢复） */
+export interface SavedReviewCard {
+  id: string;
+  sourcePath: string;
+  sourceVersion: string;      // 收藏时源笔记版本（快照 §七十七/一百四十七）
+  examId?: string;            // 来源考试（§一百四十四：不依赖 Exam 存在）
+  question: string;
+  answer: string;
+  explanation?: string;
+  questionType: ExamQuestionType;
+  sourceEvidence?: string[];
+  webSources?: ExamSource[];
+  concept?: string;
+  tags?: string[];
+  mastery?: MasteryRating;    // 最近自评（§八十九）
+  masteryScore?: number;      // 最近自评 0-100（§六十二）
+  reviewCount?: number;
+  lastReviewedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 复习卡复习历史（§九十一：CardReviewRecord） */
+export interface CardReviewRecord {
+  cardId: string;
+  reviewedAt: number;
+  rating: MasteryRating;
+}
+
+/** Exam 配置（§一百七十三/一百七十六：默认全开最小参数；高级设置不要求小白理解 §一百七十八） */
+export interface ExamConfig {
+  generationProfileId?: string; // Exam 生成路由 Profile（§一百七十三）
+  gradingProfileId?: string;    // Exam 评分路由 Profile（§一百七十三）
+  defaultMode: ExamMode;
+  defaultCount: number;
+  defaultDifficulty: ExamDifficulty;
+  defaultAnswerMode: ExamAnswerMode;
+  webEnabled: boolean;          // 默认 OFF（§一百七十五）
+  relatedNotesEnabled: boolean; // 相关知识默认 OFF（§三十二/三十三）
+  autoGrade: boolean;           // AI 自动评分默认 OFF（§二百二十七 按需触发）
+  cardMode: boolean;            // 默认 Card Mode（§七十二）
+}
+/* =====================================================================
+ * Phase 15：AI Workbench / Research Agent / Knowledge Workspace（§一~三百一十一）
+ * ---------------------------------------------------------------------
+ * 三种模式：Ask（本地检索→带来源回答）/ Research（计划→确认→执行）/ Project（定义→确认→建项目）
+ * 领域类型仅描述结构与缓存形状，不承载 Prompt / API Key / 完整网页正文。
+ * ===================================================================== */
+
+/** Phase 15 §14：AI 回答的来源条目（Ask 答案必须可追溯；假路径/假 URL 一律拒绝） */
+export interface AIAnswerSource {
+  /** 来源分类：Vault 笔记 / Web 网页 / 无来源（推理） */
+  type: "vault" | "web" | "inference";
+  /** Vault 笔记相对路径（type=vault 时必须存在） */
+  path?: string;
+  title?: string;
+  /** Web 网页 URL（type=web 时必须存在且经 web.related 校验） */
+  url?: string;
+  /** 来源摘要（≤500 字符，用于展示；不存整页正文） */
+  snippet?: string;
+  /** 为什么引用这个来源（AI 说明，可展示但不算验证） */
+  reason?: string;
+}
+
+/** Phase 15 §105：来源登记（Source Ledger）——统一去重 + 稳定 ID，回答与研究报告共用 */
+export interface SourceRecord {
+  id: string;
+  type: "vault" | "web" | "project" | "user";
+  title?: string;
+  path?: string;   // vault
+  url?: string;    // web
+  snippet?: string;
+  retrievedAt?: number;
+}
+
+/** Phase 15 §33：知识项目（Project Builder 产出物；Markdown 为 truth，cache 仅为索引） */
+export interface ProjectMilestone {
+  title: string;
+  status: "todo" | "in_progress" | "done";
+}
+
+export interface KnowledgeProject {
+  id: string;
+  name: string;
+  description?: string;
+  rootFolder?: string;
+  workspaceId?: string;
+  goals: string[];
+  questions: string[];
+  milestones: ProjectMilestone[];
+  status: "draft" | "active" | "paused" | "completed";
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Phase 15 §28：Research Task 状态机 */
+export type ResearchTaskStatus =
+  | "planning"
+  | "ready"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/** Phase 15 研究任务持久化条目（cache/ai-tasks.json；只存元数据与步骤摘要，不存 Prompt/API Key/整页正文） */
+export interface ResearchTask {
+  taskId: string;
+  title: string;
+  mode: "research" | "project";
+  status: ResearchTaskStatus;
+  createdAt: number;
+  updatedAt: number;
+  workspaceId?: string;
+  projectId?: string;
+  /** 研究问题（用户输入原文） */
+  question: string;
+  /** 研究计划步骤（用户确认后执行） */
+  plan?: string[];
+  planConfirmed?: boolean;
+  maxSteps: number;
+  /** Agent Loop 步骤摘要（taskId/stepIndex/tool/toolResultSummary；§七十八） */
+  steps?: ResearchStepSummary[];
+  /** 已完成/失败原因（错误只存分类摘要） */
+  error?: string;
+  /** 最终研究结论（Markdown 摘要；不存原始网页） */
+  resultSummary?: string;
+  outputPath?: string; // 研究材料/结论的 Vault 路径（若有）
+  cancelRequested?: boolean;
+}
+
+/** Phase 15 §78：Agent Loop 单步摘要（不保存整页网页全文到日志） */
+export interface ResearchStepSummary {
+  stepIndex: number;
+  tool: string;
+  toolArgs?: string;          // 参数摘要（不存敏感内容）
+  toolResultSummary?: string; // 结果摘要（截断）
+  at: number;
+}
+
+/** Phase 15 §153：工具调用（Agent 意图）与工具结果 */
+export interface ToolCall {
+  id: string;
+  toolId: string;
+  args: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface ToolResult {
+  ok: boolean;
+  summary: string;   // 截断后的结果摘要（≤ 12000 字符等，见 §七十九）
+  data?: unknown;    // 结构化数据（仅本地展示；不写入 AI Cache）
+  error?: string;    // 失败原因摘要
+}
+
+/** Phase 15 §64：AI Tool Registry（工具逻辑独立于 UI；权限走 permissions.ts） */
+export interface AITool {
+  id: string;
+  name: string;
+  description: string;
+  actionCategory: AIActionCategory;
+}
+
+/** Phase 15 §193：Workbench 任务历史（不是聊天历史；只存元数据） */
+export interface WorkbenchTaskHistoryEntry {
+  taskId: string;
+  title: string;
+  mode: "ask" | "research" | "project";
+  workspaceId?: string;
+  projectId?: string;
+  createdAt: number;
+  status: ResearchTaskStatus;
+}
+
+/** Phase 15 Workbench 配置（§二百五十八：maxSteps 可配 5/8/12；Web 默认关闭） */
+export interface WorkbenchConfig {
+  enabled: boolean;
+  maxSteps: number;          // 5 | 8 | 12
+  maxQueries: number;        // 默认 5
+  maxPages: number;          // 默认 10
+  maxChars: number;          // 默认 20000
+  maxBatchWrites: number;    // 默认 5（1/5/10）
+  webEnabledByDefault: boolean; // 默认 false（§四十二：Web 必须显式启用）
+  historyLimit: number;      // 任务/问题历史保留条数（默认 20）
+}
+
+/* =====================================================================
+ * Phase 17：AI Workbench 2.0 —— 气泡消息 / Message Artifact / Visible Action Trace
+ * ---------------------------------------------------------------------
+ * - WorkbenchMessage：用户与 AI 的交流单位（§81 最终理念）。
+ * - WorkbenchTraceEvent：AI 实际做过的高层行为摘要（§37），绝不包含 hidden reasoning（§130 禁止）。
+ * - MessageArtifact：用户决定长期保存的 AI 产物（§14-15），独立于 AI Cache（§31/79）。
+ * ===================================================================== */
+
+/** Phase 17 §五：Workbench 消息角色 */
+export type WorkbenchMessageRole = "user" | "assistant" | "system";
+
+/** Phase 17 §五：消息状态（Streaming 生命周期） */
+export type WorkbenchMessageStatus = "pending" | "streaming" | "complete" | "error";
+
+/** Phase 17 §13：AI 气泡底部动作 */
+export type WorkbenchMessageAction =
+  | "copy"
+  | "copy_with_sources"
+  | "save"
+  | "continue_ask"
+  | "deep_analyze"
+  | "explore_links"
+  | "save_research_note"
+  | "refine_knowledge";
+
+/** Phase 17 §五：Workbench 消息（单条气泡；AI 输出含 sources/actions/status） */
+export interface WorkbenchMessage {
+  id: string;
+  role: WorkbenchMessageRole;
+  content: string;
+  createdAt: number;
+  taskId?: string;
+  sources?: AIAnswerSource[];
+  actions?: WorkbenchMessageAction[];
+  model?: string;
+  status?: WorkbenchMessageStatus;
+  /** 已保存的 Artifact 引用（§84：📎 已保存：[[…]]） */
+  artifactRefs?: ArtifactRef[];
+  errorCode?: string;
+}
+
+/** Phase 17 §84：Artifact 引用（会话内展示 / Session 恢复） */
+export interface ArtifactRef {
+  artifactId: string;
+  title: string;
+  vaultPath: string;
+  createdAt: number;
+}
+
+/** Phase 17 §37/43：Trace Stage（高层行为阶段；真实来自 Task/Tool 事件，绝不伪造 §42） */
+export type WorkbenchTraceStage =
+  | "planning"
+  | "retrieval"
+  | "reading"
+  | "web"
+  | "synthesis"
+  | "writing"
+  | "saving";
+
+/** Phase 17 §37-39：Trace Event（只保存高层摘要与安全参数摘要；禁止 hidden reasoning / 全文） */
+export interface WorkbenchTraceEvent {
+  id: string;
+  stage: WorkbenchTraceStage;
+  status: "running" | "done" | "failed";
+  summary: string;
+  tool?: string;                // 例如 vault.search / vault.read / web.fetch
+  toolParamsSummary?: string;   // 安全摘要：query = 模块化（不存完整内部参数 §38）
+  count?: number;               // 找到 12 篇 / 读取 5 篇 / Web 3 页
+  timestamp: number;
+}
+
+/** Phase 17 §15：AI Message Artifact（保存到 Vault 的 AI 产物；独立于 Cache/Workspace/Prompt/Model §78） */
+export type ArtifactType = "answer" | "research" | "summary" | "draft" | "analysis" | "outline";
+
+export interface MessageArtifact {
+  id: string;
+  messageId: string;
+  taskId?: string;
+  title: string;
+  content: string;
+  artifactType: ArtifactType;
+  sources?: AIAnswerSource[];
+  workspaceId?: string;
+  projectId?: string;
+  /** 产物在 Vault 中的最终路径（保存后写入） */
+  vaultPath: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Phase 17 索引条目（cache/artifacts.json 只存元数据与来源快照摘要；不存 AI 全文/推理） */
+export interface ArtifactIndexEntry {
+  id: string;
+  messageId: string;
+  taskId?: string;
+  title: string;
+  artifactType: ArtifactType;
+  vaultPath: string;
+  workspaceId?: string;
+  projectId?: string;
+  sourceCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
