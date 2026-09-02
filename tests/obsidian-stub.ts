@@ -13,4 +13,4 @@ export const setIcon = (): void => {};
 export const Platform = { isMobile: false };
 export const requestUrl = async (): Promise<{ text: string; json: unknown; status: number }> => ({ text: "", json: null, status: 200 });
 export const parseYaml = (s: string): unknown => ({} as unknown);
-export const stringifyYaml = (o: unknown): string => JSON.stringify(o);
+export const stringifyYaml = (o: unknown): string => JSON.stringify(o);export class App { vault = {} as never; }

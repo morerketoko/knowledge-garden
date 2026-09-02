@@ -22,15 +22,20 @@ import type { AIService, AIOutcome } from "./ai/service";
 import { parseResearchPlan, parseProjectDefinition, parseWorkbenchAskText, parseKnowledgeAskText, type ResearchPlanParsed, type ProjectDefinitionParsed, type KnowledgeAskParsed } from "./workbenchParsers";
 import { classifyTaskComplexity, contextBudgetFor, maxStepsFor, type TaskComplexity } from "./taskClassifier";
 import { fingerprintKey } from "./ai/cache";
+import { tokenizeText } from "./searchIndex";
+import { rankSearchResults } from "./queryExplorer";
 import { LatencyTracker } from "./latency";
 import { workspaceFingerprint } from "./workspace";
 import { skillCachePart } from "./skills";
 import type { PromptTemplate } from "./promptLibrary";
 import { ledgerUpsert, type SourceLedgerStore } from "./sourceLedger";
-import type { AIAnswerSource, KnowledgeProject, ResearchTask, SourceRecord, WorkbenchTraceEvent } from "./types";
+import type { AIAnswerSource, KnowledgeProject, ResearchTask, SourceRecord, WorkbenchTraceEvent, KnowledgeArea } from "./types";
+import type { NoteMetadata } from "./noteIndex";
 import { sessionIdFor, workbenchMessageId, traceEventId, type WorkbenchSessionRecord } from "./workbenchSession";
 
 /** Phase 16 §58-64/66：Ask 附加选项（Context Shelf + Session 追问） */
+export const RETRIEVAL_VERSION = "v2";
+
 export interface WorkbenchAskOptions {
   /** Context Shelf：用户显式挑选的笔记（强制读取进证据；不算偷偷添加 §64） */
   shelfNotes?: string[];
@@ -120,26 +125,28 @@ export class WorkbenchService {
     return !!this.settings().workbench?.webEnabledByDefault;
   }
 
-  /** 本地检索（vault.search 用 SearchIndex / NoteIndex，§六十六：不整库读 Markdown） */
+  /** 本地检索（v2：中文 unigram + SearchIndex + 相关性排序；§六十六） */
   private vaultSearch(query: string, limit: number): { path: string; snippet: string }[] {
+    const tokens = tokenizeText(query || "");
+    if (tokens.length === 0) return [];
     const idx = this.plugin.searchIndex;
     try {
       if (idx && typeof idx.search === "function") {
-        const tokens = (query || "").toLowerCase().split(/[\s\u4e00-\u9fff]+/).filter((t) => t.length >= 2);
-        const docs = idx.search(tokens, limit);
-        return (docs || []).map((d) => ({
-          path: d.path,
-          snippet: (d.title || d.path) + " … " + (d.headings?.join(" / ") || ""),
-        }));
+        const docs = idx.search(tokens, Math.max(limit * 4, 200));
+        if (docs.length > 0) {
+          const areas: KnowledgeArea[] = this.settings().knowledgeAreas ?? [];
+          const allNotes = new Map<string, NoteMetadata>(this.plugin.index.all().map((n) => [n.path, n]));
+          const ranked = rankSearchResults(docs, tokens, areas, allNotes);
+          return ranked.slice(0, limit).map((r) => ({
+            path: r.doc.path,
+            snippet: (r.doc.title || r.doc.path) + " … " + (r.doc.headings?.join(" / ") || ""),
+          }));
+        }
       }
-    } catch { /* 索引不可用时退回文件名匹配 */ }
-    const paths = this.plugin.index.all().map((n) => n.path);
-    const q = (query || "").toLowerCase();
-    return paths
-      .filter((p) => p.toLowerCase().includes(q))
-      .slice(0, limit)
-      .map((p) => ({ path: p, snippet: p }));
+    } catch { /* 索引异常时退回 token 文件名匹配 */ }
+    return fallbackSearch(query, this.plugin.index.all().map((n) => n.path), limit);
   }
+
 
   /** 读取笔记（vault.read） */
   private async readNote(path: string): Promise<string | null> {
@@ -318,7 +325,7 @@ export class WorkbenchService {
       const out = await this.ai().generateForFeature(feature, [
         { role: "system", content: sys },
         { role: "user", content: question },
-      ], { maxTokens: complexity === "simple" ? 1200 : 2200, customKeyParts: ["ask", "cx:" + complexity, fingerprintKey(["q", question]), fingerprintKey(["ctx", vaultCtx, evidenceCtx]), fingerprintKey(["cv", readPaths.join(",")]), workspaceFingerprint(this.plugin.currentWorkspace() ?? undefined), skillCachePart(skillIds, this.plugin.settings?.skillRegistry ?? [], (id) => this.plugin.readSkill?.(id) ?? null)], force: opts?.force ?? false });
+      ], { maxTokens: complexity === "simple" ? 1200 : 2200, customKeyParts: ["ask", "rv:" + RETRIEVAL_VERSION, "cx:" + complexity, fingerprintKey(["q", question]), fingerprintKey(["ctx", vaultCtx, evidenceCtx]), fingerprintKey(["cv", readPaths.join(",")]), workspaceFingerprint(this.plugin.currentWorkspace() ?? undefined), skillCachePart(skillIds, this.plugin.settings?.skillRegistry ?? [], (id) => this.plugin.readSkill?.(id) ?? null)], force: opts?.force ?? false });
       tracker.mark("requestEnd");
       if (!out.ok || !out.data) {
         const s = tracker.summary();
@@ -608,4 +615,23 @@ export class WorkbenchService {
     }
     return { ok: failed.length === 0, created, failed };
   }
+}
+
+/** 本地检索兜底：SearchIndex 不可用时按 token 匹配文件名/路径（§六十六） */
+export function fallbackSearch(
+  query: string,
+  paths: string[],
+  limit: number
+): { path: string; snippet: string }[] {
+  const tokens = tokenizeText(query || "");
+  if (tokens.length === 0) return [];
+  const out: { path: string; snippet: string }[] = [];
+  for (const pth of paths) {
+    const lower = pth.toLowerCase();
+    if (tokens.some((t) => lower.includes(t))) {
+      out.push({ path: pth, snippet: pth });
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
 }
