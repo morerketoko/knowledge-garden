@@ -605,3 +605,9 @@
   .kg-wb-bubble { max-width: 92%; }
   .kg-wb-diff { flex-direction: column; }
 }
+/* Workbench Source Link（两层链接）：路径小字 + 打开/证据按钮 + 证据弹窗 */
+.kg-wb-src-path { font-size: 12px; color: var(--text-muted, #888); width: 100%; word-break: break-all; }
+.kg-wb-src-cmds { display: flex; gap: 6px; width: 100%; margin-top: 2px; }
+.kg-wb-evidence-title { font-weight: 600; margin-top: 8px; }
+.kg-wb-evidence-quote { border-left: 3px solid var(--text-accent, #7c5cff); padding: 6px 10px; margin: 8px 0; white-space: pre-wrap; background: var(--background-secondary, #222); }
+.kg-wb-evidence-note { font-size: 12px; color: var(--text-muted, #888); }

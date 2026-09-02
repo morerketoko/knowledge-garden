@@ -20,6 +20,7 @@ import type { ResearchTask } from "./types";
 import type { ArtifactSaveLocation } from "./artifactStore";
 import { suggestArtifactTitle } from "./artifactStore";
 import { saveArtifact, artifactRelPath, readExistingAt, cleanArtifactTitle, existsAt } from "./artifactSave";
+import { linkifyAnswerText, existingVaultSources, extractEvidenceSnippet } from "./workbenchLinks";
 
 export const VIEW_TYPE_AI_WORKBENCH = "knowledge-garden-ai-workbench";
 
@@ -119,7 +120,7 @@ export class AIWorkbenchView extends ItemView {
       return;
     }
     const body = bubble.createDiv({ cls: "kg-wb-bubble-body" });
-    void MarkdownRenderer.render(this.app, m.content || "", body, "", this);
+    void MarkdownRenderer.render(this.app, linkifyAnswerText(m.content || "", m.sources ?? []), body, "", this);
     if (m.model) bubble.createDiv({ text: "模型：" + m.model, cls: "kg-wb-model" });
     // Phase 17 §4/§40：Work Trace（只来自真实动作；默认折叠，可展开）
     const traces = this.traceBySession.get(this.sessionId ?? "") ?? [];
@@ -142,13 +143,7 @@ export class AIWorkbenchView extends ItemView {
       src.createEl("summary", { text: "📚 来源 " + m.sources.length });
       const list = src.createDiv({ cls: "kg-wb-src-list" });
       for (const s of m.sources) {
-        list.createEl("div", { cls: "kg-wb-src-item" }, (li) => {
-          const tag = li.createEl("span", { text: s.type === "vault" ? "Vault" : s.type === "web" ? "Web" : "推理", cls: "kg-wb-src-tag" });
-          void tag;
-          const a = li.createEl("a", { text: s.title || s.path || s.url || "（无标题）", cls: "kg-wb-src-link" });
-          a.addEventListener("click", () => this.openSource(s));
-          if (s.reason) li.createDiv({ text: s.reason, cls: "kg-wb-src-reason" });
-        });
+        list.createEl("div", { cls: "kg-wb-src-item" }, (li) => this.renderSourceItem(li, s));
       }
     }
     // 📎 已保存 Artifact（§84）
@@ -248,7 +243,7 @@ export class AIWorkbenchView extends ItemView {
       messageId: m.id,
       suggestTitle: suggestArtifactTitle(question, "answer"),
       content: m.content,
-      sources: m.sources ?? [],
+      sources: existingVaultSources(m.sources ?? [], (p) => !!this.app.vault.getAbstractFileByPath(p)),
       onSaved: (artifact) => {
         const rec = this.plugin.sessionStore.get(this.sessionId!);
         if (rec?.messages) {
@@ -462,14 +457,7 @@ export class AIWorkbenchView extends ItemView {
       this.resultEl.createEl("h4", { text: "来源" });
       const list = this.resultEl.createEl("ul", { cls: "kg-wb-sources" });
       for (const s of res.sources) {
-        list.createEl("li", {}, (li) => {
-          const tag = li.createEl("span", { text: s.type === "vault" ? "Vault" : s.type === "web" ? "Web" : "推理", cls: "kg-wb-src-tag" });
-          void tag;
-          const title = s.title || s.path || s.url || "（无标题）";
-          const a = li.createEl("a", { text: title, cls: "kg-wb-src-link" });
-          a.addEventListener("click", () => this.openSource(s));
-          if (s.reason) li.createDiv({ text: s.reason, cls: "kg-wb-src-reason" });
-        });
+        list.createEl("li", {}, (li) => this.renderSourceItem(li, s));
       }
     }
     if (res.unresolved.length) {
@@ -540,6 +528,35 @@ export class AIWorkbenchView extends ItemView {
       else new Notice("笔记不存在（可能已被移动/删除）：" + s.path);
     } else if (s.type === "web" && s.url) {
       window.open(s.url, "_blank");
+    }
+  }
+
+  /** 来源卡渲染（bubble 与快速结果共用）：vault → [打开] [查看证据]；web → 标题链接；inference → 仅文本 */
+  private renderSourceItem(li: HTMLElement, s: AIAnswerSource): void {
+    li.createEl("span", { text: s.type === "vault" ? "📖 Vault" : s.type === "web" ? "🌐 Web" : "🧠 推理", cls: "kg-wb-src-tag" });
+    const a = li.createEl("a", { text: s.title || s.path || s.url || "（无标题）", cls: "kg-wb-src-link" });
+    a.addEventListener("click", () => this.openSource(s));
+    const sub = s.type === "vault" ? s.path : s.type === "web" ? s.url : "";
+    if (sub) li.createEl("div", { text: sub, cls: "kg-wb-src-path" });
+    if (s.reason) li.createEl("div", { text: s.reason, cls: "kg-wb-src-reason" });
+    if (s.type === "vault" && s.path) {
+      const cmds = li.createEl("div", { cls: "kg-wb-src-cmds" });
+      cmds.createEl("button", { text: "打开笔记", cls: "kg-btn kg-btn-sm" }).addEventListener("click", () => this.openSource(s));
+      cmds.createEl("button", { text: "查看证据", cls: "kg-btn kg-btn-sm" }).addEventListener("click", () => void this.showEvidence(s));
+    }
+  }
+
+  /** 查看证据：本地读取真实原文片段（0 AI 请求） */
+  private async showEvidence(s: AIAnswerSource): Promise<void> {
+    if (!s.path) return;
+    const f = this.app.vault.getAbstractFileByPath(s.path);
+    if (!(f instanceof TFile)) { new Notice("笔记不存在：" + s.path); return; }
+    try {
+      const content = await this.app.vault.cachedRead(f);
+      const snippet = extractEvidenceSnippet(content, s.reason);
+      new EvidenceModal(this.app, { path: s.path, title: s.title || s.path, snippet, onOpen: () => this.openSource(s) }).open();
+    } catch (e) {
+      new Notice("读取证据失败：" + String((e as Error)?.message || e));
     }
   }
 
@@ -922,5 +939,29 @@ class DiffConfirmModal extends Modal {
       actions.createEl("button", { text: "取消", cls: "kg-btn" }).addEventListener("click", () => this.close());
       actions.createEl("button", { text: "确认覆盖", cls: "mod-cta" }).addEventListener("click", () => { this.onOverwrite(); this.close(); });
     })();
+  }
+}
+
+/** 证据弹窗：展示笔记真实原文片段（本地读取，非 AI 重新生成） */
+class EvidenceModal extends Modal {
+  constructor(
+    app: App,
+    private data: { path: string; title: string; snippet: string; onOpen: () => void }
+  ) {
+    super(app);
+  }
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "📜 证据（真实原文片段）" });
+    contentEl.createEl("div", { text: this.data.title, cls: "kg-wb-evidence-title" });
+    contentEl.createEl("div", { text: this.data.path, cls: "kg-wb-src-path" });
+    contentEl.createEl("blockquote", { text: this.data.snippet, cls: "kg-wb-evidence-quote" });
+    contentEl.createEl("div", { text: "以上为笔记真实原文片段，通过本地 Vault 读取获得，不是 AI 重新生成的内容。", cls: "kg-wb-evidence-note" });
+    const btn = contentEl.createEl("button", { text: "打开完整笔记", cls: "mod-cta kg-btn" });
+    btn.addEventListener("click", () => { this.data.onOpen(); this.close(); });
+  }
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
