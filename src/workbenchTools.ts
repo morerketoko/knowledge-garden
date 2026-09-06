@@ -10,6 +10,7 @@ import type { AITool, AIActionCategory, PermissionValue, ToolResult } from "./ty
 
 export const WORKBENCH_TOOL_IDS: string[] = [
   "vault.search",
+  "vault.list_folder",
   "vault.read",
   "vault.create",
   "vault.modify",
@@ -25,6 +26,7 @@ export const WORKBENCH_TOOL_IDS: string[] = [
 export function toolCategory(toolId: string): AIActionCategory {
   const map: Record<string, AIActionCategory> = {
     "vault.search": "LOCAL_READ",
+    "vault.list_folder": "LOCAL_READ",
     "vault.read": "LOCAL_READ",
     "vault.open": "LOCAL_READ",
     "vault.create": "LOCAL_WRITE",
@@ -71,6 +73,33 @@ export function safeVaultPath(path: string, vaultRoot: string): string | null {
   return p;
 }
 
+/**
+ * Vault 文件夹路径校验（Retrieval v3）：
+ * - 必须相对路径（非绝对）、不含 ../、不做路径穿越；
+ * - 禁止 .obsidian / node_modules（系统保留目录）；
+ * - 不以 .md 结尾；允许中文括号、空格、多级路径。
+ * - 由调用方传入 vaultRoot 做前缀校验。
+ */
+export function safeVaultFolderPath(path: string, vaultRoot: string): string | null {
+  const p = (path ?? "").trim();
+  if (!p) return ""; // 根目录（全库）
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return null;      // 绝对路径
+  if (p.includes("..") && /\.\./.test(p)) return null; // 路径穿越
+  const segs = p.split(/[\\/]+/);
+  for (const s of segs) {
+    if (!s) return null;
+    if (s === ".." || s === ".") return null;
+    if (s === ".obsidian" || s === "node_modules") return null;
+  }
+  if (p.toLowerCase().endsWith(".md")) return null;
+  const root = (vaultRoot ?? "").replace(/[\\/]+$/, "");
+  if (root) {
+    const joined = root.replace(/\\/g, "/") + "/" + p.replace(/\\/g, "/");
+    if (!joined.startsWith(root.replace(/\\/g, "/") + "/")) return null;
+  }
+  return p;
+}
+
 /** 工具结果截断（§七十九：不得超过硬上限；snippet 额外上限） */
 export function truncateToolText(text: string, max: number): string {
   const t = (text ?? "").trim();
@@ -85,8 +114,17 @@ export interface WorkbenchToolEnv {
   readNote(path: string): Promise<string | null>;
   /** 列出 Vault 内所有 Markdown 相对路径 */
   listNotes(): string[];
-  /** 本地检索（vault.search：使用现有 NoteIndex/SearchIndex，返回命中路径+片段） */
-  searchNotes(query: string, limit: number): { path: string; snippet: string }[];
+  /** 本地检索（vault.search：使用现有 NoteIndex/SearchIndex，返回命中路径+片段；可选 folder 限定目录） */
+  searchNotes(
+    query: string,
+    limit: number,
+    opts?: { folder?: string; recursive?: boolean; excludePaths?: string[] }
+  ): { path: string; snippet: string }[];
+  /** 列目录（vault.list_folder：返回子目录 + 直接 Markdown 文件 + 计数；recursive 预算由实现方控制 ≤300 paths） */
+  listFolder(
+    folder: string,
+    opts?: { recursive?: boolean; limit?: number }
+  ): { folders: string[]; files: { path: string; snippet?: string }[]; totalFiles: number; truncated: boolean };
   /** 创建笔记（vault.create） */
   createNote(path: string, content: string): boolean;
   /** 修改笔记（vault.modify） */
@@ -119,7 +157,8 @@ export interface WorkbenchToolExecuteContext {
 
 export const WORKBENCH_TOOLS: AITool[] = WORKBENCH_TOOL_IDS.map((id) => {
   const desc: Record<string, string> = {
-    "vault.search": "检索 Vault：按关键词返回真实命中笔记路径与片段（≤500 字符/条）",
+    "vault.search": "检索 Vault：按关键词返回真实命中笔记路径与片段（≤500 字符/条）；支持 folder 限定目录",
+    "vault.list_folder": "列出目录：返回子目录 / 直接 Markdown 文件与计数（≤100 条提示截断，递归受预算限制）",
     "vault.read": "读取一篇笔记全文（≤12000 字符；只读 .md）",
     "vault.create": "创建新笔记（安全路径校验；需用户确认）",
     "vault.modify": "修改已有笔记（Proposal→Diff→用户确认后应用；§六十九）",
@@ -156,12 +195,37 @@ export async function executeWorkbenchTool(
         const q = String(args.q ?? args.query ?? "");
         const limit = Math.min(Math.max(Number(args.limit ?? args.limit ?? 8) || 8, 1), 30);
         if (!q.trim()) throw new Error("missing query");
-        const hits = env.searchNotes(q, limit);
+        const folderRaw = String(args.folder ?? args.folderPath ?? "");
+        const folder = folderRaw ? safeVaultFolderPath(folderRaw, env.vaultRoot) : "";
+        if (folder === null) throw new Error("invalid folder: " + folderRaw);
+        const recursive = !(args.recursive === false || String(args.recursive ?? "") === "false");
+        const excludeRaw = Array.isArray(args.excludePaths) ? args.excludePaths.map((x) => String(x)) : [];
+        const hits = env.searchNotes(q, limit, { folder, recursive, excludePaths: excludeRaw });
         const lines = hits.map((h) => "- " + h.path + " │ " + truncateToolText(h.snippet ?? "", 500));
         return {
           ok: true,
-          summary: needConfirm ? "vault.search（需确认）" : lines.join("\n") || "（无命中）",
+          summary: needConfirm ? "vault.search（需确认）" : (lines.join("\n") || "（无命中）"),
           data: hits,
+        };
+      }
+      case "vault.list_folder": {
+        const folderRaw = String(args.path ?? args.folder ?? "");
+        const folder = safeVaultFolderPath(folderRaw, env.vaultRoot);
+        if (folder === null) throw new Error("invalid folder: " + folderRaw);
+        const recursive = args.recursive === true || String(args.recursive ?? "") === "true";
+        const limit = Math.min(Math.max(Number(args.limit ?? 100) || 100, 1), 100);
+        const listing = env.listFolder(folder, { recursive, limit });
+        const lines = [
+          "📁 " + (folder || "（Vault 根目录）"),
+          "笔记：" + listing.totalFiles + " 篇" + (listing.truncated ? "（仅列前 " + listing.files.length + " 篇）" : ""),
+          "子目录：" + (listing.folders.length ? listing.folders.map((d) => "- " + d).join("\n") : "（无）"),
+          "笔记列表：",
+          ...listing.files.map((f) => "- " + f.path),
+        ];
+        return {
+          ok: true,
+          summary: needConfirm ? "vault.list_folder（需确认）" : lines.join("\n"),
+          data: listing,
         };
       }
       case "vault.read": {

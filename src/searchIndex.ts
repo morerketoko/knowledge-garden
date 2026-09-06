@@ -215,11 +215,14 @@ export class SearchIndex {
     }
   }
 
-  /** 布尔检索（§十一/十五）：返回命中文档（调用方再 Ranking/选候选）；不写 Activity/Review */
-  search(tokens: string[], limit = 500): SearchDocument[] {
+  /** 布尔检索（§十一/十五）：返回命中文档（调用方再 Ranking/选候选）；不写 Activity/Review。
+   *  Retrieval v3：folderPrefix 限定目录（空 = 全库；path 前缀 + "/" 边界防同名误配）。 */
+  search(tokens: string[], limit = 500, folderPrefix?: string): SearchDocument[] {
     if (tokens.length === 0) return [];
+    const fp = (folderPrefix ?? "").trim().replace(/[\\/]+$/g, "").replace(/\\/g, "/");
     const out: SearchDocument[] = [];
     for (const doc of this.docs.values()) {
+      if (fp && !(doc.path === fp || doc.path.startsWith(fp + "/"))) continue;
       if (matchesDoc(doc, tokens)) out.push(doc);
     }
     return out.slice(0, limit);

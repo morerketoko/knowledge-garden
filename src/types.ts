@@ -501,6 +501,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     maxBatchWrites: 5,         // 1 / 5 / 10（§七十五）
     webEnabledByDefault: false, // Web 必须显式启用（§四十二/二百五十八）
     historyLimit: 20,          // 任务/问题历史保留条数（§一百九十三）
+  vaultScope: "vault",       // Retrieval v3：AI 可以搜索的范围（vault | workspace | current-folder | custom）
+  customFolders: [],         // 自定义搜索目录（vaultScope=custom 时生效）
   },
 };
 export function todayKey(date = new Date()): number {
@@ -1396,7 +1398,14 @@ export interface WorkbenchConfig {
   maxBatchWrites: number;    // 默认 5（1/5/10）
   webEnabledByDefault: boolean; // 默认 false（§四十二：Web 必须显式启用）
   historyLimit: number;      // 任务/问题历史保留条数（默认 20）
+  /** Retrieval v3：AI 可以搜索的范围（默认 "vault" = 整个 Vault；权限仍由 Permission 决定） */
+  vaultScope: WorkbenchVaultScope;
+  /** 自定义搜索目录（vaultScope="custom" 时的目录白名单；空 = 回退全库） */
+  customFolders?: string[];
 }
+
+/** Retrieval v3：Workbench 搜索范围（Folder Scope = 搜索边界；Permission = 动作边界） */
+export type WorkbenchVaultScope = "vault" | "workspace" | "current-folder" | "custom";
 
 /* =====================================================================
  * Phase 17：AI Workbench 2.0 —— 气泡消息 / Message Artifact / Visible Action Trace

@@ -940,6 +940,7 @@ function skillCachePart(selected, registry, readUserSkill) {
 // src/workbenchTools.ts
 var WORKBENCH_TOOL_IDS = [
   "vault.search",
+  "vault.list_folder",
   "vault.read",
   "vault.create",
   "vault.modify",
@@ -953,6 +954,7 @@ var WORKBENCH_TOOL_IDS = [
 function toolCategory(toolId) {
   const map = {
     "vault.search": "LOCAL_READ",
+    "vault.list_folder": "LOCAL_READ",
     "vault.read": "LOCAL_READ",
     "vault.open": "LOCAL_READ",
     "vault.create": "LOCAL_WRITE",
@@ -996,7 +998,8 @@ function truncateToolText(text, max) {
 }
 var WORKBENCH_TOOLS = WORKBENCH_TOOL_IDS.map((id) => {
   const desc = {
-    "vault.search": "\u68C0\u7D22 Vault\uFF1A\u6309\u5173\u952E\u8BCD\u8FD4\u56DE\u771F\u5B9E\u547D\u4E2D\u7B14\u8BB0\u8DEF\u5F84\u4E0E\u7247\u6BB5\uFF08\u2264500 \u5B57\u7B26/\u6761\uFF09",
+    "vault.search": "\u68C0\u7D22 Vault\uFF1A\u6309\u5173\u952E\u8BCD\u8FD4\u56DE\u771F\u5B9E\u547D\u4E2D\u7B14\u8BB0\u8DEF\u5F84\u4E0E\u7247\u6BB5\uFF08\u2264500 \u5B57\u7B26/\u6761\uFF09\uFF1B\u652F\u6301 folder \u9650\u5B9A\u76EE\u5F55",
+    "vault.list_folder": "\u5217\u51FA\u76EE\u5F55\uFF1A\u8FD4\u56DE\u5B50\u76EE\u5F55 / \u76F4\u63A5 Markdown \u6587\u4EF6\u4E0E\u8BA1\u6570\uFF08\u2264100 \u6761\u63D0\u793A\u622A\u65AD\uFF0C\u9012\u5F52\u53D7\u9884\u7B97\u9650\u5236\uFF09",
     "vault.read": "\u8BFB\u53D6\u4E00\u7BC7\u7B14\u8BB0\u5168\u6587\uFF08\u226412000 \u5B57\u7B26\uFF1B\u53EA\u8BFB .md\uFF09",
     "vault.create": "\u521B\u5EFA\u65B0\u7B14\u8BB0\uFF08\u5B89\u5168\u8DEF\u5F84\u6821\u9A8C\uFF1B\u9700\u7528\u6237\u786E\u8BA4\uFF09",
     "vault.modify": "\u4FEE\u6539\u5DF2\u6709\u7B14\u8BB0\uFF08Proposal\u2192Diff\u2192\u7528\u6237\u786E\u8BA4\u540E\u5E94\u7528\uFF1B\xA7\u516D\u5341\u4E5D\uFF09",

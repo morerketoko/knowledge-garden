@@ -23,6 +23,7 @@ import { parseResearchPlan, parseProjectDefinition, parseWorkbenchAskText, parse
 import { classifyTaskComplexity, contextBudgetFor, maxStepsFor, type TaskComplexity } from "./taskClassifier";
 import { fingerprintKey } from "./ai/cache";
 import { tokenizeText } from "./searchIndex";
+import { detectVaultLocationIntent, resolveFolderPaths, resolveFileNames, pathInFolder, resolveWorkbenchScope, workbenchScopeFingerprint, normalizeFolderRef } from "./retrieval";
 import { rankSearchResults } from "./queryExplorer";
 import { LatencyTracker } from "./latency";
 import { workspaceFingerprint } from "./workspace";
@@ -34,7 +35,7 @@ import type { NoteMetadata } from "./noteIndex";
 import { sessionIdFor, workbenchMessageId, traceEventId, type WorkbenchSessionRecord } from "./workbenchSession";
 
 /** Phase 16 §58-64/66：Ask 附加选项（Context Shelf + Session 追问） */
-export const RETRIEVAL_VERSION = "v2";
+export const RETRIEVAL_VERSION = "v3";
 
 export interface WorkbenchAskOptions {
   /** Context Shelf：用户显式挑选的笔记（强制读取进证据；不算偷偷添加 §64） */
@@ -125,26 +126,87 @@ export class WorkbenchService {
     return !!this.settings().workbench?.webEnabledByDefault;
   }
 
-  /** 本地检索（v2：中文 unigram + SearchIndex + 相关性排序；§六十六） */
-  private vaultSearch(query: string, limit: number): { path: string; snippet: string }[] {
+  /** 本地检索（v2 语义 + Retrieval v3：folder 边界 / 排除已见路径；§六十六） */
+  private vaultSearch(
+    query: string,
+    limit: number,
+    opts?: { folder?: string; recursive?: boolean; excludePaths?: string[] }
+  ): { path: string; snippet: string }[] {
     const tokens = tokenizeText(query || "");
     if (tokens.length === 0) return [];
+    const folder = normalizeFolderRef(opts?.folder ?? "");
+    const recursive = opts?.recursive !== false;
+    const exclude = new Set<string>((opts?.excludePaths ?? []).map((x) => x ?? ""));
+    const inScope = (p: string): boolean => {
+      if (!folder) return !exclude.has(p);
+      if (!pathInFolder(p, folder)) return false;
+      const rel = p.slice(folder.length + 1);
+      if (!recursive && rel.includes("/")) return false;
+      return !exclude.has(p);
+    };
     const idx = this.plugin.searchIndex;
     try {
       if (idx && typeof idx.search === "function") {
-        const docs = idx.search(tokens, Math.max(limit * 4, 200));
+        const docs = idx.search(tokens, Math.max(limit * 8, 400), folder);
         if (docs.length > 0) {
           const areas: KnowledgeArea[] = this.settings().knowledgeAreas ?? [];
           const allNotes = new Map<string, NoteMetadata>(this.plugin.index.all().map((n) => [n.path, n]));
-          const ranked = rankSearchResults(docs, tokens, areas, allNotes);
-          return ranked.slice(0, limit).map((r) => ({
-            path: r.doc.path,
-            snippet: (r.doc.title || r.doc.path) + " … " + (r.doc.headings?.join(" / ") || ""),
-          }));
+          const ranked = rankSearchResults(docs, tokens, areas, allNotes)
+            .filter((r) => inScope(r.doc.path))
+            .slice(0, limit)
+            .map((r) => ({
+              path: r.doc.path,
+              snippet: (r.doc.title || r.doc.path) + " … " + (r.doc.headings?.join(" / ") || ""),
+            }));
+          return ranked;
         }
       }
     } catch { /* 索引异常时退回 token 文件名匹配 */ }
-    return fallbackSearch(query, this.plugin.index.all().map((n) => n.path), limit);
+    const paths = this.plugin.index.all().map((n) => n.path).filter(inScope);
+    return fallbackSearch(query, paths, limit, folder);
+  }
+
+  /** Index Ready Guard（Retrieval v3）：SearchIndex 构建中最多等 1500ms；exact path/folder 由调用方跳过等待 */
+  private async waitForIndexReady(): Promise<void> {
+    const idx = this.plugin.searchIndex;
+    if (!idx || typeof idx.ready !== "function" || idx.ready()) return;
+    const deadline = Date.now() + 1500;
+    while (!idx.ready() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /** 列目录（vault.list_folder：子目录 / Markdown 文件 / 计数；≤100 项提示截断） */
+  private listFolder(
+    folder: string,
+    opts?: { recursive?: boolean; limit?: number }
+  ): { folders: string[]; files: { path: string; snippet?: string }[]; totalFiles: number; truncated: boolean } {
+    const all = this.plugin.index.all().map((n) => n.path);
+    const recursive = opts?.recursive ?? false;
+    const limit = Math.min(Math.max(opts?.limit ?? 100, 1), 100);
+    const budget = Math.min(limit, 100);
+    const prefix = folder ? normalizeFolderRef(folder) + "/" : "";
+    const inDir = all.filter((p) => pathInFolder(p, folder));
+    const direct = inDir.filter((p) => !p.slice(prefix.length).includes("/"));
+    const files = (recursive ? inDir : direct).map((p) => ({ path: p })).slice(0, budget);
+    const dirSet = new Set<string>();
+    for (const p of inDir) {
+      const rel = p.slice(prefix.length);
+      const segs = rel.split("/");
+      if (recursive) {
+        let acc = folder ? normalizeFolderRef(folder) : "";
+        for (let i = 0; i < segs.length - 1; i++) {
+          acc = acc ? acc + "/" + segs[i] : segs[i];
+          dirSet.add(acc);
+        }
+      } else if (segs.length > 1) {
+        dirSet.add(folder ? prefix + segs[0] : segs[0]);
+      }
+    }
+    const folders = Array.from(dirSet).sort().slice(0, budget);
+    const totalFiles = inDir.length;
+    const truncated = files.length < totalFiles || inDir.length > budget;
+    return { folders, files, totalFiles, truncated };
   }
 
 
@@ -196,7 +258,8 @@ export class WorkbenchService {
       vaultRoot: base,
       readNote: (path) => this.readNote(path),
       listNotes: () => p.index.all().map((n) => n.path),
-      searchNotes: (q, limit) => this.vaultSearch(q, limit),
+      searchNotes: (q, limit, sOpts) => this.vaultSearch(q, limit, sOpts),
+      listFolder: (folder, lOpts) => this.listFolder(folder, lOpts),
       createNote: (path, content) => { void path; void content; return false; },
       modifyNote: (path, content) => { void path; void content; return false; },
       renameNote: (oldPath, newPath) => { void oldPath; void newPath; return false; },
@@ -237,16 +300,75 @@ export class WorkbenchService {
     const traces: WorkbenchTraceEvent[] = [];
     const traceAt = Date.now();
     tracker.mark("contextStart");
-    // 1) 检索候选（§三十五~三十七：按复杂度决定候选规模）
-    const hits = this.vaultSearch(question, budget.candidates);
+    // v3：意图 + Scope（Exact Path > Semantic Search；Folder Scope = 搜索边界；Candidate ≠ Access）
+    const allPaths = this.plugin.index.all().map((n) => n.path);
+    const ws = this.plugin.currentWorkspace() ?? undefined;
+    const activeNote = this.app().workspace.getActiveFile()?.path;
+    const globalScope = this.settings().discovery?.roaming?.scope ?? this.settings().discovery?.curiosity?.scope;
+    const scopeInfo = resolveWorkbenchScope(this.settings().workbench, ws, globalScope, activeNote);
+    const intent = detectVaultLocationIntent(question);
+    let explicitFolder: string | undefined;
+    let exactFile: string | undefined;
+    let folderAsk: string[] | undefined;
+    if (intent.kind === "exact-file") {
+      const body = await this.readNote(intent.target ?? "");
+      if (body !== null) exactFile = intent.target;
+    } else if (intent.kind === "exact-folder") {
+      const r = resolveFolderPaths(intent.target ?? "", allPaths);
+      if (r.ambiguous) folderAsk = r.matched;
+      else if (r.folder !== undefined) explicitFolder = r.folder;
+    } else if (intent.kind === "folder-name" || intent.kind === "scoped-query") {
+      const r = resolveFolderPaths(intent.name ?? "", allPaths);
+      if (r.ambiguous) folderAsk = r.matched;
+      else if (r.folder !== undefined) explicitFolder = r.folder;
+    } else if (intent.kind === "file-name") {
+      const r = resolveFileNames(intent.name ?? "", allPaths);
+      if (r.ambiguous) folderAsk = r.matched;
+      else if (r.path) exactFile = r.path;
+    }
+    if (folderAsk && folderAsk.length > 0) {
+      return { ok: false, answer: "", sources: [], unresolved: [], inferences: [], uncertainties: [], followUps: [], taskComplexity: complexity, toolSteps: 0, messageId: workbenchMessageId(question, traceAt, 2), traceEvents: traces, totalMs: 0, error: "找到多个同名目录 / 笔记，请明确选择其一：\n" + folderAsk.map((x, i) => (i + 1) + ". " + x).join("\n") };
+    }
+    if (intent.kind === "normal-query" || (intent.kind === "scoped-query" && explicitFolder === undefined) || (intent.kind === "folder-name" && explicitFolder === undefined)) {
+      await this.waitForIndexReady();
+    }
+    // 1) 检索候选（渐进检索：simple ≤1 轮 / normal ≤3 / complex ≤5；排除上一轮已见路径）
+    const searchQuery = intent.kind === "scoped-query" && explicitFolder !== undefined ? (intent.query ?? question) : question;
+    const searchFolders = explicitFolder !== undefined ? [explicitFolder] : scopeInfo.folders;
+    const prevPaths = opts?.sessionId ? (this.plugin.sessionStore.get(opts.sessionId)?.sources ?? []).map((x) => x.path || x.url || "").filter(Boolean) : [];
+    const maxRounds = complexity === "simple" ? 1 : complexity === "normal" ? 3 : 5;
+    const queryBudget = Math.max(1, Math.min(maxRounds, Math.max(1, this.settings().workbench?.maxQueries || 5)));
+    const seen = new Set<string>(prevPaths);
+    const hits: { path: string; snippet: string }[] = [];
+    for (let r = 0; r < queryBudget && hits.length < budget.candidates; r++) {
+      let freshCount = 0;
+      for (const fd of (searchFolders.length ? searchFolders : [""])) {
+        const more = this.vaultSearch(searchQuery, Math.max(budget.candidates, 12), { folder: fd, recursive: true, excludePaths: Array.from(seen) })
+          .filter((h) => !seen.has(h.path));
+        for (const h of more) { seen.add(h.path); hits.push(h); }
+        freshCount += more.length;
+      }
+      if (freshCount === 0) break;
+    }
+    hits.splice(budget.candidates);
+    const folderLines = explicitFolder !== undefined
+      ? (() => {
+          const listing = this.listFolder(explicitFolder, { recursive: false, limit: 30 });
+          return ["📁 已定位文件夹：" + explicitFolder + "（共 " + listing.totalFiles + " 篇 Markdown 笔记）"]
+            .concat(listing.folders.map((d) => "- 📂 " + d))
+            .concat(listing.files.map((f) => "- " + f.path));
+        })()
+      : [];
+    const exactLines = exactFile !== undefined ? ["📄 已定位笔记：" + exactFile] : [];
+    const searchScopeText = explicitFolder !== undefined ? "目录：" + explicitFolder : scopeInfo.label;
     traces.push({
       id: traceEventId(question, traceAt, 1),
       stage: "retrieval",
       status: "done",
-      summary: "搜索知识库",
-      tool: "vault.search",
-      toolParamsSummary: "query=" + question.slice(0, 40),
-      count: hits.length,
+      summary: "搜索知识库（" + searchScopeText + "）",
+      tool: explicitFolder !== undefined ? "vault.list_folder" : "vault.search",
+      toolParamsSummary: "query=" + searchQuery.slice(0, 40),
+      count: hits.length + (explicitFolder !== undefined ? folderLines.length - 1 : 0),
       timestamp: Date.now(),
     });
     // Phase 16 §58-64：Context Shelf 显式笔记（用户挑选 → 强制读取进证据；不算偷偷添加）
@@ -257,20 +379,26 @@ export class WorkbenchService {
       const body = await this.readNote(pth);
       if (!body) continue;
       shelfRead.push(pth);
-      const snip = body.replace(/^---[\s\S]*?\r?\n---\r?\n?/, "").slice(0, 900);
+            const snip = body.replace(/^---[\s\S]*?\r?\n---\r?\n?/, "").slice(0, 900);
       shelfEvidence.push("[" + pth + "]\n" + snip);
     }
-    const vaultCtx = hits.map((h) => h.path + " | " + h.snippet).concat(shelfRead.map((pth) => pth + " | （用户显式加入 Context Shelf）")).join("\n");
-    // 2) 阅读预算内笔记全文（§四十三：normal/complex 才读全文，读取数量 ≤ readFull）
+    const vaultCtx = exactLines.concat(folderLines)
+      .concat(hits.map((h) => h.path + " | " + h.snippet))
+      .concat(shelfRead.map((pth) => pth + " | （用户显式加入 Context Shelf）"))
+      .join("\n");
+    // 2) 阅读预算内笔记全文（§四十三：exactFile 优先，其余 ≤ readFull）
+    const readTargets = exactFile !== undefined
+      ? [exactFile, ...hits.slice(0, Math.max(0, budget.readFull - 1)).map((h) => h.path)]
+      : hits.slice(0, budget.readFull).map((h) => h.path);
     const readPaths: string[] = [];
     const evidenceParts: string[] = [];
     let evidenceChars = 0;
-    for (const h of hits.slice(0, budget.readFull)) {
-      const body = await this.readNote(h.path);
+    for (const pth of readTargets) {
+      const body = await this.readNote(pth);
       if (!body) continue;
-      readPaths.push(h.path);
+      readPaths.push(pth);
       const snip = body.replace(/^---[\s\S]*?\r?\n---\r?\n?/, "").slice(0, 900);
-      evidenceParts.push("[" + h.path + "]\n" + snip);
+      evidenceParts.push("[" + pth + "]\n" + snip);
       evidenceChars += snip.length;
       if (evidenceChars >= budget.evidenceChars) break;
     }
@@ -325,7 +453,7 @@ export class WorkbenchService {
       const out = await this.ai().generateForFeature(feature, [
         { role: "system", content: sys },
         { role: "user", content: question },
-      ], { maxTokens: complexity === "simple" ? 1200 : 2200, customKeyParts: ["ask", "rv:" + RETRIEVAL_VERSION, "cx:" + complexity, fingerprintKey(["q", question]), fingerprintKey(["ctx", vaultCtx, evidenceCtx]), fingerprintKey(["cv", readPaths.join(",")]), workspaceFingerprint(this.plugin.currentWorkspace() ?? undefined), skillCachePart(skillIds, this.plugin.settings?.skillRegistry ?? [], (id) => this.plugin.readSkill?.(id) ?? null)], force: opts?.force ?? false });
+      ], { maxTokens: complexity === "simple" ? 1200 : 2200, customKeyParts: ["ask", "rv:" + RETRIEVAL_VERSION, "cx:" + complexity, fingerprintKey(["q", question]), fingerprintKey(["ctx", vaultCtx, evidenceCtx]), fingerprintKey(["cv", readPaths.join(",")]), workspaceFingerprint(this.plugin.currentWorkspace() ?? undefined), skillCachePart(skillIds, this.plugin.settings?.skillRegistry ?? [], (id) => this.plugin.readSkill?.(id) ?? null), workbenchScopeFingerprint(this.settings().workbench, ws, globalScope, activeNote), "nix:" + (this.plugin.index?.revision ?? 0)], force: opts?.force ?? false });
       tracker.mark("requestEnd");
       if (!out.ok || !out.data) {
         const s = tracker.summary();
@@ -452,7 +580,9 @@ export class WorkbenchService {
     const settings = this.settings();
     const wb = settings.workbench || { maxSteps: 8, maxQueries: 5, maxPages: 10, maxChars: 20000, maxBatchWrites: 5, webEnabledByDefault: false, historyLimit: 20 };
     const maxSteps = wb.maxSteps > 0 ? wb.maxSteps : 8;
+    const maxQueries = wb.maxQueries > 0 ? wb.maxQueries : 5;
     const stepsSnapshot: AgentStepRecord[] = [];
+    let queriesUsed = 0;
     const progressCb = opts.onProgress;
     const startStep = task.steps?.length ?? 0;
     const completedWith = task.resultSummary;
@@ -486,7 +616,11 @@ export class WorkbenchService {
       executeTool: async (ctx: WorkbenchToolExecuteContext) => {
         const perm: Record<string, "allow" | "ask" | "deny"> = {};
         if (enableWeb) { perm["web.search"] = "allow"; perm["web.fetch"] = "allow"; }
+        if ((ctx.toolId === "vault.search" || ctx.toolId === "vault.list_folder") && queriesUsed >= maxQueries) {
+                    return { ok: false, summary: "本次任务搜索上限（workbench.maxQueries=" + maxQueries + "）已用尽；请基于现有结果给出结论", error: "QUERY_BUDGET_EXCEEDED" };
+        }
         const r = await executeWorkbenchTool(env, { ...ctx, permissionOverride: perm });
+        if (ctx.toolId === "vault.search" || ctx.toolId === "vault.list_folder") { if (r.ok) queriesUsed++; }
         return r;
       },
       isCancelled: opts.cancelled,
@@ -621,12 +755,15 @@ export class WorkbenchService {
 export function fallbackSearch(
   query: string,
   paths: string[],
-  limit: number
+  limit: number,
+  folderPrefix?: string
 ): { path: string; snippet: string }[] {
   const tokens = tokenizeText(query || "");
   if (tokens.length === 0) return [];
   const out: { path: string; snippet: string }[] = [];
+  const fp = normalizeFolderRef(folderPrefix ?? "");
   for (const pth of paths) {
+    if (fp && !pathInFolder(pth, fp)) continue;
     const lower = pth.toLowerCase();
     if (tokens.some((t) => lower.includes(t))) {
       out.push({ path: pth, snippet: pth });

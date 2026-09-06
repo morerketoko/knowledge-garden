@@ -228,6 +228,7 @@ init_obsidian_stub();
 // src/workbenchTools.ts
 var WORKBENCH_TOOL_IDS = [
   "vault.search",
+  "vault.list_folder",
   "vault.read",
   "vault.create",
   "vault.modify",
@@ -241,6 +242,7 @@ var WORKBENCH_TOOL_IDS = [
 function toolCategory(toolId) {
   const map = {
     "vault.search": "LOCAL_READ",
+    "vault.list_folder": "LOCAL_READ",
     "vault.read": "LOCAL_READ",
     "vault.open": "LOCAL_READ",
     "vault.create": "LOCAL_WRITE",
@@ -255,7 +257,8 @@ function toolCategory(toolId) {
 }
 var WORKBENCH_TOOLS = WORKBENCH_TOOL_IDS.map((id) => {
   const desc = {
-    "vault.search": "\u68C0\u7D22 Vault\uFF1A\u6309\u5173\u952E\u8BCD\u8FD4\u56DE\u771F\u5B9E\u547D\u4E2D\u7B14\u8BB0\u8DEF\u5F84\u4E0E\u7247\u6BB5\uFF08\u2264500 \u5B57\u7B26/\u6761\uFF09",
+    "vault.search": "\u68C0\u7D22 Vault\uFF1A\u6309\u5173\u952E\u8BCD\u8FD4\u56DE\u771F\u5B9E\u547D\u4E2D\u7B14\u8BB0\u8DEF\u5F84\u4E0E\u7247\u6BB5\uFF08\u2264500 \u5B57\u7B26/\u6761\uFF09\uFF1B\u652F\u6301 folder \u9650\u5B9A\u76EE\u5F55",
+    "vault.list_folder": "\u5217\u51FA\u76EE\u5F55\uFF1A\u8FD4\u56DE\u5B50\u76EE\u5F55 / \u76F4\u63A5 Markdown \u6587\u4EF6\u4E0E\u8BA1\u6570\uFF08\u2264100 \u6761\u63D0\u793A\u622A\u65AD\uFF0C\u9012\u5F52\u53D7\u9884\u7B97\u9650\u5236\uFF09",
     "vault.read": "\u8BFB\u53D6\u4E00\u7BC7\u7B14\u8BB0\u5168\u6587\uFF08\u226412000 \u5B57\u7B26\uFF1B\u53EA\u8BFB .md\uFF09",
     "vault.create": "\u521B\u5EFA\u65B0\u7B14\u8BB0\uFF08\u5B89\u5168\u8DEF\u5F84\u6821\u9A8C\uFF1B\u9700\u7528\u6237\u786E\u8BA4\uFF09",
     "vault.modify": "\u4FEE\u6539\u5DF2\u6709\u7B14\u8BB0\uFF08Proposal\u2192Diff\u2192\u7528\u6237\u786E\u8BA4\u540E\u5E94\u7528\uFF1B\xA7\u516D\u5341\u4E5D\uFF09",
@@ -272,11 +275,28 @@ var WORKBENCH_TOOLS = WORKBENCH_TOOL_IDS.map((id) => {
 // src/workbenchService.ts
 init_cache();
 
-// src/latency.ts
-init_migrations();
-
 // src/workspace.ts
 init_cache();
+
+// src/retrieval.ts
+function trimFolderRef(s) {
+  let t = (s ?? "").trim();
+  t = t.replace(/^["'`「」『』\s]+|["'`「」『』\s]+$/g, "");
+  t = t.replace(/[\\/]+$/g, "");
+  return t;
+}
+function normalizeFolderRef(s) {
+  return trimFolderRef(s).normalize("NFKC");
+}
+function pathInFolder(path2, folder) {
+  const f = normalizeFolderRef(folder ?? "");
+  const p = normalizeFolderRef((path2 ?? "").replace(/\\/g, "/"));
+  if (!f) return true;
+  return p === f || p.startsWith(f + "/");
+}
+
+// src/latency.ts
+init_migrations();
 
 // src/skills.ts
 init_cache();
@@ -377,12 +397,14 @@ init_migrations();
 init_cache();
 
 // src/workbenchService.ts
-var RETRIEVAL_VERSION = "v2";
-function fallbackSearch(query, paths, limit) {
+var RETRIEVAL_VERSION = "v3";
+function fallbackSearch(query, paths, limit, folderPrefix) {
   const tokens = tokenizeText(query || "");
   if (tokens.length === 0) return [];
   const out = [];
+  const fp = normalizeFolderRef(folderPrefix ?? "");
   for (const pth of paths) {
+    if (fp && !pathInFolder(pth, fp)) continue;
     const lower = pth.toLowerCase();
     if (tokens.some((t) => lower.includes(t))) {
       out.push({ path: pth, snippet: pth });
@@ -487,7 +509,7 @@ var AREAS = [];
 }
 {
   const src = fs.readFileSync(path.resolve(__dirname, "../src/workbenchService.ts"), "utf8");
-  test("R9", RETRIEVAL_VERSION === "v2", "RETRIEVAL_VERSION \u5E38\u91CF = v2\uFF08\u5F53\u524D\u503C=" + RETRIEVAL_VERSION + "\uFF09");
+  test("R9", RETRIEVAL_VERSION === "v3", "RETRIEVAL_VERSION \u5E38\u91CF = v3\uFF08\u5F53\u524D\u503C=" + RETRIEVAL_VERSION + "\uFF09");
   test("R9b", src.includes('"rv:" + RETRIEVAL_VERSION'), "Ask cache key \u5DF2\u7EB3\u5165 rv:" + RETRIEVAL_VERSION);
   const oldSplitStillThere = src.includes("u4e00-") && src.includes("split(");
   test("R9c", !oldSplitStillThere, "\u65E7 split(/[\\s\\u4e00-\\u9fff]+/) \u4E2D\u6587\u5206\u9694 bug \u5DF2\u5220\u9664");

@@ -1,7 +1,7 @@
 import { App, Modal, PluginSettingTab, Setting, normalizePath, Notice } from "obsidian";
 import { pickRandomImage } from "./mediaHelper";
 import type KnowledgeGardenPlugin from "./main";
-import type { DiscoveryScopeMode, KnowledgeArea, QueryScopeMode, ReviewQueueSize } from "./types";
+import type { DiscoveryScopeMode, KnowledgeArea, QueryScopeMode, ReviewQueueSize, WorkbenchVaultScope } from "./types";
 import type { AIFeature, AIActionCategory, AIFunctionConfig, AIProfile, KnowledgeWorkspace, ModelMetadata, PermissionValue, PluginSettings, ProfileDraft, SkillSummary, StateBrowseScopeMode, ExamMode, ExamDifficulty, ExamAnswerMode } from "./types";
 import { allFeatures, featureLabel, resolveAIFunctionRoute, DEFAULT_PROFILE_ID, applyProfileDraft, copyProfileTemplate, createProfileFromDraft, draftFromProfile, profileUsage, validateProfileDraft } from "./aiRouting";
 import { defaultWorkspace, workspaceInstructions } from "./workspace";
@@ -272,6 +272,14 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
   new Setting(containerEl).setName("批量写入上限").setDesc("一次确认最多应用 N 个 Vault 写入（默认 5；写操作仍逐个需确认）。").addDropdown((d) => { d.addOption("1", "1 · 最保守"); d.addOption("5", "5 · 默认"); d.addOption("10", "10 · 批量场景"); d.setValue(String(s.workbench.maxBatchWrites)).onChange(async (v) => { s.workbench.maxBatchWrites = parseInt(v, 10); await this.plugin.saveSettings(); }); });
   new Setting(containerEl).setName("Web 默认关闭（§四十二/八十五）").setDesc("OFF：Web 默认 ask，研究时勾选「本次启用」才允许；不改写权限。").addToggle((t) => t.setValue(s.workbench.webEnabledByDefault).onChange(async (v) => { s.workbench.webEnabledByDefault = v; await this.plugin.saveSettings(); }));
   new Setting(containerEl).setName("历史保留条数").setDesc("任务/问题历史最多保存 N 条（默认 20；只存元数据，不存 Prompt/密钥/网页正文）。").addText((t) => t.setPlaceholder("20").setValue(String(s.workbench.historyLimit)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isNaN(n) && n >= 5 && n <= 100) { s.workbench.historyLimit = n; await this.plugin.saveSettings(); } }));
+  new Setting(containerEl).setName("AI 可以搜索的范围（Retrieval v3）").setDesc("搜索范围 ≠ 权限：读取/搜索仍按权限策略。vault = 整个 Vault（默认）；workspace = 跟随 Workspace 目录；current-folder = 当前笔记所在目录；custom = 下方自定义目录。").addDropdown((d) => {
+    d.addOption("vault", "整个 Vault（默认）");
+    d.addOption("workspace", "跟随 Workspace 范围");
+    d.addOption("current-folder", "当前笔记所在目录");
+    d.addOption("custom", "自定义目录");
+    d.setValue(s.workbench.vaultScope ?? "vault").onChange(async (v) => { s.workbench.vaultScope = v as WorkbenchVaultScope; await this.plugin.saveSettings(); });
+  });
+    new Setting(containerEl).setName("自定义搜索目录").setDesc("每行一个 Obsidian 文件夹路径（如 015 书库/二十四史（全12册））。仅 vaultScope=custom 时生效，留空回退整个 Vault。").addTextArea((t) => t.setPlaceholder("015 书库/二十四史（全12册）\n每行一个目录").setValue((s.workbench.customFolders ?? []).join("\n")).onChange(async (v) => { s.workbench.customFolders = v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean); await this.plugin.saveSettings(); }));
   // ---------- Phase 13：Workspaces / Skills / Models & Capabilities / Permissions / Context ----------
     new Setting(containerEl).setName("AI Workspaces（知识工作空间）").setHeading()
       .setDesc("Workspace = 当前进行某一类知识活动时的稳定 AI 上下文（Scope + Instructions + Skills + 默认 Profile，§二~§十五）。只创建数据，不改变全局 Discovery Scope（§七）。");

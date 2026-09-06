@@ -99,10 +99,10 @@ const AREAS: KnowledgeArea[] = [];
   test("R8b", fallbackSearch("的了是吗？", ["AI/游戏.md"], 5).length === 0, "fallbackSearch 对纯虚词同样返回空");
 }
 
-// ---------- R9：Retrieval v2 缓存版本生效 ----------
+// ---------- R9：Retrieval v3 缓存版本生效 ----------
 {
   const src = fs.readFileSync(path.resolve(__dirname, "../src/workbenchService.ts"), "utf8");
-  test("R9", RETRIEVAL_VERSION === "v2", "RETRIEVAL_VERSION 常量 = v2（当前值=" + RETRIEVAL_VERSION + "）");
+  test("R9", RETRIEVAL_VERSION === "v3", "RETRIEVAL_VERSION 常量 = v3（当前值=" + RETRIEVAL_VERSION + "）");
   test("R9b", src.includes('"rv:" + RETRIEVAL_VERSION'), "Ask cache key 已纳入 rv:" + RETRIEVAL_VERSION);
   const oldSplitStillThere = src.includes("u4e00-") && src.includes("split(");
   test("R9c", !oldSplitStillThere, "旧 split(/[\\s\\u4e00-\\u9fff]+/) 中文分隔 bug 已删除");

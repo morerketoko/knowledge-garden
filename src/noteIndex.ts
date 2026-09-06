@@ -102,6 +102,8 @@ function titleFrom(fm: Record<string, unknown>, filePath: string): string {
 
 /** 增量索引：首次全量扫描，之后跟随 vault 事件增量更新，并持久化缓存 */
 export class NoteIndex {
+  /** Retrieval v3：文件新增/修改/删除计数器（参与 Ask cache key，文件变化 → cache miss） */
+  revision = 0;
   private notes = new Map<string, NoteMetadata>();
   private cacheFile: string;
   private loaded = false;
@@ -137,6 +139,7 @@ export class NoteIndex {
     }
     this.rebuildBacklinks();
     this.loaded = true;
+    this.revision++;
     await this.saveCache();
   }
 
@@ -188,6 +191,7 @@ export class NoteIndex {
     const wasNew = !this.notes.has(file.path);
     await this.readFile(file);
     this.rebuildBacklinks();
+    this.revision++;
     if (wasNew) await this.saveCache();
   }
 
@@ -195,6 +199,7 @@ export class NoteIndex {
   removeFile(filePath: string): void {
     if (!this.loaded) return;
     this.notes.delete(filePath);
+    this.revision++;
     for (const n of this.notes.values()) {
       n.backlinks = n.backlinks.filter((b) => b !== filePath);
     }
@@ -209,6 +214,7 @@ export class NoteIndex {
     }
     this.rebuildBacklinks();
     this.loaded = true;
+    this.revision++;
     await this.saveCache();
   }
 
