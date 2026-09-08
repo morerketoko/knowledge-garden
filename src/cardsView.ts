@@ -11,6 +11,9 @@ import type KnowledgeGardenPlugin from "./main";
 import type { SavedReviewCard, SavedCardScope, SavedCardScopeMode, FsrsRating } from "./types";
 import { examTypeLabel } from "./examView";
 import {
+  ANSWER_FALLBACK, answerVisibility, toggleAnswerVisibility, revealDomAction, answerBodyContent,
+} from "./reviewCardAnswer";
+import {
   FSRS_RATINGS, FSRS_RATING_LABEL, FSRS_RATING_EMOJI, masteryConfidence,
   defaultSavedCardScope, savedCardScopeText, savedCardOverview, clampCustomFolders, CUSTOM_SCOPE_FOLDER_LIMIT,
   type SavedCardSpacedState, type MasteryBand,
@@ -208,6 +211,26 @@ export class CardsView extends ItemView {
     const fill = wrap.createDiv({ cls: "kg-mastery-fill" });
     fill.style.width = Math.max(0, Math.min(100, value)) + "%";
     if (color) fill.style.background = color;
+  }
+
+  /**
+   * §5/6：渲染答案 body（内容完全等同旧逻辑：答案/说明/原文依据/来源/打开笔记；0 AI）。
+   * 返回 .kg-answer-body 元素；调用方决定 display。只在 body 不存在时调用（§7/12）。
+   */
+  private renderAnswerBody(answerArea: HTMLElement, card: SavedReviewCard): HTMLElement {
+    const content = answerBodyContent(card);
+    const body = answerArea.createDiv({ cls: "kg-answer-body" });
+    body.createDiv({ cls: "kg-answer-text", text: content.answer || ANSWER_FALLBACK });   // P-HOTFIX-03/16
+    if (content.explanation) body.createDiv({ cls: "kg-exam-ans-explanation", text: "说明：" + content.explanation });   // P-HOTFIX-15
+    if (content.evidence.length) {   // P-HOTFIX-14
+      body.createDiv({ cls: "kg-exam-ans-evidence-label", text: "📎 原文依据" });
+      for (const s of content.evidence) body.createDiv({ cls: "kg-exam-ans-evidence", text: "• " + s });
+    }
+    const srcRow = body.createDiv({ cls: "kg-row kg-answer-source" });
+    srcRow.createSpan({ cls: "kg-review-qlabel", text: "来源：" + content.sourcePath });   // P-HOTFIX-13
+    srcRow.createEl("button", { cls: "kg-btn", text: "打开笔记" })
+      .addEventListener("click", () => { this.plugin.openNote(card.sourcePath); });   // §14/79：0 AI
+    return body;
   }
 
   private sortCards(cards: SavedReviewCard[]): SavedReviewCard[] {
@@ -463,31 +486,30 @@ export class CardsView extends ItemView {
     }
 
     // 📖 答案区（默认显示 §12/14/93/88；SavedReviewCard.answer 优先，不调 deriveReviewAnswer）
-    const defaultHidden = this.plugin.settings.reviewCenter?.showAnswerByDefault === false;
-    const hidden = defaultHidden ? !this.shownAnswers.has(c.id) : this.hiddenAnswers.has(c.id);
+    const defaultVisible = this.plugin.settings.reviewCenter?.showAnswerByDefault !== false;
+    const hidden = !answerVisibility(c.id, defaultVisible, this.hiddenAnswers, this.shownAnswers);
     const answerArea = card.createDiv({ cls: "kg-answer-area" });
     const ansHead = answerArea.createDiv({ cls: "kg-row kg-answer-header" });
     ansHead.createDiv({ cls: "kg-answer-title", text: "📖 答案" });
     const hideBtn = ansHead.createEl("button", { cls: "kg-btn", text: hidden ? "显示答案" : "隐藏答案" });
     hideBtn.addEventListener("click", () => {
-      if (defaultHidden) {
-        if (this.shownAnswers.has(c.id)) this.shownAnswers.delete(c.id); else this.shownAnswers.add(c.id);
-      } else if (hidden) this.hiddenAnswers.delete(c.id); else this.hiddenAnswers.add(c.id);
-      const body = answerArea.querySelector(".kg-answer-body") as HTMLElement | null;
-      if (body) body.style.display = hidden ? "" : "none";
+      // §8：willShow = 点击后的目标状态（由本卡 id 在 shown/hidden 集合中的状态决定，§19）
+      const willShow = toggleAnswerVisibility(c.id, defaultVisible, this.hiddenAnswers, this.shownAnswers);
+      let body = answerArea.querySelector(".kg-answer-body") as HTMLElement | null;
+      const action = revealDomAction(!!body, willShow);   // §7/12/13/十六
+      if (action === "create") {
+        body = this.renderAnswerBody(answerArea, c);      // 立即创建，答案马上出现（§3）
+        body.style.display = "";
+      } else if (action === "show") {
+        body!.style.display = "";                          // §13/18：只改 display，不重建
+      } else if (action === "hide" && body) {
+        body.style.display = "none";                       // §12/17：只隐藏，不删 DOM
+      }
+      hideBtn.setText(willShow ? "隐藏答案" : "显示答案");   // §10：按钮文字立即同步
     });
     if (!hidden) {
-      const body = answerArea.createDiv({ cls: "kg-answer-body" });
-      body.createDiv({ cls: "kg-answer-text", text: c.answer || "（该卡没有保存答案文字）" });
-      if (c.explanation) body.createDiv({ cls: "kg-exam-ans-explanation", text: "说明：" + c.explanation });
-      if (c.sourceEvidence && c.sourceEvidence.length) {
-        body.createDiv({ cls: "kg-exam-ans-evidence-label", text: "📎 原文依据" });
-        for (const s of c.sourceEvidence) body.createDiv({ cls: "kg-exam-ans-evidence", text: "• " + s });
-      }
-      const srcRow = body.createDiv({ cls: "kg-row kg-answer-source" });
-      srcRow.createSpan({ cls: "kg-review-qlabel", text: "来源：" + c.sourcePath });
-      srcRow.createEl("button", { cls: "kg-btn", text: "打开笔记" })
-        .addEventListener("click", () => { this.plugin.openNote(c.sourcePath); });   // §14/79：0 AI
+      const body = this.renderAnswerBody(answerArea, c);
+      body.style.display = "";
     }
 
     // 掌握度 vs 保持率（§24 分离展示）
