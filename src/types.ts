@@ -360,6 +360,8 @@ export interface PluginSettings {
   lastQuarterlyEvolution: LongTermReflectionData | null;
   evolution: EvolutionConfig;
   reviewCenter: ReviewCenterConfig;
+  /** Phase 20：间隔重复（FSRS）设置 */
+  spacedReview: SpacedReviewConfig;
   discovery: DiscoveryConfig;
   queryExplorer: QueryExplorerConfig;
   capture: CaptureConfig;
@@ -445,6 +447,21 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     maxQuestions: 5,
     skipPenalty: true,
     autoOpenReview: false,
+    showAnswerByDefault: true,   // Phase 20 §44：答案默认显示（纯本地，0 AI）
+  },
+  spacedReview: {
+    enabled: true,               // Phase 20：默认升级为 FSRS 驱动；关闭 = Phase 8-19 行为
+    desiredRetention: 0.9,
+    maxIntervalDays: 3650,
+    learningSteps: "10m,1h",
+    relearningSteps: "10m",
+    dailyNewCards: 10,
+    maxReviewsPerDay: 30,
+    overdueFirst: true,
+    sortByRetrievability: true,
+    autoReschedule: false,
+    showAnswerByDefault: true,
+    fsrsParameters: null,
   },
   discovery: {
     curiosity: { scope: { mode: "vault" }, candidateCount: 16, exploreOld: true },
@@ -781,6 +798,7 @@ export interface ReviewCenterConfig {
   maxQuestions: number;         // 每次 Session 最多生成问题数（3/5，默认 5，§五十六）
   skipPenalty: boolean;         // 连续跳过惩罚开关（默认 ON，§三十二）
   autoOpenReview: boolean;      // 日复盘成功后自动打开复习窗口（默认 OFF，§四十三/六十三）
+  showAnswerByDefault: boolean; // Phase 20 §44：答案默认显示（原文摘录，0 AI）
 }
 
 /** AI 复习问题类型（§二十/二十一）：帮助重新建立知识结构，不是考试 */
@@ -818,6 +836,10 @@ export interface ReviewQueueItem {
   selectedAt: number;
   completedAt?: number;
   snoozedUntil?: number;        // “稍后再看”：明天/3 天/7 天（§三十）
+  /** Phase 20：该卡进入今日队列时的 FSRS due（epoch ms；新卡/旧队列无） */
+  dueAt?: number;
+  /** Phase 20：选中时的当前保持率（FSRS retrievability，0~1；新卡无） */
+  retrievabilityAtSelection?: number;
 }
 
 /** Review Queue（§九/十/十一）：本地可执行状态，与 AI Cache 分离、按 periodKey 幂等 */
@@ -827,14 +849,61 @@ export interface ReviewQueue {
   items: ReviewQueueItem[];
   completedCount: number;
   skippedCount: number;
+  /** Phase 20：本队列的复习范围（缺省 = vault，兼容 Phase 8-19 旧队列文件） */
+  scope?: ReviewScope;
+  /** Phase 20：队列缓存键 = periodKey#scopeFingerprint#schedulerConfigFingerprint（§十八/三十） */
+  key?: string;
+  /** Phase 20：队列来源（spaced = FSRS 驱动；legacy = Phase 8 priorityScore 队列） */
+  source?: "legacy" | "spaced";
 }
 
 /** Session 持久化（§三十九）：只存指针，不存 AI prompt / 笔记全文（§七十四） */
 export interface ReviewSessionState {
   periodKey: string;
   currentIndex: number;
-  queueKey: string;             // 等于该 session 工作的 queue.periodKey（恢复不丢进度，§三十八）
+  queueKey: string;             // 等于该 session 工作的 queue 键（恢复不丢进度，§三十八；Phase 20 起含 scope/config 指纹）
   updatedAt: number;
+  /** Phase 20：该 session 的复习范围（§97：重开恢复 scope） */
+  scope?: ReviewScope | null;
+  /** Phase 20：恢复锚点——已完成动作后指向的下一张卡 path（刷新重排后仍能回到同一张，§34） */
+  currentPath?: string | null;
+}
+
+/** ---------- Phase 20：Review Scope + FSRS 间隔重复（Review System 专属；与 Discovery Scope 分离，§3/二十八） ---------- */
+
+/** 复习范围模式（§十九）：vault=整个 Vault / current-note=当前笔记 / folder=文件夹 / area=知识区域 / custom=自定义文件夹 */
+export type ReviewScopeMode = "vault" | "current-note" | "folder" | "area" | "custom";
+
+/**
+ * Review Scope（§二十/二十一/二十八）：只决定「搜索/选择哪些复习卡」，不是 Permission。
+ * 不能改变 vault.read/write；scope key = 排序后字段 hash（§二十九）。
+ */
+export interface ReviewScope {
+  mode: ReviewScopeMode;
+  notePath?: string;      // current-note：具体笔记路径（从某篇笔记打开 → 只复习该来源，§22）
+  folderPath?: string;    // folder：文件夹路径（递归与否由设置/选择行为决定——Phase 20 递归包含子目录）
+  areaId?: string;        // area：KnowledgeArea.id → 使用其 folder 作为范围（§24）
+  folders?: string[];     // custom：多个文件夹，最多 10 个（§25）
+  tags?: string[];        // custom：可选标签过滤（本地 NoteIndex 元数据，0 AI，§87）
+}
+
+/** FSRS Rating（§九）：😵忘记→Again / 😕困难→Hard / 🙂掌握→Good / 😎熟练→Easy */
+export type FsrsRating = "again" | "hard" | "good" | "easy";
+
+/** Phase 20：间隔重复设置（§65~77）。本阶段禁止直接编辑 FSRS model parameters（§77）；参数优化接口保留（§78）。 */
+export interface SpacedReviewConfig {
+  enabled: boolean;              // 启用（默认 true——本阶段默认升级为 FSRS 驱动；关闭 = 完全 Phase 8-19 行为）
+  desiredRetention: number;      // 目标保持率（默认 0.9，范围 0.7~0.97，§66）
+  maxIntervalDays: number;       // 最大间隔（默认 3650，范围 30~36500，§67）
+  learningSteps: string;         // 学习步骤（默认 "10m,1h"，逗号分隔，§68）
+  relearningSteps: string;       // 重新学习步骤（默认 "10m"，§69）
+  dailyNewCards: number;         // 每日新卡（默认 10，范围 0~100，§70）
+  maxReviewsPerDay: number;      // 每日最大复习（默认 30，范围 1~500，§71）
+  overdueFirst: boolean;         // 逾期优先（默认 true，§72）
+  sortByRetrievability: boolean; // 按 retrievability 排序（默认 true，§73）
+  autoReschedule: boolean;       // 设置变化自动重排（默认 false：仅影响未来复习，§74）
+  showAnswerByDefault: boolean;  // 答案默认显示（§44；隐藏只是 DOM 切换，0 AI）
+  fsrsParameters?: number[] | null; // 保留位：个人 FSRS 参数训练接口（§78：本阶段不实现）
 }
 
 /** ---------- Discovery Scope：全库知识奇想 + 可调节知识漫游范围 ---------- */

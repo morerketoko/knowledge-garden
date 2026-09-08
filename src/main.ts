@@ -1,5 +1,5 @@
 import { Plugin, WorkspaceLeaf, Notice, TFile, TFolder, normalizePath } from "obsidian";
-import { DEFAULT_SETTINGS, mergeSettings, type Period, type PluginSettings, type ReviewQueue, type ReviewQuestion } from "./types";
+import { DEFAULT_SETTINGS, mergeSettings, type Period, type PluginSettings, type ReviewQueue, type ReviewQuestion, type ReviewQueueItem } from "./types";
 import { NoteIndex, type NoteMetadata } from "./noteIndex";
 import { SearchIndex, extractAliases, extractHeadings, tokenizeText } from "./searchIndex";
 import { QueryHistoryStore } from "./queryHistory";
@@ -7,6 +7,7 @@ import { QUERY_MAX_LENGTH, buildQueryCacheKey, parseQuery, queryScopePaths, rank
 import { PROMPT_VERSIONS } from "./ai/service";
 import type { DiscoveryScope, KnowledgeWorkspace, QueryExplorationResult, QueryScopeMode, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource, NoteExam, ExamSessionState, SavedReviewCard, MasteryRating, ExamQuestionType } from "./types";
 import type { ActivityEntry, KGState } from "./types";
+import type { FsrsRating, ReviewScope, ReviewScopeMode, ReviewSessionState } from "./types";
 import { defaultProfileFrom, resolveAIFunctionRoute, resolveAIFunctionRouteWithWorkspace, routeFingerprint, routeFingerprintWithWorkspace } from "./aiRouting";
 import { defaultWorkspace, resolveWorkspace, workspaceFingerprint } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
@@ -20,8 +21,15 @@ import { AIError, SiliconFlowProvider } from "./ai/provider";
 import { AIService } from "./ai/service";
 import { ReviewManager } from "./review";
 import { ActivityStore } from "./activity";
-import { ReviewCenterStore, buildReviewQueue, dailyPeriodKey, markCompleted, markSkipped, markSnoozed, nextActiveIndex, pruneQueue, safeResumeIndex, sessionFinished } from "./reviewCenter";
+import { ReviewCenterStore, buildReviewQueue, dailyPeriodKey, markCompleted, markSkipped, markSnoozed, nextActiveIndex, pruneQueue, safeResumeIndex, sessionFinished, rankReviewCandidates } from "./reviewCenter";
 import { ReviewSessionView, VIEW_TYPE_REVIEW } from "./reviewSession";
+import {
+  SpacedReviewStore, FsrsScheduler, schedulerFromConfig, schedulerConfigFingerprint,
+  selectDueCards, selectNewCardsFromRanked, queueKeyFor, mergeQueueForRefresh, defaultReviewScope, reviewScopeText, scopeNotesPaths,
+  nextMasteryPercent, computeSpacedStats, type SpacedReviewCard, type StoredFsrsState,
+  type ScheduleResult, type ReviewLogEntry, type SpacedStats,
+} from "./spacedReview";
+import { deriveAnswerFromMarkdown, type DerivedAnswer } from "./reviewAnswer";
 
 /* ================= Phase 14：Note Exam / Review Cards ================= */
 import { ExamSessionView, VIEW_TYPE_EXAM } from "./examView";
@@ -31,7 +39,7 @@ import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamRe
 import { ExamBuildModal, type ExamBuildParams } from "./examView";
 import { collectWebContext } from "./webContext";
 import { ReviewScheduler } from "./scheduler";
-import { forgottenCandidates } from "./knowledgeState";
+import { deriveState, forgottenCandidates } from "./knowledgeState";
 import { DashboardView, VIEW_TYPE_KG } from "./dashboard";
 import { SavedExplorationView, VIEW_TYPE_SAVED } from "./savedView";
 import { KnowledgeGardenSettingTab } from "./settings";
@@ -108,6 +116,12 @@ export default class KnowledgeGardenPlugin extends Plugin {
   evolutionError: string | null = null;
   /** Phase 8：Review Center 本地存储（队列 + session 指针 + 连续跳过历史） */
   reviewCenter!: ReviewCenterStore;
+  /** Phase 20：FSRS 间隔重复状态（cache/spaced-review.json；与 Activity/旧 Queue/AI Cache 分离，§7） */
+  spaced!: SpacedReviewStore;
+  /** Phase 20：复习范围（决定选哪些卡；不是 Permission）。默认 vault；session 持久化恢复（§97） */
+  reviewScope: ReviewScope = defaultReviewScope();
+  /** Phase 20：Review Session 实例内的轻量缓存（当前卡预览/统计，避免重复计算） */
+  reviewUiCache: { kind: string; value: unknown } | null = null;
   /** Phase 8：本周期复习问题只请求一次（§五十六：每次 Session 最多 1 次 AI request） */
   reviewQuestionMemo: { key: string; map: Map<string, ReviewQuestion> } | null = null;
   /** Discovery Scope：AI Discovery 曝光数据（cache/discovery.json，§二十二） */
@@ -197,6 +211,11 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const evolutionCorrupt = this.evolution.load();
     this.evolution.setKeepWeeks(this.settings.evolution.keepWeeks);
     this.reviewCenter = new ReviewCenterStore(baseDir);
+    this.spaced = new SpacedReviewStore(baseDir);
+    const spacedCorrupt = this.spaced.load();
+    // Phase 20：FSRS 卡/session 指向不存在的笔记 → 与 Activity 一样随索引清理（保持 O(note count)）
+    this.spaced.prune(new Set(this.index.all().map((n) => n.path)));
+    this.reviewScope = defaultReviewScope();
 
     this.examStore = new ExamStore(baseDir);
     const examCorrupt = this.examStore.load();
@@ -265,6 +284,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       this.ensureReviewQueue(); // §十三：queue 损坏 → 重新生成当前周期队列（纯本地，不调用 AI）
       new Notice("复习队列已损坏，已隔离并重建当前队列。");
     }
+    if (spacedCorrupt) new Notice("间隔重复(FSRS)数据已损坏，已隔离并重建（原文件保留为 .corrupt-*）。");
     if (discoveryCorrupt) new Notice("知识发现曝光数据已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
     if (workbenchCorrupt) new Notice("来源台账已损坏，已隔离重建（原文件保留为 .corrupt-*）。");
     if (tasksCorrupt) new Notice("AI 任务数据已损坏，已隔离重建。");
@@ -417,6 +437,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       const act = this.activity.get(oldPath);
       if (act) this.activity.set(file.path, act);
       this.reviewCenter.migratePaths(oldPath, file.path);
+      this.spaced?.migratePaths(oldPath, file.path); // Phase 20：FSRS 卡/日志 path 随行更新（0 AI）
       this.index.removeFile(oldPath);
       this.searchIndex.rename(oldPath, file.path);
       this.saved.migratePaths(oldPath, file.path); // §十八：收藏引用跟随 rename（0 AI）
@@ -1643,25 +1664,103 @@ export default class KnowledgeGardenPlugin extends Plugin {
     return (p.split("/").pop() ?? p).replace(/\.md$/i, "");
   }
 
-  /** 确保今日队列存在（§十/四十二/六十四）：同 periodKey 幂等复用；删除的笔记安全移除（Test 18）；
-   *  force=true 重建时排除「稍后再看」未到期笔记（§三十）。纯本地计算，绝不调用 AI（§六十四/七十一）。 */
-  ensureReviewQueue(force = false): ReviewQueue | null {
-    const key = dailyPeriodKey();
-    const store = this.reviewCenter;
-    const notes = this.index.all();
-    const existingPaths = new Set(notes.map((n) => n.path));
-    let base = store.getQueue();
-    if (base && base.periodKey === key) base = pruneQueue(base, existingPaths);
-    else base = null;
-    const now = Date.now();
-    if (!force && base && base.items.length >= 0) return base;
-    if (force) this.reviewQuestionMemo = null;   // 重建 → 旧问题缓存失效（同周期内重新提问）
-    const eligible = notes.filter((n) => {
-      const e = base?.items.find((i) => i.path === n.path);
-      return !(e?.snoozedUntil && e.snoozedUntil > now);
+  /* ---------- Phase 20：间隔重复（FSRS）状态入口（调度数学在 spacedReview.ts，这里只做编排） ---------- */
+
+  spacedEnabled(): boolean {
+    return !!this.settings.spacedReview && this.settings.spacedReview.enabled !== false;
+  }
+
+  /** 当前 FSRS 设置快照 → ts-fsrs 调度器（只影响未来调度，§74；参数不可直接编辑 §77） */
+  spacedScheduler(): FsrsScheduler {
+    return schedulerFromConfig(this.settings.spacedReview);
+  }
+
+  /** §三十：queue 键的一部分 = FSRS config fingerprint（只含调度参数，见 spacedReview 注释） */
+  private spacedCfgFp(): string {
+    return schedulerConfigFingerprint({
+      desiredRetention: this.settings.spacedReview.desiredRetention,
+      maxIntervalDays: this.settings.spacedReview.maxIntervalDays,
+      learningSteps: this.settings.spacedReview.learningSteps,
+      relearningSteps: this.settings.spacedReview.relearningSteps,
     });
-    const q = buildReviewQueue(
-      eligible,
+  }
+
+  /** §十八/三十：queueKey = periodKey#scopeFingerprint#schedulerConfigFingerprint（FSRS off → "off"） */
+  reviewQueueKey(periodKey: string, scope: ReviewScope): string {
+    return queueKeyFor(periodKey, scope, this.spacedEnabled() ? this.spacedCfgFp() : "off");
+  }
+
+  /** 当前复习范围（§27/97）：同周期未完成的 active session 优先恢复；否则默认整个 Vault */
+  currentReviewScope(now = Date.now()): ReviewScope {
+    const period = dailyPeriodKey(new Date(now));
+    const s = this.reviewCenter.getSession();
+    if (s && s.periodKey === period && s.scope && typeof s.scope === "object" && (s.scope as ReviewScope).mode) {
+      return s.scope as ReviewScope;
+    }
+    if (this.reviewScope && (this.reviewScope as ReviewScope).mode) return this.reviewScope;
+    return defaultReviewScope();
+  }
+
+  /** §8：范围过滤只读 NoteIndex 元数据（0 AI，§87/88） */
+  private scopeFilteredNotes(scope: ReviewScope): NoteMetadata[] {
+    const notes = this.index.all();
+    const paths = new Set(scopeNotesPaths(notes, scope));
+    return notes.filter((n) => paths.has(n.path));
+  }
+
+  private noteByPath(): Map<string, NoteMetadata> {
+    return new Map(this.index.all().map((n) => [n.path, n]));
+  }
+
+  /** §16：FSRS 模式今日队列（全新计算，不保留进度）：
+   *  1) due<=now 的卡 → 逾期优先 → retrievability 升序（§17）→ 每日最大复习量截断（§19）
+   *  5) 剩余名额 → 无 FSRS state 的新卡，沿用 ReviewCenter priorityScore 排序（§15/16.6）→ 每日新卡上限（§20） */
+  private buildFreshDailyQueue(scope: ReviewScope, now: number): ReviewQueue {
+    const periodKey = dailyPeriodKey(new Date(now));
+    const qKey = this.reviewQueueKey(periodKey, scope);
+    const scopedNotes = this.scopeFilteredNotes(scope);
+    const noteMap = this.noteByPath();
+    const store = this.reviewCenter;
+    const prev = store.getQueue();
+    const prevSameDay = prev && prev.periodKey === periodKey ? prev : null;
+    const snoozed = new Set<string>();
+    if (prevSameDay) for (const it of prevSameDay.items) if (it.snoozedUntil && it.snoozedUntil > now) snoozed.add(it.path);
+
+    if (!this.spacedEnabled()) {
+      // Phase 8-19 行为：priorityScore 队列（仅按范围过滤 + 指纹键）
+      const eligible = scopedNotes.filter((n) => !snoozed.has(n.path));
+      const q = buildReviewQueue(
+        eligible,
+        (p) => this.activity.get(p),
+        this.settings.knowledgeAreas,
+        this.settings.reviewCenter,
+        this.settings.activity,
+        store.getSkipHistory(),
+        now
+      );
+      return { ...q, scope, key: qKey, source: "legacy" };
+    }
+
+    // ---- FSRS 模式 ----
+    const cfg = this.settings.spacedReview;
+    const sched = this.spacedScheduler();
+    const scopedCards: SpacedReviewCard[] = [];
+    for (const n of scopedNotes) {
+      const c = this.spaced.get(n.path);
+      if (c) scopedCards.push(c);
+    }
+    const dueSel = selectDueCards(
+      scopedCards,
+      sched,
+      now,
+      cfg.maxReviewsPerDay,
+      cfg.overdueFirst !== false,
+      cfg.sortByRetrievability !== false
+    ).filter((d) => !snoozed.has(d.path));
+
+    // 新卡候选排序与旧版一致（rankReviewCandidates 与 buildReviewCandidates 同一评分，不做 quota）
+    const ranked = rankReviewCandidates(
+      scopedNotes,
       (p) => this.activity.get(p),
       this.settings.knowledgeAreas,
       this.settings.reviewCenter,
@@ -1669,11 +1768,174 @@ export default class KnowledgeGardenPlugin extends Plugin {
       store.getSkipHistory(),
       now
     );
+    const rankedBy = new Map(ranked.map((c) => [c.path, c] as const));
+    const duePaths = new Set(dueSel.map((d) => d.path));
+    const snoozedSet = snoozed;
+    const newSel = selectNewCardsFromRanked(
+      ranked,
+      (p) => !!this.spaced.get(p),
+      duePaths,
+      snoozedSet,
+      cfg.dailyNewCards
+    );
+
+    const metaOf = (p: string): { state: KGState; priorityScore: number } => {
+      const r = rankedBy.get(p);
+      if (r) return { state: r.state, priorityScore: r.priorityScore };
+      const n = noteMap.get(p);
+      const st = n ? deriveState(n, this.activity.get(p), this.settings.activity, now) : "new";
+      return { state: st, priorityScore: 0 };
+    };
+
+    const items: ReviewQueueItem[] = [];
+    let idx = 0;
+    for (const d of dueSel) {
+      const m = metaOf(d.path);
+      items.push({
+        path: d.path,
+        stateAtSelection: m.state,
+        priorityScore: m.priorityScore,
+        status: idx === 0 ? "reviewing" : "pending",
+        selectedAt: now,
+        dueAt: d.due,
+        retrievabilityAtSelection: d.retrievability,
+      });
+      idx++;
+    }
+    for (const c of newSel) {
+      items.push({
+        path: c.path,
+        stateAtSelection: c.state,
+        priorityScore: c.priorityScore,
+        status: items.length === 0 ? "reviewing" : "pending",
+        selectedAt: now,
+      });
+    }
+    return {
+      periodKey,
+      createdAt: now,
+      items,
+      completedCount: 0,
+      skippedCount: 0,
+      scope,
+      key: qKey,
+      source: "spaced",
+    };
+  }
+
+  /** 会话指针持久化（§39/97）：只存指针 + 范围，不存 AI/全文（§74） */
+  private saveReviewSessionPointer(q: ReviewQueue): void {
+    if (sessionFinished(q)) {
+      this.reviewCenter.setSession(null);
+      return;
+    }
+    const nextIdx = nextActiveIndex(q, 0);
+    const nextItem = nextIdx === null ? null : q.items[nextIdx];
+    this.reviewCenter.setSession({
+      periodKey: q.periodKey,
+      currentIndex: nextIdx === null ? 0 : nextIdx,
+      queueKey: q.key ?? q.periodKey,
+      updatedAt: Date.now(),
+      scope: q.scope ?? defaultReviewScope(),
+      currentPath: nextItem ? nextItem.path : null,
+    });
+  }
+
+  /**
+   * 确保今日队列存在（§十/四十二/六十四）：同周期且同指纹（period+scope+config）幂等复用（进度不重置，§34）；
+   * force / 指纹变化 → 重新本地计算（纯本地，0 AI，§31/38/39）。
+   * 跨日（periodKey 变化）自动进入新一天（§36/98）。
+   */
+  ensureReviewQueue(force = false, opts: { scope?: ReviewScope; now?: number } = {}): ReviewQueue | null {
+    const now = opts?.now ?? Date.now();
+    const periodKey = dailyPeriodKey(new Date(now));
+    const scope = opts?.scope ?? this.currentReviewScope(now);
+    const store = this.reviewCenter;
+    const qKey = this.reviewQueueKey(periodKey, scope);
+    const base = store.getQueue();
+    if (!force && base && base.periodKey === periodKey && base.key === qKey) {
+      const existing = new Set(this.index.all().map((n) => n.path));
+      const pruned = pruneQueue(base, existing);   // Test 18：删除的笔记安全移除
+      if (pruned !== base) store.setQueue(pruned);
+      return pruned;
+    }
+    if (force) this.reviewQuestionMemo = null;   // 重建 → 旧问题缓存失效（同周期内重新提问）
+    const q = this.buildFreshDailyQueue(scope, now);
     store.setQueue(q);
     return q;
   }
 
-  /** 恢复下标（§三十八/三十九/四十）：同 queueKey 复用 active session；否则从 0 开始 */
+  /**
+   * §32~37：Review Session 的「🔄 刷新复习」。
+   * 1) 重读 Review Queue 2) 重读 FSRS state 3) 重算今日队列 4) 重新定位 currentIndex 5) 更新 mastery/due。
+   * 同周期同指纹：保留已完成/已跳过（§34，不回到第 1 张）；learning/relearning 再到期的卡按 FSRS 重新入队。
+   * 指纹变化（跨日/改范围/改调度设置）：全新队列。失败保留现有 UI（由 View 提示，§37）。0 AI（§89）。
+   */
+  refreshReviewSessionQueue(scope?: ReviewScope, now = Date.now()): ReviewQueue | null {
+    const periodKey = dailyPeriodKey(new Date(now));
+    const effectiveScope = scope ?? this.currentReviewScope(now);
+    const store = this.reviewCenter;
+    const prev = store.getQueue();
+    const sameKey = !!prev && prev.periodKey === periodKey && prev.key === this.reviewQueueKey(periodKey, effectiveScope);
+    const fresh = this.buildFreshDailyQueue(effectiveScope, now);
+    if (!sameKey) {
+      store.setQueue(fresh);
+      return fresh;
+    }
+    const relearn = new Set<string>();
+    if (fresh.source === "spaced" && prev) {
+      const sched = this.spacedScheduler();
+      for (const it of prev.items) {
+        if (it.status !== "completed" && it.status !== "skipped") continue;
+        const card = this.spaced.get(it.path);
+        if (card && card.fsrsState.due <= now) relearn.add(it.path);   // 学习/重学步骤再到期
+      }
+    }
+    const merged = mergeQueueForRefresh(fresh.items, prev ? prev.items : null, relearn);
+    const q: ReviewQueue = {
+      ...fresh,
+      items: merged,
+      completedCount: merged.filter((i) => i.status === "completed").length,
+      skippedCount: merged.filter((i) => i.status === "skipped").length,
+    };
+    store.setQueue(q);
+    return q;
+  }
+
+  /** §97/31：改变复习范围 → 新指纹 → 全新本地队列（0 AI）；不沿用旧队列。 */
+  setReviewScope(scope: ReviewScope): ReviewQueue | null {
+    this.reviewScope = scope;
+    this.reviewQuestionMemo = null;   // 范围变化 → 旧 AI 问题缓存失效（§31）
+    const q = this.buildFreshDailyQueue(scope, Date.now());
+    this.reviewCenter.setQueue(q);
+    this.saveReviewSessionPointer(q);
+    this.rerenderDashboard();
+    return q;
+  }
+
+  /** Scope 变更/恢复的显示名（§27：范围必须可见） */
+  reviewScopeLabel(scope: ReviewScope | null | undefined): string {
+    const areas = this.settings.knowledgeAreas;
+    const area = scope?.mode === "area" ? areas.find((a) => a.id === scope.areaId) : undefined;
+    return reviewScopeText(scope, area?.name);
+  }
+
+  /** 当前范围内有 FSRS 卡的数据（View/统计用；不改状态） */
+  scopedSpacedCards(scope: ReviewScope): SpacedReviewCard[] {
+    const paths = new Set(scopeNotesPaths(this.index.all(), scope));
+    return this.spaced.all().filter((c) => paths.has(c.path));
+  }
+
+  /** §100：FSRS 诊断/概况统计（卡片均分/到期数/平均保持率/平均掌握度/今日复习次数） */
+  spacedStats(scope?: ReviewScope, now = Date.now()): SpacedStats {
+    const cards = scope ? this.scopedSpacedCards(scope) : this.spaced.all();
+    const logs = scope
+      ? this.spaced.logsAll().filter((l) => cards.some((c) => c.path === l.path))
+      : this.spaced.logsAll();
+    return computeSpacedStats(cards, logs, this.spacedScheduler(), now);
+  }
+
+  /** 恢复下标（§三十八/三十九/四十/97）：同 queue 键复用 active session；否则从 0 开始 */
   reviewResumeIndex(q: ReviewQueue): number {
     return safeResumeIndex(this.reviewCenter.getSession(), q);
   }
@@ -1692,7 +1954,6 @@ export default class KnowledgeGardenPlugin extends Plugin {
     return null;
   }
 
-  /** ✓ 已复习（§二十六/五十八/七十）：唯一更新 Activity 的行为；历史 snapshot 保持历史（§四十五） */
   /** §二十八~三十：连点防抖——300ms 内只允许一个 Review 动作生效（进度/写盘只推进一次） */
   private reviewActionGuard(): boolean {
     const now = Date.now();
@@ -1701,6 +1962,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     return true;
   }
 
+  /** ✓ 已复习（§二十六/五十八/七十，FSRS 关闭时的旧语义）：唯一更新 Activity 的行为；历史 snapshot 保持历史（§四十五） */
   completeReviewItem(path: string): void {
     if (!this.reviewActionGuard()) return;
     const q = this.reviewCenter.getQueue();
@@ -1714,7 +1976,52 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.rerenderDashboard();
   }
 
-  /** 跳过（§二十九）：status=skipped；绝不更新 lastReviewedAt/reviewCount（§二十九）；连续跳过登记（§三十二） */
+  /**
+   * Phase 20：四种 FSRS Rating（§48/92）。顺序严格为：
+   * FSRS state update → save FSRS（失败即中止，绝不 markReviewed，§95）→ activity.markReviewed()
+   * → queue 完成 → session 指针 → 下一张（§50）。成功才记完成（§九十六：三者一致）。
+   */
+  rateReviewItem(path: string, rating: FsrsRating): boolean {
+    if (!this.reviewActionGuard()) return false;
+    const q = this.reviewCenter.getQueue();
+    if (!q) return false;
+    const item = q.items.find((i) => i.path === path);
+    if (!item || item.status === "completed" || item.status === "skipped") return false;
+    if (!this.spacedEnabled()) { this.completeReviewItem(path); return true; }   // 兼容旧路径
+    const now = Date.now();
+    try {
+      const sched = this.spacedScheduler();
+      const existing = this.spaced.get(path);
+      const res: ScheduleResult = sched.schedule(rating, existing ? existing.fsrsState : null, now);
+      const reviewTime = res.log.timestamp;
+      const prevCount = existing?.reviewCount ?? 0;
+      const card: SpacedReviewCard = {
+        path,
+        fsrsState: res.next,
+        lastRating: rating,
+        reviewCount: prevCount + 1,
+        lastReviewedAt: reviewTime,
+        masteryPercent: nextMasteryPercent(existing?.masteryPercent, prevCount, rating),
+        createdAt: existing?.createdAt ?? reviewTime,
+        updatedAt: reviewTime,
+      };
+      this.spaced.commitReview(path, card, res.log);   // 抛错 → 不记为完成（§95/164）
+    } catch (e) {
+      new Notice("保存间隔重复状态失败，未记为完成：" + ((e as Error).message ?? String(e)));
+      return false;
+    }
+    // FSRS 已保存成功才开始 Activity/Queue（§九十五/九十六）
+    this.activity.recordAccess(path);   // 复习中打开笔记 = 访问记录（file-open 语义）
+    this.activity.markReviewed(path);   // 唯一写 lastReviewedAt 的入口
+    this.reviewCenter.resetSkip(path);  // 真正完成 → 清除连续跳过
+    const updated = markCompleted(q, path);
+    this.reviewCenter.setQueue(updated);
+    this.advanceReviewSession(updated);
+    this.rerenderDashboard();
+    return true;
+  }
+
+  /** 跳过（§十/二十九）：不调用 FSRS、不改变 stability/difficulty/due/reviewCount；status=skipped（§21/24） */
   skipReviewItem(path: string): void {
     if (!this.reviewActionGuard()) return;
     const q = this.reviewCenter.getQueue();
@@ -1726,7 +2033,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.rerenderDashboard();
   }
 
-  /** 稍后再看（§三十/三十一）：snoozedUntil 只进队列，绝不更新 Activity（Test 9） */
+  /** 稍后再看（§十一/三十/三十一）：不调用 FSRS；只修改当前 session/queue 状态（§22） */
   snoozeReviewItem(path: string, days: number): void {
     if (!this.reviewActionGuard()) return;
     const q = this.reviewCenter.getQueue();
@@ -1739,22 +2046,22 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.rerenderDashboard();
   }
 
-  /** 保存 session 指针（§三十九）：完成则清除（进入完成页后无需恢复）；只存指针不存 AI/全文（§七十四） */
+  /** 保存 session 指针（§三十九/97）：完成则清除；只存指针 + 范围 + 恢复锚点，不存 AI/全文（§七十四） */
   private advanceReviewSession(q: ReviewQueue): void {
-    if (sessionFinished(q)) { this.reviewCenter.setSession(null); return; }
-    const next = nextActiveIndex(q, 0);
-    this.reviewCenter.setSession({
-      periodKey: q.periodKey,
-      currentIndex: next === null ? 0 : next,
-      queueKey: q.periodKey,
-      updatedAt: Date.now(),
-    });
+    this.saveReviewSessionPointer(q);
   }
 
-  /** AI 复习问题（§十七~二十五）：本周期只请求一次（§五十六）；失败/关闭 → 空 Map，Session 用系统 fallback（§二十五） */
+  /** 记忆点/掌握度速览（View 用；不写盘） */
+  fsrsCardOf(path: string): SpacedReviewCard | undefined {
+    return this.spaced.get(path);
+  }
+
+  /** AI 复习问题（§十七~二十五/八十二）：每周期每队列只请求一次；失败/关闭 → 空 Map，Session 用系统 fallback（§二十五）。
+   *  范围变化（queueKey 变化）→ 缓存失效重新提问（§31：AI question 独立于 FSRS，§82）。 */
   async reviewQuestions(q: ReviewQueue): Promise<Map<string, ReviewQuestion>> {
     if (!this.settings.reviewCenter.aiQuestion) return new Map();
-    if (this.reviewQuestionMemo && this.reviewQuestionMemo.key === q.periodKey) return this.reviewQuestionMemo.map;
+    const memoKey = q.key ?? q.periodKey;
+    if (this.reviewQuestionMemo && this.reviewQuestionMemo.key === memoKey) return this.reviewQuestionMemo.map;
     const notes = q.items
       .map((i) => this.index.all().find((n) => n.path === i.path))
       .filter((x): x is NoteMetadata => !!x);
@@ -1774,7 +2081,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const outcome = await this.ai.generateReviewQuestions(prep, false);
     const map = new Map<string, ReviewQuestion>();
     if (outcome.ok) for (const qq of outcome.data) if (!map.has(qq.path)) map.set(qq.path, qq);
-    this.reviewQuestionMemo = { key: q.periodKey, map };
+    this.reviewQuestionMemo = { key: memoKey, map };
     return map;
   }
 
@@ -1802,6 +2109,77 @@ export default class KnowledgeGardenPlugin extends Plugin {
     return areas;
   }
 
+  /**
+   * §40/41/42/八十三：原文依据（0 AI）。流程：
+   * 1) 读取当前笔记正文（只读当前卡）→ 2) 去 frontmatter → 3) 定位与 question 相关 heading/paragraph
+   * → 4) short evidence excerpt（300~800 字符）→ 5) 无正文 → found=false（UI 显示 [[笔记]] + 打开按钮）。
+   */
+  async deriveReviewAnswer(pathKey: string, question?: string): Promise<DerivedAnswer> {
+    try {
+      const file = this.app.vault.getAbstractFileByPath(normalizePath(pathKey));
+      if (!(file instanceof TFile)) return { excerpt: "", heading: null, found: false };
+      const src = await this.app.vault.cachedRead(file);
+      return deriveAnswerFromMarkdown(src, question);
+    } catch {
+      return { excerpt: "", heading: null, found: false };
+    }
+  }
+
+  /**
+   * §75/76：立即按新设置重排（ConfirmModal 后调用）。实现 = 用新参数把每张卡的 reviewLogs 重放一遍
+   * （ts-fsrs 真实调度，不发明公式）；备份 → 批量替换 → 失败 restoreSnapshot rollback。
+   * 重排不动 Activity/AI（§91/140）。
+   */
+  rescheduleSpacedAll(now = Date.now()): { ok: boolean; message: string } {
+    if (!this.spacedEnabled()) return { ok: true, message: "间隔重复(FSRS)未启用，无需重排。" };
+    const snapshot = this.spaced.fileSnapshot();   // §76：重排前备份
+    try {
+      const sched = this.spacedScheduler();
+      const logsByPath = new Map<string, ReviewLogEntry[]>();
+      for (const log of this.spaced.logsAll()) {
+        const arr = logsByPath.get(log.path) ?? [];
+        arr.push(log);
+        logsByPath.set(log.path, arr);
+      }
+      const existingByPath = new Map(this.spaced.all().map((c) => [c.path, c] as const));
+      const nextCards: SpacedReviewCard[] = [];
+      for (const [p, logs] of logsByPath) {
+        if (!logs.length) continue;
+        const sorted = [...logs].sort((a, b) => a.timestamp - b.timestamp);
+        let state: StoredFsrsState | null = null;
+        let lastRating: FsrsRating | undefined;
+        let firstTs = sorted[0].timestamp;
+        for (const log of sorted) {
+          const res = sched.schedule(log.rating, state, log.timestamp);
+          state = res.next;
+          lastRating = log.rating;
+        }
+        if (!state) continue;
+        const existing = existingByPath.get(p);
+        // 防止日志被环形裁剪后低估：reviewCount 取日志数与现有数较大者
+        const reviewCount = Math.max(existing?.reviewCount ?? 0, sorted.length);
+        nextCards.push({
+          path: p,
+          fsrsState: state,
+          lastRating,
+          reviewCount,
+          lastReviewedAt: existing?.lastReviewedAt,
+          masteryPercent: existing?.masteryPercent,
+          createdAt: existing?.createdAt ?? firstTs,
+          updatedAt: now,
+        });
+      }
+      // 没有日志的存量卡（异常态）原样保留
+      const covered = new Set(nextCards.map((c) => c.path));
+      for (const c of this.spaced.all()) if (!covered.has(c.path)) nextCards.push(c);
+      this.spaced.replaceAllCards(nextCards);   // 抛错 → catch rollback
+      return { ok: true, message: "已按当前设置重排 " + nextCards.length + " 张卡（0 AI）。" };
+    } catch (e) {
+      this.spaced.restoreSnapshot(snapshot);    // §76：失败 rollback（旧状态仍存在，§164）
+      return { ok: false, message: "重排失败，已回滚到原状态：" + ((e as Error).message ?? String(e)) };
+    }
+  }
+
   /** 打开今日复习窗口（§十五/四十）：已有同类型 leaf 直接恢复；否则右侧新建 */
   async openReviewSession(): Promise<void> {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_REVIEW);
@@ -1821,6 +2199,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const existing = new Set(this.index.all().map((n) => n.path));
     this.activity.prune(existing);
     this.reviewCenter.prunePaths(existing);
+    this.spaced?.prune(existing);       // Phase 20：FSRS 卡与日志随删除清理（0 AI）
     this.discovery.prune(existing);
   }
 

@@ -150,6 +150,7 @@ export class DiagnosticsModal extends Modal {
       ["AI Cache Entries", cacheStats.count + "（" + (cacheStats.byType["daily_curiosity"] ?? 0) + " 奇想 / " + (cacheStats.byType["connections"] ?? 0) + " 连接 / " + (cacheStats.byType["review_question"] ?? 0) + " 复习问题 / " + (cacheStats.byType["query_exploration"] ?? 0) + " 探索）"],
       ["Evolution Snapshots", String(evo.all().length) + "（持久问题 " + evo.persistentQuestions().length + "）"],
       ["Review Queue", queue ? queue.periodKey + " · " + queue.items.length + " 项（已完成 " + queue.completedCount + "）" : "（暂无）"],
+      ["间隔重复（FSRS，§100）", this.fsrsLine()],
       ["Scheduler", sched.enabled ? "自动复盘已启用 · 记录 " + sched.records.length + " 条" : "自动复盘未启用"],
       ["Hero", (s.hero.folder ? "图片文件夹已配置 · " : "") + (s.hero.current ? "当前有背景图" : "使用默认视觉")],
       ["Music", s.music.enabled ? "已启用 · " + (s.music.folder || "未配置文件夹") : "未启用"],
@@ -244,6 +245,21 @@ export class DiagnosticsModal extends Modal {
     return lines;
   }
 
+  /** Phase 20 §100：FSRS 状态行（0 AI，只读聚合） */
+  private fsrsLine(): string {
+    const p = this.plugin;
+    const cfg = p.settings.spacedReview;
+    if (!cfg || !cfg.enabled) return "未启用（沿用 Phase 8 候选队列，§14）";
+    try {
+      const stats = p.spacedStats(undefined, Date.now());
+      const retr = stats.avgRetrievability === null ? "—" : Math.round(stats.avgRetrievability * 100) + "%";
+      const mastery = stats.avgMastery === null ? "—" : Math.round(stats.avgMastery) + "%";
+      return "Enabled · 卡 " + stats.cardCount + " · 到期 " + stats.dueCount + " · 今日复习 " + stats.reviewsToday + " 次 · 平均保持率 " + retr + " · 平均掌握度 " + mastery;
+    } catch {
+      return "Enabled（统计读取失败）";
+    }
+  }
+
   /** 复制摘要（§四十三）：version/notes/areas/ai-cache/scheduler… 不含 secret / 笔记正文 */
   private summaryText(): string {
     const p = this.plugin;
@@ -261,6 +277,7 @@ export class DiagnosticsModal extends Modal {
       "ai-cache: " + cacheStats.count,
       "evolution: " + p.evolution.all().length,
       "review-queue: " + (queue ? queue.items.length : 0),
+      "spaced-review: " + (p.settings.spacedReview?.enabled ? "enabled · 卡 " + (p.spaced?.count() ?? 0) : "off"),
       "scheduler: " + (sched.enabled ? "enabled" : "disabled") + " / records " + sched.records.length,
       "hero: " + (s.hero.current ? "image" : "default"),
       "music: " + (s.music.enabled ? "enabled" : "disabled"),

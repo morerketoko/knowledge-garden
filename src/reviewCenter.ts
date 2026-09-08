@@ -8,7 +8,7 @@ import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import type { NoteMetadata } from "./noteIndex";
 import type {
   ActivityEntry, KGState, KnowledgeArea, ReviewCandidate, ReviewCenterConfig,
-  ReviewQuestion, ReviewQuestionPurpose, ReviewSessionState, ReviewQueue, ReviewQueueItem,
+  ReviewQuestion, ReviewQuestionPurpose, ReviewScope, ReviewSessionState, ReviewQueue, ReviewQueueItem,
 } from "./types";
 import { deriveState, daysSince, type KGRules } from "./knowledgeState";
 
@@ -147,6 +147,25 @@ export function freshQuota(size: number): number {
   return Math.max(1, Math.ceil(size * 0.3));
 }
 
+/** 全量排序（Phase 20：FSRS 模式「新卡补充池」也用它排序，§16.6）：
+ *  与 buildReviewCandidates 使用同一评分，但不做 forgotten 配额封顶 → 供外部自行截断。 */
+export function rankReviewCandidates(
+  notes: NoteMetadata[],
+  getAct: (p: string) => ActivityEntry | undefined,
+  areas: KnowledgeArea[],
+  cfg: ReviewCenterConfig,
+  rules: KGRules,
+  skipHistory: SkipHistory = {},
+  now = Date.now()
+): ReviewCandidate[] {
+  return notes
+    .map((n) => buildReviewCandidate(n, getAct(n.path), areas, rules, now))
+    .map((c) => (skipHistory[c.path] && cfg.skipPenalty && skipHistory[c.path].consecutive >= 3
+      ? { ...c, priorityScore: c.priorityScore - 0.25 }
+      : c))
+    .sort((a, b) => b.priorityScore - a.priorityScore);
+}
+
 /** 构建每日候选（§六/四十七）：forgotten 优先但受配额封顶（防垄断，§七/六）；
  *  连续跳过 ≥3 次降优先级但绝不排除（§三十二）。 */
 export function buildReviewCandidates(
@@ -158,12 +177,7 @@ export function buildReviewCandidates(
   skipHistory: SkipHistory = {},
   now = Date.now()
 ): ReviewCandidate[] {
-  const all = notes
-    .map((n) => buildReviewCandidate(n, getAct(n.path), areas, rules, now))
-    .map((c) => (skipHistory[c.path] && cfg.skipPenalty && skipHistory[c.path].consecutive >= 3
-      ? { ...c, priorityScore: c.priorityScore - 0.25 }
-      : c))
-    .sort((a, b) => b.priorityScore - a.priorityScore);
+  const all = rankReviewCandidates(notes, getAct, areas, cfg, rules, skipHistory, now);
   const chosen: ReviewCandidate[] = [];
   const used = new Set<string>();
   // fresh 名额按实际可用 fresh 候选封顶：没有 fresh 时 forgotten 可以填满队列（§八：5 篇完整任务）
@@ -285,9 +299,16 @@ export function migrateSkipHistory(h: SkipHistory, oldPath: string, newPath: str
   return out;
 }
 
-/** 恢复 session（§三十八/三十九/四十）：同 periodKey → 复用同一 active session；clamp 到有效范围 */
+/** 恢复 session（§三十八/三十九/四十/97）：同 queue 键 → 复用同一 active session；clamp 到有效范围。
+ *  Phase 20：queue 键含 scope/config 指纹；优先按 currentPath 恢复（刷新重排后仍回到同一张卡，§34）。 */
 export function safeResumeIndex(session: ReviewSessionState | null, queue: ReviewQueue): number {
-  if (!session || session.queueKey !== queue.periodKey) return 0;
+  if (!session) return 0;
+  const queueKey = queue.key ?? queue.periodKey;
+  if (session.queueKey !== queueKey) return 0;
+  if (session.currentPath) {
+    const idx = queue.items.findIndex((i) => i.path === session.currentPath);
+    if (idx >= 0) return idx;
+  }
   const resumed = session.currentIndex;
   if (!Number.isFinite(resumed) || resumed < 0 || resumed >= queue.items.length) return 0;
   const active = nextActiveIndex(queue, resumed);
@@ -323,12 +344,17 @@ export class ReviewCenterStore {
         const raw = JSON.parse(fs.readFileSync(this.queueFile, "utf8")) as QueueFile;
         if (!raw || typeof raw !== "object") throw new Error("invalid queue structure");
         if (raw.queue && typeof raw.queue === "object" && Array.isArray(raw.queue.items)) {
+          const rq = raw.queue as ReviewQueue;
           this.queue = {
-            periodKey: typeof raw.queue.periodKey === "string" ? raw.queue.periodKey : "",
-            createdAt: typeof raw.queue.createdAt === "number" ? raw.queue.createdAt : 0,
+            periodKey: typeof rq.periodKey === "string" ? rq.periodKey : "",
+            createdAt: typeof rq.createdAt === "number" ? rq.createdAt : 0,
             items: raw.queue.items.filter((i) => i && typeof i.path === "string"),
             completedCount: 0,
             skippedCount: 0,
+            // Phase 20：保留 scope/key/source（旧队列文件无这些字段 → 缺失即视为 vault/legacy，§十四）
+            scope: rq.scope && typeof rq.scope === "object" ? rq.scope : undefined,
+            key: typeof rq.key === "string" && rq.key ? rq.key : undefined,
+            source: rq.source === "spaced" || rq.source === "legacy" ? rq.source : undefined,
           };
           this.queue = recount(this.queue);
         }
@@ -347,6 +373,9 @@ export class ReviewCenterStore {
             currentIndex: Number.isFinite(s.currentIndex) ? s.currentIndex : 0,
             queueKey: typeof s.queueKey === "string" ? s.queueKey : s.periodKey,
             updatedAt: typeof s.updatedAt === "number" ? s.updatedAt : 0,
+            // Phase 20：scope 恢复（§97：重开恢复范围）
+            scope: s.scope && typeof s.scope === "object" ? s.scope : null,
+            currentPath: typeof s.currentPath === "string" && s.currentPath ? s.currentPath : null,
           };
         } else {
           throw new Error("invalid session structure");
@@ -426,4 +455,54 @@ export class ReviewCenterStore {
 /** 同周期只允许一个 active session（§四十）：重新进入直接恢复 */
 export function sameActiveSession(session: ReviewSessionState | null, queueKey: string): boolean {
   return !!session && session.queueKey === queueKey;
+}
+
+/* ---------- Phase 20 §61：复习列表排序（纯函数；默认「最可能忘记」；掌握度/保持率/下次 由 UI 传 meta） ---------- */
+
+export type ReviewListSort = "recommend" | "mastery" | "forget" | "recent" | "next";
+
+export interface ReviewListMeta {
+  due?: number;
+  retrievability: number | null;   // 0~1；null = 新卡/未知
+  mastery?: number;                // 0~100
+  lastReviewedAt?: number;
+}
+
+const LIST_STATUS_RANK: Record<string, number> = { reviewing: 0, pending: 1, skipped: 2, completed: 3 };
+
+export function sortReviewQueueForList(
+  items: ReviewQueueItem[],
+  mode: ReviewListSort,
+  meta: (p: string) => ReviewListMeta
+): ReviewQueueItem[] {
+  const ranked = items.map((it, idx) => ({ it, idx, m: meta(it.path) }));
+  const byStatus = (x: { it: ReviewQueueItem }): number => LIST_STATUS_RANK[x.it.status] ?? 2;
+  const retr = (m: ReviewListMeta): number => (typeof m.retrievability === "number" ? m.retrievability : Infinity);
+  const mastery = (m: ReviewListMeta): number => (typeof m.mastery === "number" ? m.mastery : Infinity);
+  const recent = (m: ReviewListMeta): number => (typeof m.lastReviewedAt === "number" ? m.lastReviewedAt : -Infinity);
+  const due = (m: ReviewListMeta): number => (typeof m.due === "number" ? m.due : Infinity);
+  ranked.sort((a, b) => {
+    const sa = byStatus(a) - byStatus(b);
+    if (sa !== 0) return sa;
+    let d = 0;
+    switch (mode) {
+      case "forget":   // 最可能忘记 = 保持率升序（§61 默认）
+        d = retr(a.m) - retr(b.m);
+        if (d !== 0) return d;
+        return due(a.m) - due(b.m);
+      case "mastery":  // 掌握度低在前
+        d = mastery(a.m) - mastery(b.m);
+        if (d !== 0) return d;
+        return due(a.m) - due(b.m);
+      case "recent":   // 最近复习在前
+        return recent(b.m) - recent(a.m);
+      case "next":     // 下次复习最近在前
+        d = due(a.m) - due(b.m);
+        if (d !== 0) return d;
+        return retr(a.m) - retr(b.m);
+      default:         // recommend：保持队列原顺序（复习顺序）
+        return a.idx - b.idx;
+    }
+  });
+  return ranked.map((x) => x.it);
 }

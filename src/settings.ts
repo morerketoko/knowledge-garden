@@ -8,9 +8,32 @@ import { defaultWorkspace, workspaceInstructions } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
 import { capabilityLabel, recommendModels, scoreModelFor, mergedCapabilities } from "./capabilities";
 import { AI_ACTION_CATEGORIES, DEFAULT_PERMISSIONS, actionLabel, effectivePermission } from "./permissions";
+import { parseLearningSteps, isValidDesiredRetention, isValidMaxIntervalDays, isValidDailyNewCards, isValidMaxReviewsPerDay } from "./spacedReview";
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+/** Phase 20 §75：立即重排确认弹窗（ConfirmModal 后才执行；main 内部先备份、失败 rollback §76） */
+class RescheduleConfirmModal extends Modal {
+  constructor(app: App, private onOk: () => void) {
+    super(app);
+  }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.addClass("kg-dashboard");
+    this.contentEl.createEl("h3", { text: "立即按新设置重排所有 FSRS 卡？" });
+    this.contentEl.createEl("p", { text: "将用当前「间隔重复」设置重算每张卡（重放历史评分）。执行前自动备份 cache/spaced-review.json，失败自动回滚到原状态（§75/76/164）。" });
+    const row = this.contentEl.createDiv({ cls: "kg-row" });
+    row.createEl("button", { cls: "kg-btn", text: "取消" }).addEventListener("click", () => this.close());
+    row.createEl("button", { cls: "kg-btn kg-btn-primary", text: "确认重排" }).addEventListener("click", () => {
+      this.close();
+      this.onOk();
+    });
+  }
+  onClose(): void {
+    this.contentEl.empty();
+  }
 }
 
 /** 设置页：数据结构完整可配置；Appearance 视觉项仅保留数据字段（视觉迭代后置）。 */
@@ -688,6 +711,92 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("自动打开复习窗口")
       .setDesc("日复盘成功后自动弹出复习窗口（默认 OFF：不要让 Obsidian 晚上自动弹出强制学习窗口，§六十三）。")
       .addToggle((t) => t.setValue(s.reviewCenter.autoOpenReview).onChange(async (v) => { s.reviewCenter.autoOpenReview = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("答案默认显示（§44）")
+      .setDesc("ON：打开复习卡默认显示「📖 原文依据」（本地原文摘录，0 AI）；OFF：默认隐藏，点「显示答案」展开（隐藏只切 DOM，0 AI）。")
+      .addToggle((t) => t.setValue(s.reviewCenter.showAnswerByDefault).onChange(async (v) => { s.reviewCenter.showAnswerByDefault = v; await this.plugin.saveSettings(); }));
+
+    // ---------- Phase 20：间隔重复（FSRS；§65~78） ----------
+    new Setting(containerEl).setName("间隔重复（FSRS）").setHeading()
+      .setDesc("Review Center 2.0：队列由 FSRS due 驱动（可限定复习范围），Rating 使用真实 FSRS 调度（ts-fsrs@5.4.2），不自行实现公式（§七十九）。关闭 = 完全 Phase 8-19 候选队列行为（§十四）。FSRS 参数（w）本阶段禁止直接编辑（§77），参数优化接口保留（§78）。");
+    new Setting(containerEl).setName("启用间隔重复")
+      .setDesc("ON：今日队列 = due<=now 的 FSRS 卡（保持率升序）+ 每日新卡；OFF：沿用旧 priorityScore 队列。旧的 cache/review-queue.json 始终保留（§14）。")
+      .addToggle((t) => t.setValue(s.spacedReview.enabled).onChange(async (v) => {
+        s.spacedReview.enabled = v;
+        await this.plugin.saveSettings();
+        this.refreshDashboard();
+      }));
+    new Setting(containerEl).setName("目标保持率（desired retention）")
+      .setDesc("FSRS 计算到期日的目标回忆率；范围 0.7~0.97（默认 0.9）。调低 → 到期更晚（更松）；调高 → 到期更频繁。0.69 / 0.98 会被拒绝（P20-32）。")
+      .addText((t) => t.setValue(String(s.spacedReview.desiredRetention)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidDesiredRetention(n)) { new Notice("目标保持率必须在 0.7~0.97 之间（如 0.9）。"); t.setValue(String(s.spacedReview.desiredRetention)); return; }
+        s.spacedReview.desiredRetention = n;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("最大间隔（天）")
+      .setDesc("到期间隔上限：30~36500 天（默认 3650）。")
+      .addText((t) => t.setValue(String(s.spacedReview.maxIntervalDays)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidMaxIntervalDays(n)) { new Notice("最大间隔必须在 30~36500 天之间。"); t.setValue(String(s.spacedReview.maxIntervalDays)); return; }
+        s.spacedReview.maxIntervalDays = Math.floor(n);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("学习步骤（新卡）")
+      .setDesc("逗号分隔，如 10m,1h（分钟 m / 小时 h / 天 d）。拒绝 0 / 空 / 负数（P20-34）。")
+      .addText((t) => t.setValue(s.spacedReview.learningSteps).onChange(async (v) => {
+        const parsed = parseLearningSteps(v);
+        if (!parsed) { new Notice("学习步骤格式非法（如 10m,1h；拒绝 0/空/负数）。"); t.setValue(s.spacedReview.learningSteps); return; }
+        s.spacedReview.learningSteps = v;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("重新学习步骤（遗忘后）")
+      .setDesc("默认 10m；格式同上。")
+      .addText((t) => t.setValue(s.spacedReview.relearningSteps).onChange(async (v) => {
+        const parsed = parseLearningSteps(v);
+        if (!parsed) { new Notice("重新学习步骤格式非法（如 10m）。"); t.setValue(s.spacedReview.relearningSteps); return; }
+        s.spacedReview.relearningSteps = v;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("每日新卡")
+      .setDesc("每天最多首次复习多少张无 FSRS 状态的笔记（0~100，默认 10）。")
+      .addText((t) => t.setValue(String(s.spacedReview.dailyNewCards)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidDailyNewCards(n)) { new Notice("每日新卡必须是 0~100 的整数。"); t.setValue(String(s.spacedReview.dailyNewCards)); return; }
+        s.spacedReview.dailyNewCards = Math.floor(n);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("每日最大复习")
+      .setDesc("每天最多复习多少张到期卡（1~500，默认 30）。")
+      .addText((t) => t.setValue(String(s.spacedReview.maxReviewsPerDay)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidMaxReviewsPerDay(n)) { new Notice("每日最大复习必须是 1~500 的整数。"); t.setValue(String(s.spacedReview.maxReviewsPerDay)); return; }
+        s.spacedReview.maxReviewsPerDay = Math.floor(n);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("逾期优先")
+      .setDesc("ON：逾期卡排在今日到期卡之前（默认 ON）。")
+      .addToggle((t) => t.setValue(s.spacedReview.overdueFirst).onChange(async (v) => { s.spacedReview.overdueFirst = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("按保持率排序（retrievability）")
+      .setDesc("ON：最可能忘记的卡排在前面（默认 ON；Anki FSRS 思路，§17）。OFF：改按到期时间排序。")
+      .addToggle((t) => t.setValue(s.spacedReview.sortByRetrievability).onChange(async (v) => { s.spacedReview.sortByRetrievability = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("设置变化自动重排")
+      .setDesc("默认 OFF：改设置只影响未来复习，不立即修改已有日期（Anki FSRS 行为，§74/162）。")
+      .addToggle((t) => t.setValue(s.spacedReview.autoReschedule).onChange(async (v) => {
+        s.spacedReview.autoReschedule = v;
+        await this.plugin.saveSettings();
+        if (v) {
+          const r = this.plugin.rescheduleSpacedAll();
+          new Notice(r.message);
+        }
+      }));
+    new Setting(containerEl).setName("立即按新设置重排（§75/76）")
+      .setDesc("用当前设置把所有 FSRS 卡重排一次。执行前自动备份 cache/spaced-review.json；失败自动回滚（§76/164）。不影响 Activity / AI。")
+      .addButton((b) => b.setButtonText("立即重排").onClick(() => {
+        new RescheduleConfirmModal(this.app, () => {
+          const r = this.plugin.rescheduleSpacedAll();
+          new Notice(r.message);
+        }).open();
+      }));
     // ---------- Discovery Scope：全库知识奇想 + 可调节知识漫游范围（奇想/漫游独立，§六） ----------
     new Setting(containerEl).setName("知识发现").setHeading()
       .setDesc("奇想与漫游各自独立设置探索范围：奇想=发散（整个仓库找意外连接），漫游=收敛（沿指定领域深入）。本地先筛选候选再发给 AI（§十七），绝不上传整库。")
