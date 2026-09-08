@@ -37,6 +37,7 @@ import { deriveAnswerFromMarkdown, type DerivedAnswer } from "./reviewAnswer";
 import { ExamSessionView, VIEW_TYPE_EXAM } from "./examView";
 import { CardsView, VIEW_TYPE_CARDS } from "./cardsView";
 import { NoteExamHubModal, ExamReviewView, VIEW_TYPE_EXAM_REVIEW } from "./examHub";
+import { hydrateSavedCardBatch, legacyMcCandidates, needsSavedCardHydration } from "./savedCardHydration";
 import { examMarkdown, cardMarkdown, examMarkdownPath, cardMarkdownPath, examFingerprint, newExamId, newCardId, examDirPath, cardsDirPath, parseExamMarkdown, parseCardMarkdown, ExamStore, ReviewCardStore, ExamSessionStore, CardReviewStore } from "./examStore";
 import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamResumeIndex, selfMasteryPercent, aiMasteryPercent, masteryLabel, masteryGapHint, weakConceptsOf, strongConceptsOf, type ExamProgressStats } from "./examEngine";
 import { ExamBuildModal, type ExamBuildParams } from "./examView";
@@ -394,6 +395,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.addCommand({ id: "kg-exam-open", name: "知识花园：打开当前笔记考试", callback: () => { void this.openExamForActive(); } });
     this.addCommand({ id: "kg-cards-open", name: "知识花园：查看收藏复习卡", callback: () => { void this.openCardsView(); } });
     this.addCommand({ id: "kg-exam-hub", name: "知识花园：本篇笔记考试中心", callback: () => { this.openExamHubForActive(); } });
+    this.addCommand({ id: "kg-cards-repair", name: "知识花园：修复我的复习卡数据（选择题选项，0 AI）", callback: () => {
+      const r = this.repairSavedCardData();
+      new Notice("发现旧选择题卡 " + r.found + " 张 · 已修复 " + r.repaired + " · 无法恢复 " + r.unavailable + "（0 AI，不猜题）");
+    } });
     this.addCommand({ id: "kg-application-ideas", name: "从当前笔记生成应用思路", callback: () => { const f = this.app.workspace.getActiveFile(); if (f instanceof TFile) this.toolbox.runQuickApplication({ file: f, editor: null, selectedText: "" }); else new Notice("当前没有打开的笔记。"); } });
     this.addCommand({ id: "kg-wb-open", name: "打开 Knowledge Garden AI 工作台（提问/研究/项目）", callback: () => { this.openWorkbenchView(); } });
     this.addCommand({ id: "kg-wb-ask", name: "向 Knowledge Garden 提问", callback: () => { this.openWorkbenchView("ask"); } });
@@ -3014,6 +3019,76 @@ export default class KnowledgeGardenPlugin extends Plugin {
   rerenderExamReview(): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW)) {
       (leaf.view as ExamReviewView).refresh();
+    }
+  }
+
+  /**
+   * Phase 21 Hotfix：Saved Card 惰性 hydration（选择题选项恢复，0 AI）。
+   * - 只在 CardsView reload / 批量修复命令时调用（不在 Dashboard/启动时全量扫描写盘，§34/61）；
+   * - 只处理 multiple_choice 且 options 缺失/无效或 correctAnswer 缺失的卡（§12/52/53）；
+   * - 恢复来源严格：examId+examQuestionId → examId+题干唯一匹配 → sourcePath+题干全局唯一匹配（§5）；
+   *   无法唯一恢复 → unavailable，不 AI 猜题（§3/36/45）。
+   * - 只补 options/correctAnswer 并同步 ReviewCardStore + Review Card Markdown（§37/38）；
+   *   不碰 createdAt/cardId/examId/examQuestionId/question/answer/explanation/evidence/reviewCount/mastery（§6/37/56~58），
+   *   不触发 Activity（§59）。已完整的卡不重复写盘（§12）。
+   */
+  hydrateSavedReviewCards(cards?: SavedReviewCard[]): SavedReviewCard[] {
+    const all = cards ?? this.cards.all();
+    const examIndex = new Map<string, NoteExam>();
+    const sourceIndex = new Map<string, NoteExam[]>();
+    for (const e of this.examStore.all()) {
+      examIndex.set(e.id, e);
+      const arr = sourceIndex.get(e.sourcePath) ?? [];
+      arr.push(e);
+      sourceIndex.set(e.sourcePath, arr);   // §62/63：按 examId/source 缓存，避免每卡 IO
+    }
+    const res = hydrateSavedCardBatch(all, examIndex, (p) => sourceIndex.get(p) ?? []);
+    if (res.repairedCount > 0) {
+      for (const c of res.cards) {
+        const orig = this.cards.get(c.id);
+        if (!orig) continue;
+        const changedOpts = JSON.stringify(c.options ?? null) !== JSON.stringify(orig.options ?? null);
+        if (!changedOpts && c.correctAnswer === orig.correctAnswer) continue;   // 只持久化真正变化的
+        this.cards.update(c.id, { options: c.options, correctAnswer: c.correctAnswer });
+        void this.writeSavedCardMarkdown(c);
+      }
+      this.rerenderDashboard();
+    }
+    return res.cards;
+  }
+
+  /** 批量修复命令（§35）：扫描 legacy MC 卡并恢复；返回统计。0 AI。 */
+  repairSavedCardData(): { found: number; repaired: number; unavailable: number } {
+    const candidates = legacyMcCandidates(this.cards.all());
+    const before = new Map(this.cards.all().map((c) => [c.id, c] as const));
+    const hydrated = this.hydrateSavedReviewCards();
+    const byId = new Map(hydrated.map((c) => [c.id, c] as const));
+    let repaired = 0;
+    let unavailable = 0;
+    for (const c of candidates) {
+      const hc = byId.get(c.id);
+      if (!hc) continue;
+      const okNow = !needsSavedCardHydration(hc);
+      if (okNow && (JSON.stringify(hc.options ?? null) !== JSON.stringify(before.get(c.id)?.options ?? null) || hc.correctAnswer !== before.get(c.id)?.correctAnswer)) repaired++;
+      else if (!okNow) unavailable++;
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS)) {
+      void (leaf.view as CardsView).refresh();
+    }
+    return { found: candidates.length, repaired, unavailable };
+  }
+
+  /** 写入/覆写单张卡 Markdown（保持 Review Cards/*.md 为快照真相源，§38/65；0 AI） */
+  private async writeSavedCardMarkdown(card: SavedReviewCard): Promise<void> {
+    try {
+      await this.ensureVaultFolder(cardsDirPath());
+      const body = cardMarkdown(card) + "\n";
+      const p = cardMarkdownPath(card);
+      const existing = this.app.vault.getAbstractFileByPath(normalizePath(p));
+      if (existing instanceof TFile) await this.app.vault.modify(existing, body);
+      else await this.app.vault.create(p, body);
+    } catch (err) {
+      new Notice("写入复习卡 Markdown 失败：" + String((err as Error)?.message ?? err));
     }
   }
 

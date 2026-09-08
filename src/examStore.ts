@@ -199,8 +199,13 @@ function parseExamFrontmatter(md: string): ExamFrontmatter | null {
   if (!examId) return null;
   const inlineArr = (v?: string): string[] | undefined => {
     if (!v) return undefined;
-    if (v.startsWith("[") && v.endsWith("]")) {
-      return v.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    const t = v.trim();
+    if (t.startsWith("[") && t.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(t);   // 优先严格 JSON：选项含逗号/引号/宽字符也不丢（§20~24）
+        if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean);
+      } catch { /* fallback 旧 split 格式 */ }
+      return t.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
     }
     return undefined;
   };
@@ -301,7 +306,14 @@ export function parseCardMarkdown(md: string): ParsedCard {
   }
   const inlineArr = (v?: string): string[] | undefined => {
     if (!v) return undefined;
-    if (v.startsWith("[") && v.endsWith("]")) return v.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    const t = v.trim();
+    if (t.startsWith("[") && t.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(t);   // Phase 21 Hotfix：优先严格 JSON（§20~24），失败回退旧 split
+        if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean);
+      } catch { /* fallback 旧 split 格式 */ }
+      return t.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    }
     return undefined;
   };
   const id = unescYaml(kv.get("cardId") ?? "");

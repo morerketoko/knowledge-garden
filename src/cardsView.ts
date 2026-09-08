@@ -103,7 +103,8 @@ export class CardsView extends ItemView {
   async onClose(): Promise<void> { this.containerEl.empty(); }
 
   private reloadCards(): void {
-    this.cards = this.plugin.cards.all();   // 索引缓存，不读 Markdown 全文（§113）
+    // Phase 21 Hotfix §11/34：惰性 hydration——只对 options 缺失/无效的 MC 卡尝试从真实 ExamQuestion 恢复（0 AI）
+    this.cards = this.plugin.hydrateSavedReviewCards(this.plugin.cards.all());
   }
 
   private scopedCards(): SavedReviewCard[] {
@@ -463,22 +464,42 @@ export class CardsView extends ItemView {
     }
 
     // 选择题：kg-card 内部 kg-exam-options（§32/34/42：保持卡片 UI，绝不转普通列表）
-    if (c.questionType === "multiple_choice" && c.options && c.options.length) {
-      card.createDiv({ cls: "kg-review-divider" });
-      const optsBox = card.createDiv({ cls: "kg-exam-options" });
-      for (let i = 0; i < c.options.length; i++) {
-        const o = c.options[i];
-        const lbl = String.fromCharCode(65 + i);
-        const row = optsBox.createDiv({ cls: "kg-exam-opt" + (this.chosenOption === lbl ? " kg-exam-opt-picked" : "") });
-        row.createSpan({ cls: "kg-exam-opt-lbl", text: lbl });
-        row.createDiv({ cls: "kg-exam-opt-text", text: o });
-        row.addEventListener("click", () => {
-          this.chosenOption = lbl;
-          this.ratingDone = false;
-          this.renderReview();
-        });
+    if (c.questionType === "multiple_choice") {
+      const opts = c.options ?? [];
+      const optsOk = opts.length >= 1;
+      if (optsOk) {
+        card.createDiv({ cls: "kg-review-divider" });
+        const optsBox = card.createDiv({ cls: "kg-exam-options" });
+        for (let i = 0; i < opts.length; i++) {
+          const o = opts[i];
+          const lbl = String.fromCharCode(65 + i);
+          const row = optsBox.createDiv({ cls: "kg-exam-opt" + (this.chosenOption === lbl ? " kg-exam-opt-picked" : "") });
+          row.createSpan({ cls: "kg-exam-opt-lbl", text: lbl });
+          row.createDiv({ cls: "kg-exam-opt-text", text: o });
+          row.addEventListener("click", () => {
+            this.chosenOption = lbl;
+            this.ratingDone = false;
+            this.renderReview();
+          });
+        }
+        if (opts.length < 2) {   // §53：单选项视为异常提示（hydration 已尽力）
+          const warn = card.createDiv({ cls: "kg-review-hint" });
+          warn.setText("⚠ 此卡仅 1 个选项，可能不完整；若原考试仍在可执行「修复我的复习卡数据」。");
+        }
       }
-      // §94：正确答案明确标注（用户仍可先做选择）
+      // 未修复缺失选项：绝不静默只显示题干（§8/9/42/43）；也绝不 AI 猜题
+      if (!optsOk) {
+        const note = card.createDiv({ cls: "kg-review-hint" });
+        const examExists = !!c.examId && !!this.plugin.examStore.get(c.examId);
+        note.setText(
+          examExists
+            ? "⚠ 此旧选择题卡缺少选项数据（原考试仍在但未唯一匹配题目，无法自动恢复；已保留题干）。"
+            : (c.examId ? "⚠ 原考试已删除，无法恢复该选择题选项（已保留题干）。" : "⚠ 此旧选择题卡缺少选项数据（无来源考试，无法恢复；已保留题干）。")
+        );
+        card.createEl("button", { cls: "kg-btn", text: "打开卡片来源" })
+          .addEventListener("click", () => { this.plugin.openNote(c.sourcePath); });
+      }
+      // §94/27：正确答案独立显示（即使 options 缺失也展示已保存的 correctAnswer）
       if (c.correctAnswer) {
         const correct = card.createDiv({ cls: "kg-exam-answer-title kg-exam-correct-note" });
         correct.setText("✅ 正确答案：" + c.correctAnswer + (this.chosenOption ? (this.chosenOption === c.correctAnswer.trim().toUpperCase() ? "（你选对了 🎉）" : "（你选了 " + this.chosenOption + "）") : ""));
