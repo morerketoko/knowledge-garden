@@ -314,19 +314,34 @@ export class DashboardView extends ItemView {
     }
   }
 
-  /** Phase 14（§一百二十九/一百三十）：📚 我的复习卡 —— 统计（最近掌握 / 需要复习）+ 最近 5 张 + 查看全部（0 AI）。
-   *  点击卡片/查看全部 → openCardsView（§一百二十九）；绝不触发 AI、不修改访问数据。 */
+  /** Phase 14（§一百二十九/一百三十）+ Phase 21 §59/60/125/126：📚 我的复习卡 —— 统计（总卡数/今日到期/可能忘记/高掌握）+ 最近 5 张。
+   *  打开 Dashboard = 0 AI；FSRS 概览只读 scGet 索引缓存（不读 Markdown，§113）。 */
   private renderReviewCardsSection(parent: HTMLElement): void {
     const cards = this.plugin.cards.all();
     const section = parent.createDiv({ cls: "kg-section" });
     const head = section.createDiv({ cls: "kg-section-title-row" });
     head.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
-    const allBtn = head.createEl("button", { cls: "kg-btn", text: "查看全部" });
+    const allBtn = head.createEl("button", { cls: "kg-btn", text: "查看全部 / 开始复习" });
     allBtn.addEventListener("click", () => { void this.plugin.openCardsView(); });
     const masteryMap: Record<string, string> = { forgot: "😵 没想起来", hard: "😕 很困难", good: "🙂 基本掌握", easy: "😎 很熟练" };
+    // Phase 21 §60：本地 FSRS 概览（0 AI）
+    const now = Date.now();
+    const sched = this.plugin.spacedScheduler();
+    let due = 0, forgetting = 0, high = 0, withState = 0;
+    for (const c of cards) {
+      const st = this.plugin.savedCardStateOf(c.id);
+      if (!st) continue;
+      withState++;
+      if (st.fsrsState.due <= now) {
+        due++;
+        const r = sched.retrievability(st.fsrsState, now);
+        if (r !== null && r < 0.7) forgetting++;
+      }
+      if (typeof st.masteryPercent === "number" && st.masteryPercent >= 80) high++;
+    }
     const goodCount = cards.filter((c) => c.mastery === "good" || c.mastery === "easy").length;
     const needCount = cards.filter((c) => !c.mastery || c.mastery === "hard" || c.mastery === "forgot").length;
-    section.createDiv({ cls: "kg-section-desc", text: "最近掌握：🙂 " + goodCount + " · 需要复习：😕 " + needCount + "（复习卡来自「📝 构建知识考试」后收藏题目；0 AI）" });
+    section.createDiv({ cls: "kg-section-desc", text: "总 " + cards.length + " 张 · 已调度 " + withState + " · 今日到期 " + due + " · 即将遗忘 " + forgetting + " · 高掌握 " + high + "（复习卡来自「📝 构建知识考试」后收藏题目；全部本地计算，0 AI）" });
     const list = section.createDiv({ cls: "kg-note-list" });
     if (cards.length === 0) {
       list.createDiv({ cls: "kg-empty", text: "还没有收藏复习卡。在任何笔记右键 →「📝 构建知识考试」→ 作答后把题目收藏为复习卡。" });

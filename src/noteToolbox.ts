@@ -130,6 +130,13 @@ export class NoteToolbox extends Component {
         .setIcon("graduation-cap")
         .onClick(() => void this.plugin.openExamBuilder(ctx.file))
     );
+    // Phase 21 §42/127：本篇笔记考试中心（放在「构建知识考试」下面；0 AI，只列已有考试）
+    menu.addItem((item) =>
+      item
+        .setTitle("📝 本篇笔记考试中心")
+        .setIcon("library")
+        .onClick(() => this.plugin.openExamHubForFile(ctx.file))
+    );
     const label = this.isInKnowledgeFolder(ctx.file.path) ? "✦ 整理 / 提炼此知识" : "✦ 提炼到知识库";
     menu.addItem((item) =>
       item

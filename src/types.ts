@@ -457,6 +457,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     relearningSteps: "10m",
     dailyNewCards: 10,
     maxReviewsPerDay: 30,
+    dailySavedCardsLimit: 10,
     overdueFirst: true,
     sortByRetrievability: true,
     autoReschedule: false,
@@ -887,6 +888,22 @@ export interface ReviewScope {
   tags?: string[];        // custom：可选标签过滤（本地 NoteIndex 元数据，0 AI，§87）
 }
 
+/** ---------- Phase 21：Saved Review Card 范围（§17~22；与 ReviewScope(笔记) 分离，不破坏 Phase 20） ---------- */
+
+export type SavedCardScopeMode = "vault" | "current-note" | "folder" | "area" | "exam" | "custom";
+
+/** 「我的复习卡」范围（§17/19/20/21/22）：按 SavedReviewCard.sourcePath 过滤；exam 模式按 examId（§19）。
+ *  是 Scope 不是 Permission（§28 同语义）。 */
+export interface SavedCardScope {
+  mode: SavedCardScopeMode;
+  notePath?: string;      // current-note：sourcePath === 当前笔记（§18）
+  folderPath?: string;    // folder/area：sourcePath 前缀（§20/21）
+  areaId?: string;
+  examId?: string;        // exam：只显示 examId === 该考试（§19）
+  folders?: string[];     // custom：多个文件夹，最多 10（§22）
+}
+
+
 /** FSRS Rating（§九）：😵忘记→Again / 😕困难→Hard / 🙂掌握→Good / 😎熟练→Easy */
 export type FsrsRating = "again" | "hard" | "good" | "easy";
 
@@ -899,6 +916,7 @@ export interface SpacedReviewConfig {
   relearningSteps: string;       // 重新学习步骤（默认 "10m"，§69）
   dailyNewCards: number;         // 每日新卡（默认 10，范围 0~100，§70）
   maxReviewsPerDay: number;      // 每日最大复习（默认 30，范围 1~500，§71）
+  dailySavedCardsLimit: number;  // Phase 21 §67：每日「我的复习卡」处理上限（默认 10；与今日笔记复习独立计数 §68）
   overdueFirst: boolean;         // 逾期优先（默认 true，§72）
   sortByRetrievability: boolean; // 按 retrievability 排序（默认 true，§73）
   autoReschedule: boolean;       // 设置变化自动重排（默认 false：仅影响未来复习，§74）
@@ -1289,16 +1307,19 @@ export interface SavedReviewCard {
   sourcePath: string;
   sourceVersion: string;      // 收藏时源笔记版本（快照 §七十七/一百四十七）
   examId?: string;            // 来源考试（§一百四十四：不依赖 Exam 存在）
+  examQuestionId?: string;    // Phase 21 §55：来源考试题目 id（稳定时使用；旧卡缺省不破坏）
   question: string;
   answer: string;
   explanation?: string;
   questionType: ExamQuestionType;
+  options?: string[];         // Phase 21 §33：选择题选项（复习时保持卡片 UI）
+  correctAnswer?: string;     // Phase 21 §33：选择题/判断题正确答案（展示用，本地 0 AI）
   sourceEvidence?: string[];
   webSources?: ExamSource[];
   concept?: string;
   tags?: string[];
   mastery?: MasteryRating;    // 最近自评（§八十九）
-  masteryScore?: number;      // 最近自评 0-100（§六十二）
+  masteryScore?: number;      // 最近自评 0-100（§六十二；Phase 21：由 FSRS 评分 EWMA 计算 §23）
   reviewCount?: number;
   lastReviewedAt?: number;
   createdAt: number;

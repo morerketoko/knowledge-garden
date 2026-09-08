@@ -29,7 +29,7 @@ import {
   type Steps,
 } from "ts-fsrs";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
-import type { FsrsRating } from "./types";
+import type { FsrsRating, SavedCardScope, SavedCardScopeMode } from "./types";
 import type { ReviewQueueItem, ReviewScope } from "./types";
 
 /* ================= 版本与常量 ================= */
@@ -82,6 +82,34 @@ export interface SpacedReviewCard {
   updatedAt: number;
 }
 
+/* ---------- Phase 21：Saved Review Card 的 FSRS 状态（§三/五：主键 savedCard:<cardId>，与笔记卡分离） ---------- */
+
+/** 「我的复习卡」独立 FSRS 状态：cardId = SavedReviewCard.id（主键保存，不随 sourcePath 变，§85）。
+ *  不把 fsrsState 塞进 SavedReviewCard / 不写进卡片 Markdown（§八：Markdown 资产保持干净）。 */
+export interface SavedCardSpacedState {
+  cardId: string;
+  fsrsState: StoredFsrsState;
+  lastRating?: FsrsRating;
+  reviewCount: number;        // 与 SavedReviewCard.reviewCount 同步增长
+  lastReviewedAt?: number;
+  masteryPercent?: number;    // 历史评分 EWMA（0~100；§23；≠ retrievability §24）
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Saved Card Review Log（§七）：只记调度元数据；绝不记录 Prompt / API Key / 正文全文 / Web 正文 */
+export interface SavedCardReviewLogEntry {
+  cardId: string;
+  timestamp: number;
+  rating: FsrsRating;
+  previousDue?: number | null;
+  nextDue: number;
+  intervalDays: number;
+  stability: number;
+  difficulty: number;
+  retrievability: number;
+}
+
 /** Review Log（§八）：每次 FSRS 评分至少记录以下字段；绝不记录 API Key / Prompt / 全文 / Web 内容 */
 export interface ReviewLogEntry {
   path: string;
@@ -99,6 +127,9 @@ export interface SpacedReviewFile {
   formatVersion: number;
   cards: Record<string, SpacedReviewCard>;
   reviewLogs: ReviewLogEntry[];
+  /** Phase 21（formatVersion 2）：Saved Card FSRS 状态与日志（同一 FSRS State Store，§六/一百二十三） */
+  savedCards?: Record<string, SavedCardSpacedState>;
+  savedCardReviewLogs?: SavedCardReviewLogEntry[];
 }
 
 /* ================= 设置校验（§六十六~七十一；P20-31~34） ================= */
@@ -114,6 +145,10 @@ export function isValidDailyNewCards(v: number): boolean {
 }
 export function isValidMaxReviewsPerDay(v: number): boolean {
   return Number.isInteger(v) && v >= 1 && v <= 500;
+}
+/** Phase 21 §67：每日「我的复习卡」处理上限（0~500；与笔记复习限额独立） */
+export function isValidSavedCardsDailyLimit(v: number): boolean {
+  return Number.isInteger(v) && v >= 0 && v <= 500;
 }
 
 /** 解析学习步骤文本（如 "10m,1h"）→ ts-fsrs Steps；非法（0/空/负数/坏单位）返回 null（P20-34） */
@@ -637,13 +672,17 @@ export function computeSpacedStats(
   };
 }
 
-/* ================= 本地持久化（§七/十四/35/36/37：cache/spaced-review.json，与 Activity/旧 Queue 分离） ================= */
+/* ================= 本地持久化（§七/14/35/36/37/六：cache/spaced-review.json 一个 FSRS State Store） =================
+ * formatVersion 2：Phase 21 起同文件保存 savedCards / savedCardReviewLogs（§六/一百二十三）。
+ * 旧 v1 文件（cards/reviewLogs）容错加载；绝不另建 saved-card-fsrs.json（§一百二十四）。 */
 
 export class SpacedReviewStore {
   private file: string;
   private cards = new Map<string, SpacedReviewCard>();
   private logs: ReviewLogEntry[] = [];
-  private static readonly FORMAT_VERSION = 1;
+  private savedCards = new Map<string, SavedCardSpacedState>();
+  private savedLogs: SavedCardReviewLogEntry[] = [];
+  private static readonly FORMAT_VERSION = 2;
 
   constructor(pluginDir: string) {
     this.file = path.join(pluginDir, "cache", "spaced-review.json");
@@ -666,15 +705,30 @@ export class SpacedReviewStore {
           .filter((l) => l && typeof l === "object" && typeof l.path === "string" && typeof l.timestamp === "number")
           .slice(-REVIEW_LOG_MAX);
       }
+      // Phase 21：savedCards（v1 文件缺失 → 空，兼容旧数据 §38/53）
+      if (raw.savedCards && typeof raw.savedCards === "object") {
+        for (const [id, c] of Object.entries(raw.savedCards)) {
+          const card = sanitizeSavedCard(id, c);
+          if (card) this.savedCards.set(id, card);
+        }
+      }
+      if (Array.isArray(raw.savedCardReviewLogs)) {
+        this.savedLogs = raw.savedCardReviewLogs
+          .filter((l) => l && typeof l === "object" && typeof l.cardId === "string" && typeof l.timestamp === "number")
+          .slice(-REVIEW_LOG_MAX);
+      }
       return false;
     } catch {
       const isolated = isolateCorruptFile(this.file);
       this.cards.clear();
       this.logs = [];
+      this.savedCards.clear();
+      this.savedLogs = [];
       return isolated;
     }
   }
 
+  /* ---------- Note-based FSRS（Phase 20 原 API，不变） ---------- */
   get(pathKey: string): SpacedReviewCard | undefined { return this.cards.get(pathKey); }
   all(): SpacedReviewCard[] { return Array.from(this.cards.values()); }
   count(): number { return this.cards.size; }
@@ -691,12 +745,12 @@ export class SpacedReviewStore {
     const nextCards = new Map(this.cards);
     nextCards.set(pathKey, card);
     const nextLogs = this.logs.concat(entry).slice(-REVIEW_LOG_MAX);
-    this.persist(nextCards, nextLogs);      // 抛错则内存不变
+    this.persist(nextCards, nextLogs, this.savedCards, this.savedLogs);      // 抛错则内存不变
     this.cards = nextCards;
     this.logs = nextLogs;
   }
 
-  /** 删除笔记后清理（Test 18 语义） */
+  /** 删除笔记后清理（Test 18 语义）；Saved Card 状态不随 sourcePath 删除（§141） */
   prune(existing: Set<string>): void {
     let changed = false;
     for (const k of Array.from(this.cards.keys())) {
@@ -704,10 +758,10 @@ export class SpacedReviewStore {
     }
     const kept = this.logs.filter((l) => existing.has(l.path));
     if (kept.length !== this.logs.length) { this.logs = kept; changed = true; }
-    if (changed) this.persist(this.cards, this.logs);
+    if (changed) this.persist(this.cards, this.logs, this.savedCards, this.savedLogs);
   }
 
-  /** 笔记 rename 后 path 随行更新（不产生假死路径） */
+  /** 笔记 rename 后 path 随行更新（不产生假死路径）；saved 主键 cardId 不变（§85） */
   migratePaths(oldPath: string, newPath: string): void {
     if (!this.cards.has(oldPath) && !this.logs.some((l) => l.path === oldPath)) return;
     const cards = new Map(this.cards);
@@ -717,31 +771,70 @@ export class SpacedReviewStore {
       cards.set(newPath, { ...c, path: newPath, updatedAt: Date.now() });
     }
     const logs = this.logs.map((l) => (l.path === oldPath ? { ...l, path: newPath } : l));
-    this.persist(cards, logs);
+    this.persist(cards, logs, this.savedCards, this.savedLogs);
     this.cards = cards;
     this.logs = logs;
   }
 
-  /** §七十五/七十六：立即重排（备份 → 批量替换 → 失败恢复由调用方以 fileBackup 回滚；本方法失败抛错内存不变） */
+  /** §七十五/七十六：立即重排（笔记卡；备份 → 批量替换 → 失败恢复由调用方以 fileBackup 回滚） */
   replaceAllCards(nextCards: SpacedReviewCard[]): void {
     const cards = new Map<string, SpacedReviewCard>();
     for (const c of nextCards) if (c && c.path) cards.set(c.path, { ...c, updatedAt: Date.now() });
-    this.persist(cards, this.logs);
+    this.persist(cards, this.logs, this.savedCards, this.savedLogs);
     this.cards = cards;
   }
 
-  /** 文件原文备份（§七十六：重排前备份，失败 rollback） */
+  /* ---------- Saved Card FSRS（Phase 21：savedCard:<cardId> 主键，§三/五） ---------- */
+  scGet(cardId: string): SavedCardSpacedState | undefined { return this.savedCards.get(cardId); }
+  scAll(): SavedCardSpacedState[] { return Array.from(this.savedCards.values()); }
+  scCount(): number { return this.savedCards.size; }
+  scLogsAll(): SavedCardReviewLogEntry[] { return this.savedLogs.slice(); }
+
+  /** §28/二十九：保存卡评分（FSRS save 成功才算完成，失败抛错 → 调用方不标已复习）。 */
+  scCommitReview(cardId: string, next: SavedCardSpacedState, log: Omit<SavedCardReviewLogEntry, "cardId">): void {
+    const state: SavedCardSpacedState = { ...next, cardId, updatedAt: Date.now() };
+    const entry: SavedCardReviewLogEntry = { ...log, cardId };
+    const nextStates = new Map(this.savedCards);
+    nextStates.set(cardId, state);
+    const nextLogs = this.savedLogs.concat(entry).slice(-REVIEW_LOG_MAX);
+    this.persist(this.cards, this.logs, nextStates, nextLogs);      // 抛错则内存不变
+    this.savedCards = nextStates;
+    this.savedLogs = nextLogs;
+  }
+
+  /** §三十九：删除卡 → 同时删 Saved Card FSRS 状态与日志（不动 Exam/Source/AI Cache §39） */
+  scRemoveCard(cardId: string): void {
+    if (!this.savedCards.has(cardId) && !this.savedLogs.some((l) => l.cardId === cardId)) return;
+    const states = new Map(this.savedCards);
+    states.delete(cardId);
+    const logs = this.savedLogs.filter((l) => l.cardId !== cardId);
+    this.persist(this.cards, this.logs, states, logs);
+    this.savedCards = states;
+    this.savedLogs = logs;
+  }
+
+  /** §147：Saved Card 全部重排（与 Note 一起由 main 调用；本方法失败抛错内存不变） */
+  scReplaceAll(nextStates: SavedCardSpacedState[]): void {
+    const states = new Map<string, SavedCardSpacedState>();
+    for (const s of nextStates) if (s && s.cardId) states.set(s.cardId, { ...s, updatedAt: Date.now() });
+    this.persist(this.cards, this.logs, states, this.savedLogs);
+    this.savedCards = states;
+  }
+
+  /** 文件原文备份（§76：重排前备份，失败 rollback） */
   fileSnapshot(): string | null {
     try { return fs.existsSync(this.file) ? fs.readFileSync(this.file, "utf8") : null; } catch { return null; }
   }
 
-  /** 从备份恢复（§七十六 rollback）：写回后重载内存 */
+  /** 从备份恢复（§76 rollback）：写回后重载内存 */
   restoreSnapshot(snapshot: string | null): boolean {
     try {
       if (snapshot === null) {
         this.cards.clear();
         this.logs = [];
-        this.persist(this.cards, this.logs);
+        this.savedCards.clear();
+        this.savedLogs = [];
+        this.persist(this.cards, this.logs, this.savedCards, this.savedLogs);
         return true;
       }
       fs.writeFileSync(this.file, snapshot, "utf8");
@@ -752,11 +845,18 @@ export class SpacedReviewStore {
     }
   }
 
-  private persist(cards: Map<string, SpacedReviewCard>, logs: ReviewLogEntry[]): void {
+  private persist(
+    cards: Map<string, SpacedReviewCard>,
+    logs: ReviewLogEntry[],
+    savedCards: Map<string, SavedCardSpacedState>,
+    savedLogs: SavedCardReviewLogEntry[]
+  ): void {
     const obj: SpacedReviewFile = {
       formatVersion: SpacedReviewStore.FORMAT_VERSION,
       cards: Object.fromEntries(cards),
       reviewLogs: logs,
+      savedCards: Object.fromEntries(savedCards),
+      savedCardReviewLogs: savedLogs,
     };
     atomicWriteJson(this.file, obj);   // 抛错向上传播
   }
@@ -792,5 +892,226 @@ function sanitizeCard(p: string, c: unknown): SpacedReviewCard | null {
     masteryPercent: typeof rec["masteryPercent"] === "number" ? Math.max(0, Math.min(100, rec["masteryPercent"])) : undefined,
     createdAt: f(rec["createdAt"], Date.now()),
     updatedAt: f(rec["updatedAt"], Date.now()),
+  };
+}
+
+function sanitizeSavedCard(id: string, c: unknown): SavedCardSpacedState | null {
+  if (!c || typeof c !== "object") return null;
+  const rec = c as Record<string, unknown>;
+  const fsState = rec["fsrsState"] as Record<string, unknown> | undefined;
+  if (!fsState || typeof fsState !== "object") return null;
+  const f = (v: unknown, fb: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fb;
+  };
+  const lastReviewRaw = fsState["lastReview"];
+  const lastReview = typeof lastReviewRaw === "number" && Number.isFinite(lastReviewRaw) ? lastReviewRaw : undefined;
+  return {
+    cardId: id,
+    fsrsState: {
+      due: f(fsState["due"], Date.now()),
+      stability: Math.max(0.001, f(fsState["stability"], 1)),
+      difficulty: Math.min(10, Math.max(1, f(fsState["difficulty"], 5))),
+      reps: Math.max(0, Math.floor(f(fsState["reps"], 0))),
+      lapses: Math.max(0, Math.floor(f(fsState["lapses"], 0))),
+      state: Number(fsState["state"]) === State.Learning || Number(fsState["state"]) === State.Review || Number(fsState["state"]) === State.Relearning ? Number(fsState["state"]) : State.New,
+      learningSteps: Math.max(0, Math.floor(f(fsState["learningSteps"], 0))),
+      lastReview,
+    },
+    lastRating: FSRS_RATINGS.includes(rec["lastRating"] as FsrsRating) ? rec["lastRating"] as FsrsRating : undefined,
+    reviewCount: Math.max(0, Math.floor(f(rec["reviewCount"], 0))),
+    lastReviewedAt: typeof rec["lastReviewedAt"] === "number" ? rec["lastReviewedAt"] : undefined,
+    masteryPercent: typeof rec["masteryPercent"] === "number" ? Math.max(0, Math.min(100, rec["masteryPercent"])) : undefined,
+    createdAt: f(rec["createdAt"], Date.now()),
+    updatedAt: f(rec["updatedAt"], Date.now()),
+  };
+}
+
+/* ================= Phase 21：Saved Card 范围 / 队列 / 统计（纯函数；0 AI） ================= */
+
+/** 同一 folder 前缀判断（saved card 按 sourcePath 过滤，§20/21） */
+export function savedCardInFolder(sourcePath: string, folderPath: string): boolean {
+  const fp = (folderPath || "").replace(/\/+$/, "");
+  if (!fp) return true;
+  if (sourcePath === fp || sourcePath === fp + ".md") return true;
+  return sourcePath.startsWith(fp + "/");
+}
+
+/** §17~22：Saved Card Scope 过滤（按 SavedReviewCard.sourcePath / examId；只读索引元数据，0 AI） */
+export function filterSavedCardObjects<T extends { sourcePath: string; examId?: string }>(
+  cards: ReadonlyArray<T>,
+  scope: SavedCardScope | null | undefined
+): T[] {
+  if (!scope || scope.mode === "vault") return cards as T[];
+  const match = (c: { sourcePath: string; examId?: string }): boolean => {
+    switch (scope.mode) {
+      case "current-note":
+        return !!scope.notePath && c.sourcePath === scope.notePath;
+      case "folder":
+        return !!scope.folderPath && savedCardInFolder(c.sourcePath, scope.folderPath);
+      case "area":
+        return !!scope.folderPath && savedCardInFolder(c.sourcePath, scope.folderPath);
+      case "exam":
+        return !!scope.examId && c.examId === scope.examId;
+      case "custom": {
+        if (scope.folders && scope.folders.length) {
+          if (!scope.folders.some((f) => savedCardInFolder(c.sourcePath, f))) return false;
+        }
+        return true;
+      }
+      default:
+        return true;
+    }
+  };
+  return (cards as unknown as { sourcePath: string; examId?: string }[]).filter(match) as T[];
+}
+
+/** §17/29：Saved Card scope fingerprint（排序后 hash；exam 模式含 examId） */
+export function savedCardScopeFingerprint(scope: SavedCardScope | null | undefined): string {
+  const o: Record<string, unknown> = { mode: scope?.mode ?? "vault" };
+  if (scope?.notePath) o["notePath"] = scope.notePath;
+  if (scope?.folderPath) o["folderPath"] = scope.folderPath;
+  if (scope?.areaId) o["areaId"] = scope.areaId;
+  if (scope?.examId) o["examId"] = scope.examId;
+  if (scope?.folders && scope.folders.length) o["folders"] = [...scope.folders].sort();
+  const s = JSON.stringify(o);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
+}
+
+export function defaultSavedCardScope(): SavedCardScope {
+  return { mode: "vault" };
+}
+
+/** §17 范围显示名（View 用） */
+export function savedCardScopeText(scope: SavedCardScope | null | undefined, examTitle?: string): string {
+  if (!scope || scope.mode === "vault") return "整个 Vault";
+  switch (scope.mode) {
+    case "current-note": return scope.notePath ? scope.notePath.replace(/\.md$/i, "") : "当前笔记";
+    case "folder": return scope.folderPath || "（未选文件夹）";
+    case "area": return scope.areaId || "（未选区域）";
+    case "exam": return examTitle || scope.examId || "（未选考试）";
+    case "custom": {
+      const folders = (scope.folders ?? []).slice(0, 2);
+      const more = (scope.folders ?? []).length > 2 ? " 等 " + (scope.folders?.length ?? 0) + " 个" : "";
+      return (folders.length ? folders.join("、") : "（未选文件夹）") + more;
+    }
+  }
+}
+
+/** 本地日键（与 reviewCenter.dailyPeriodKey 同格式；避免循环依赖） */
+function savedDayKey(now: number): string {
+  const d = new Date(now);
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return "daily:" + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+/**
+ * §70/71：Saved Card 每日复习队列（纯函数；独立于 Note Queue §68/72，但共用 FsrsScheduler §69）。
+ * 顺序：due<=now 卡按保持率升序（最可能忘记在前）→ 无 FSRS 状态的卡（首次复习/新）按 createdAt 升序；
+ * 上限 = dailySavedCardsLimit（与笔记每日限额分别计数 §67）。
+ */
+export interface SavedCardQueueItem {
+  cardId: string;
+  state: SavedCardSpacedState | null;   // null = 尚无 FSRS 状态（首次评分时 createEmptyCard，§38/55）
+  due?: number;
+  retrievability?: number;
+}
+
+export interface SavedCardReviewQueue {
+  periodKey: string;
+  items: SavedCardQueueItem[];
+  completedCount: number;
+  skippedCount: number;
+}
+
+export function buildSavedCardReviewQueue(
+  cards: ReadonlyArray<{ id: string; sourcePath: string; createdAt: number; examId?: string }>,
+  states: ReadonlyArray<SavedCardSpacedState>,
+  scheduler: FsrsScheduler,
+  now: number,
+  dailySavedCardsLimit: number,
+  scope?: SavedCardScope | null
+): SavedCardReviewQueue {
+  const scoped = filterSavedCardObjects(cards, scope);
+  const stateById = new Map(states.map((s) => [s.cardId, s] as const));
+  const limit = Math.max(0, Math.floor(dailySavedCardsLimit));
+  if (limit <= 0) return { periodKey: savedDayKey(now), items: [], completedCount: 0, skippedCount: 0 };
+  const due = scoped
+    .map((c) => ({ c, st: stateById.get(c.id) }))
+    .filter((x): x is { c: typeof scoped[number]; st: SavedCardSpacedState } => !!x.st && x.st.fsrsState.due <= now)
+    .map((x) => ({ id: x.c.id, state: x.st, retr: scheduler.retrievability(x.st.fsrsState, now) ?? 1 }))
+    .sort((a, b) => a.retr - b.retr || a.state.fsrsState.due - b.state.fsrsState.due)
+    .map((x) => ({ id: x.id, state: x.state }));
+  const fresh = scoped
+    .filter((c) => !stateById.has(c.id))
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((c) => ({ id: c.id, state: null as SavedCardSpacedState | null }));
+  const selected = [...due, ...fresh].slice(0, limit);
+  return {
+    periodKey: savedDayKey(now),
+    items: selected.map((x) => ({
+      cardId: x.id,
+      state: x.state,
+      due: x.state ? x.state.fsrsState.due : undefined,
+      retrievability: x.state ? (scheduler.retrievability(x.state.fsrsState, now) ?? undefined) : undefined,
+    })),
+    completedCount: 0,
+    skippedCount: 0,
+  };
+}
+
+/** 掌握分布（Saved Card；复用掌握带边界 §23/61，0 AI） */
+export function savedMasteryDistribution(states: ReadonlyArray<{ masteryPercent?: number }>): MasteryDistribution {
+  const dist = emptyDistribution();
+  for (const s of states) if (typeof s.masteryPercent === "number") dist[reviewBandOf(s.masteryPercent)]++;
+  return dist;
+}
+
+/** §60/62：Saved Card 概况（本地计算；due = 今天到期卡数用于概览；忘记/稳定/总数/掌握分布） */
+export interface SavedCardOverview {
+  total: number;
+  due: number;            // due <= now（含已到期）
+  forgetting: number;     // due<=now 且保持率 <0.7（即将遗忘）
+  stable: number;         // masteryPercent >= 80（稳定掌握）
+  reviewsToday: number;
+  avgRetrievability: number | null;
+  avgMastery: number | null;
+  dist: MasteryDistribution;
+}
+
+export function savedCardOverview(
+  states: ReadonlyArray<SavedCardSpacedState>,
+  logs: ReadonlyArray<SavedCardReviewLogEntry>,
+  scheduler: FsrsScheduler,
+  now: number
+): SavedCardOverview {
+  const d = new Date(now);
+  const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  let due = 0, forgetting = 0, stable = 0;
+  const retr: number[] = [];
+  const mastery: number[] = [];
+  for (const s of states) {
+    const r = scheduler.retrievability(s.fsrsState, now);
+    if (s.fsrsState.due <= now) {
+      due++;
+      if (r !== null && r < 0.7) forgetting++;
+    }
+    if (r !== null) retr.push(r);
+    if (typeof s.masteryPercent === "number") {
+      mastery.push(s.masteryPercent);
+      if (s.masteryPercent >= 80) stable++;
+    }
+  }
+  return {
+    total: states.length,
+    due,
+    forgetting,
+    stable,
+    reviewsToday: logs.filter((l) => l.timestamp >= startOfDay).length,
+    avgRetrievability: retr.length ? retr.reduce((a, b) => a + b, 0) / retr.length : null,
+    avgMastery: mastery.length ? mastery.reduce((a, b) => a + b, 0) / mastery.length : null,
+    dist: savedMasteryDistribution(states),
   };
 }

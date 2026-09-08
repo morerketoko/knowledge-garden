@@ -8,7 +8,7 @@ import { defaultWorkspace, workspaceInstructions } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
 import { capabilityLabel, recommendModels, scoreModelFor, mergedCapabilities } from "./capabilities";
 import { AI_ACTION_CATEGORIES, DEFAULT_PERMISSIONS, actionLabel, effectivePermission } from "./permissions";
-import { parseLearningSteps, isValidDesiredRetention, isValidMaxIntervalDays, isValidDailyNewCards, isValidMaxReviewsPerDay } from "./spacedReview";
+import { parseLearningSteps, isValidDesiredRetention, isValidMaxIntervalDays, isValidDailyNewCards, isValidMaxReviewsPerDay, isValidSavedCardsDailyLimit } from "./spacedReview";
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -771,6 +771,14 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
         const n = Number(v);
         if (Number.isNaN(n) || !isValidMaxReviewsPerDay(n)) { new Notice("每日最大复习必须是 1~500 的整数。"); t.setValue(String(s.spacedReview.maxReviewsPerDay)); return; }
         s.spacedReview.maxReviewsPerDay = Math.floor(n);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("每日复习卡上限（Phase 21 §67）")
+      .setDesc("「我的复习卡」每天最多处理的卡数（0~500，默认 10；与上方今日笔记复习限额独立计数，§68——今天可以同时有 5 篇笔记复习 + 10 张复习卡）。")
+      .addText((t) => t.setValue(String(s.spacedReview.dailySavedCardsLimit)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidSavedCardsDailyLimit(n)) { new Notice("每日复习卡上限必须是 0~500 的整数。"); t.setValue(String(s.spacedReview.dailySavedCardsLimit)); return; }
+        s.spacedReview.dailySavedCardsLimit = Math.floor(n);
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl).setName("逾期优先")

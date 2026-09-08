@@ -254,7 +254,10 @@ export class DiagnosticsModal extends Modal {
       const stats = p.spacedStats(undefined, Date.now());
       const retr = stats.avgRetrievability === null ? "—" : Math.round(stats.avgRetrievability * 100) + "%";
       const mastery = stats.avgMastery === null ? "—" : Math.round(stats.avgMastery) + "%";
-      return "Enabled · 卡 " + stats.cardCount + " · 到期 " + stats.dueCount + " · 今日复习 " + stats.reviewsToday + " 次 · 平均保持率 " + retr + " · 平均掌握度 " + mastery;
+      const now = Date.now();
+      const savedStates = p.spaced?.scAll() ?? [];
+      const savedDue = savedStates.filter((s) => s.fsrsState.due <= now).length;
+      return "Enabled · 笔记卡 " + stats.cardCount + " · 到期 " + stats.dueCount + " · 今日复习 " + stats.reviewsToday + " 次 · 平均保持率 " + retr + " · 平均掌握度 " + mastery + " · 复习卡状态 " + savedStates.length + "（到期 " + savedDue + "）";
     } catch {
       return "Enabled（统计读取失败）";
     }

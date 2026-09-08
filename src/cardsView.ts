@@ -1,44 +1,81 @@
-/** Phase 14 Cards View（§八十三~八十六/一百八十~一百八十六）：收藏复习卡列表 + 搜索/来源/掌握度过滤 + Card Viewer。
- * - 打开/搜索/收藏/删除/复习全部无 AI（§一百一十一/一百一十二/二百零六）。
- * - 首页只展示最近 5 张（§一百三十）；查看全部进入本视图。
- * - Card Review（§一百八十五/二百三十六）：问题 → 回忆 → 显示答案 → 自评 → 下一张，0 AI。
+/**
+ * Phase 21：📚 我的复习卡（CardsView 升级版，§九~§三十一/§60~63）。
+ * - 全面接入 Phase 20 FSRS：Refresh / 范围(vault·current-note·folder·area·exam·custom) / Auto Answer /
+ *   掌握度(EWMA)与保持率(FSRS retrievability)分离展示 / 4 档 Rating 真实预览 / Due 徽标 / 排序。
+ * - 打开/刷新/切范围/显示隐藏答案/评分/打开来源与来源考试：全部 0 AI（§86/165）。
+ * - Skip 不调用 FSRS（§30）；Snooze 不模拟 Again（§31）；Rating = 真实复习（§137）。
+ * - 选择题保持卡片 UI（§32/34）：选项 → 作答 → ✅ 正确答案 → FSRS Rating（§94）。
  */
-import { ItemView, WorkspaceLeaf } from "obsidian";
+import { ItemView, WorkspaceLeaf, Notice } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
-import type { MasteryRating, SavedReviewCard } from "./types";
-import { masteryLabel } from "./examEngine";
+import type { SavedReviewCard, SavedCardScope, SavedCardScopeMode, FsrsRating } from "./types";
 import { examTypeLabel } from "./examView";
+import {
+  FSRS_RATINGS, FSRS_RATING_LABEL, FSRS_RATING_EMOJI, masteryConfidence,
+  defaultSavedCardScope, savedCardScopeText, savedCardOverview, clampCustomFolders, CUSTOM_SCOPE_FOLDER_LIMIT,
+  type SavedCardSpacedState, type MasteryBand,
+} from "./spacedReview";
 
 export const VIEW_TYPE_CARDS = "knowledge-garden-cards";
 
-const MASTERY_OPTIONS: { value: MasteryRating; label: string }[] = [
-  { value: "forgot", label: "😵 没想起来" },
-  { value: "hard", label: "😕 很困难" },
-  { value: "good", label: "🙂 基本掌握" },
-  { value: "easy", label: "😎 很熟练" },
-];
+const BAND_LABEL: Record<MasteryBand, string> = {
+  relearn: "需要重新学习 (0-39)",
+  building: "正在建立 (40-59)",
+  basic: "基本掌握 (60-79)",
+  proficient: "熟练 (80-94)",
+  mastered: "高度掌握 (95-100)",
+};
+const BAND_COLOR: Record<MasteryBand, string> = {
+  relearn: "var(--color-red, #e53935)",
+  building: "var(--color-orange, #ff9800)",
+  basic: "var(--color-yellow, #fbc02d)",
+  proficient: "var(--color-blue, #1e88e5)",
+  mastered: "var(--color-green, #43a047)",
+};
+const DAY_MS = 86400000;
 
-/** 掌握度排序权重（越低越需要复习） */
-function masteryWeight(m?: MasteryRating): number {
-  switch (m) {
-    case "forgot": return 0;
-    case "hard": return 1;
-    case "good": return 2;
-    case "easy": return 3;
-    default: return 1.5;
+type ListSort = "forget" | "mastery" | "recent" | "next" | "recommend";
+
+function fmtDue(due: number | undefined, now: number): { text: string; tone: string } {
+  if (typeof due !== "number") return { text: "—", tone: "green" };
+  const d = new Date(now);
+  const today = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const dd = new Date(due);
+  const dueDay = new Date(dd.getFullYear(), dd.getMonth(), dd.getDate()).getTime();
+  if (due <= now) return { text: dueDay === today ? "已到期" : "逾期", tone: "red" };
+  const diff = Math.round((dueDay - today) / DAY_MS);
+  if (diff === 0) return { text: "今天", tone: "orange" };
+  if (diff === 1) return { text: "明天", tone: "yellow" };
+  return { text: diff + " 天后", tone: "green" };
+}
+function fmtDueText(due: number | undefined, now: number): string { return fmtDue(due, now).text; }
+function fmtAgo(ts: number | undefined, now: number): string {
+  if (typeof ts !== "number") return "从未";
+  const diff = now - ts;
+  if (diff < DAY_MS) return diff < 3600000 ? Math.floor(diff / 60000) + " 分钟前" : Math.floor(diff / 3600000) + " 小时前";
+  return Math.floor(diff / DAY_MS) <= 1 ? "昨天" : Math.floor(diff / DAY_MS) + " 天前";
+}
+function fmtPreview(intervalDays: number, due: number, now: number): string {
+  if (intervalDays < 1 && intervalDays > 0) {
+    const mins = Math.max(1, Math.round(intervalDays * 1440));
+    return mins < 60 ? mins + " 分钟后" : Math.floor(mins / 60) + " 小时后";
   }
+  return fmtDueText(due, now);
 }
 
-/** 收藏复习卡视图：列表 / 搜索 / 来源过滤 / 掌握度过滤 / Card Viewer / 复习模式 */
 export class CardsView extends ItemView {
   private cards: SavedReviewCard[] = [];
-  private query = "";
-  private sourceFilter = "";
-  private masteryFilter: MasteryRating | "" = "";
+  private cardScope: SavedCardScope = defaultSavedCardScope();
+  private scopeEditorOpen = false;
+  private customInput = "";
+  private listSort: ListSort = "forget";           // §27：默认最可能忘记
+  private hiddenAnswers = new Set<string>();
+  private shownAnswers = new Set<string>();
   private reviewing: SavedReviewCard[] = [];
   private reviewIndex = 0;
-  private mode: "list" | "view" | "review" = "list";
-  private activeCard: SavedReviewCard | null = null;
+  private mode: "list" | "review" = "list";
+  private chosenOption = "";
+  private ratingDone = false;
 
   constructor(leaf: WorkspaceLeaf, private plugin: KnowledgeGardenPlugin) { super(leaf); }
 
@@ -50,161 +87,473 @@ export class CardsView extends ItemView {
     this.containerEl.empty();
     this.containerEl.addClass("kg-dashboard");
     this.containerEl.addClass("kg-cards");
-    const inner = this.containerEl.createDiv({ cls: "kg-inner" });
-    this.cards = this.plugin.cards.all();
-    this.mode = "list";
-    this.render(inner);
+    this.containerEl.createDiv({ cls: "kg-inner" });
+    this.reloadCards();
+    this.renderList();
   }
 
-  async refresh(): Promise<void> {
+  async refresh(): Promise<void> { this.reloadCards(); this.mode = "list"; this.renderList(); }
+
+  /** §76/52：外部预置范围（Exam Hub「已收藏 N」入口），0 AI */
+  setScope(scope: SavedCardScope): void { this.cardScope = scope; this.reloadCards(); this.renderList(); }
+
+  async onClose(): Promise<void> { this.containerEl.empty(); }
+
+  private reloadCards(): void {
+    this.cards = this.plugin.cards.all();   // 索引缓存，不读 Markdown 全文（§113）
+  }
+
+  private scopedCards(): SavedReviewCard[] {
+    const all = this.cards;
+    if (!this.cardScope || this.cardScope.mode === "vault") return all;
+    return all.filter((c) => this.inScope(c));
+  }
+  private inScope(c: SavedReviewCard): boolean {
+    const s = this.cardScope;
+    switch (s.mode) {
+      case "current-note": return !!s.notePath && c.sourcePath === s.notePath;
+      case "folder": return !!s.folderPath && this.inFolder(c.sourcePath, s.folderPath);
+      case "area": return !!s.folderPath && this.inFolder(c.sourcePath, s.folderPath);
+      case "exam": return !!s.examId && c.examId === s.examId;
+      case "custom": {
+        if (s.folders && s.folders.length && !s.folders.some((f) => this.inFolder(c.sourcePath, f))) return false;
+        return true;
+      }
+      default: return true;
+    }
+  }
+  private inFolder(p: string, folderPath: string): boolean {
+    const fp = (folderPath || "").replace(/\/+$/, "");
+    if (!fp) return true;
+    if (p === fp || p === fp + ".md") return true;
+    return p.startsWith(fp + "/");
+  }
+
+  private stateOf(id: string): SavedCardSpacedState | null { return this.plugin.savedCardStateOf(id); }
+
+  private metaOf(c: SavedReviewCard): { due?: number; retrievability: number | null; mastery?: number; lastReviewedAt?: number } {
+    const st = this.stateOf(c.id);
+    if (!st) return { retrievability: null, mastery: undefined, lastReviewedAt: c.lastReviewedAt };
+    const sched = this.plugin.spacedScheduler();
+    return {
+      due: st.fsrsState.due,
+      retrievability: sched.retrievability(st.fsrsState, Date.now()),
+      mastery: st.masteryPercent,
+      lastReviewedAt: st.lastReviewedAt ?? c.lastReviewedAt,
+    };
+  }
+
+  /* ================= 列表 ================= */
+
+  private renderList(): void {
     const inner = this.containerEl.querySelector(".kg-inner") as HTMLElement | null;
     if (!inner) return;
-    this.cards = this.plugin.cards.all();
-    this.render(inner);
-  }
-  async onClose(): Promise<void> { this.containerEl.empty(); return Promise.resolve(); }
-
-  private render(inner: HTMLElement): void {
     inner.empty();
-    if (this.mode === "view" && this.activeCard) { this.renderCardViewer(inner, this.activeCard); return; }
-    if (this.mode === "review") { this.renderReviewStep(inner); return; }
-    this.renderList(inner);
-  }
-
-  /* ---------- 列表（搜索 / 来源 / 掌握度过滤；首页最近 5 张对应 §一百二十九） ---------- */
-  private renderList(inner: HTMLElement): void {
-    inner.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
-    inner.createDiv({ cls: "kg-empty", text: "收藏数量：" + this.cards.length + "（打开/刷新均 0 AI；卡片是独立快照，清 AI 缓存不影响）" });
-
-    const filters = inner.createDiv({ cls: "kg-cards-filters" });
-    const search = filters.createEl("input", { cls: "kg-input", attr: { placeholder: "🔍 搜索问题 / 概念 / 来源…" } });
-    search.value = this.query;
-    search.addEventListener("input", () => { this.query = search.value.trim(); this.renderListBody(inner); });
-    const srcSel = filters.createEl("select", { cls: "kg-select" });
-    srcSel.createEl("option", { value: "", text: "全部来源" });
-    const sources = [...new Set(this.cards.map((c) => c.sourcePath).filter(Boolean))];
-    for (const s of sources) srcSel.createEl("option", { value: s, text: s });
-    srcSel.value = this.sourceFilter;
-    srcSel.addEventListener("change", () => { this.sourceFilter = srcSel.value; this.renderListBody(inner); });
-    const masterySel = filters.createEl("select", { cls: "kg-select" });
-    masterySel.createEl("option", { value: "", text: "全部掌握度" });
-    for (const m of MASTERY_OPTIONS) masterySel.createEl("option", { value: m.value, text: m.label });
-    masterySel.value = this.masteryFilter;
-    masterySel.addEventListener("change", () => { this.masteryFilter = masterySel.value as MasteryRating | ""; this.renderListBody(inner); });
-
-    if (this.cards.length) inner.createEl("button", { cls: "kg-btn kg-btn-primary", text: "▶ 开始复习（无 AI）" })
-      .addEventListener("click", () => { this.startReview(); });
-
-    const body = inner.createDiv({ cls: "kg-cards-body" });
-    this.renderListBody(body);
-  }
-  private renderListBody(body: HTMLElement): void {
-    body.empty();
-    const q = this.query.toLowerCase();
-    const filtered = this.cards.filter((c) => {
-      if (this.sourceFilter && c.sourcePath !== this.sourceFilter) return false;
-      if (this.masteryFilter && c.mastery !== this.masteryFilter) return false;
-      if (!q) return true;
-      const hay = ((c.question || "") + " " + (c.concept || "") + " " + (c.sourcePath || "")).toLowerCase();
-      return hay.includes(q);
-    }).sort((a, b) => masteryWeight(a.mastery) - masteryWeight(b.mastery));
-
-    if (!filtered.length) {
-      body.createDiv({ cls: "kg-empty", text: "没有符合条件的复习卡。" });
+    this.mode = "list";
+    this.renderHeader(inner);
+    const scoped = this.scopedCards();
+    if (scoped.length === 0) {
+      inner.createDiv({ cls: "kg-empty", text: this.scopeEmptyText() });
       return;
     }
-    for (const c of filtered.slice(0, 50)) {
-      const row = body.createDiv({ cls: "kg-card kg-card-row" });
-      row.createDiv({ cls: "kg-card-question", text: c.question });
-      row.createDiv({ cls: "kg-card-meta", text: (c.concept ? "★ " + c.concept + " · " : "") + "《" + this.plugin.basename(c.sourcePath) + "》 · " + examTypeLabel(c.questionType) });
-      row.createDiv({ cls: "kg-card-mastery", text: "掌握： " + (c.mastery ? MASTERY_OPTIONS.find((m) => m.value === c.mastery)?.label ?? c.mastery : "未复习") });
-      row.addEventListener("click", () => { this.activeCard = c; this.mode = "view"; this.render(this.containerEl.querySelector(".kg-inner") as HTMLElement); });
+    // 排序（默认最可能忘记）
+    const sorted = this.sortCards(scoped);
+    const list = inner.createDiv({ cls: "kg-note-list kg-cards-body" });
+    const now = Date.now();
+    for (const c of sorted) {
+      const m = this.metaOf(c);
+      const st = this.stateOf(c.id);
+      const examTitle = c.examId ? this.plugin.examStore.get(c.examId)?.title : undefined;
+      const sourceGone = !this.plugin.index.get(c.sourcePath);
+      const row = list.createDiv({ cls: "kg-note-item kg-list-item" });
+      row.createDiv({ cls: "kg-card-question", text: (c.question || "").slice(0, 80) });
+      const chips = row.createDiv({ cls: "kg-row kg-chip-row" });
+      if (c.questionType === "multiple_choice") chips.createSpan({ cls: "kg-chip", text: "🅰 选择" });
+      else chips.createSpan({ cls: "kg-chip", text: examTypeLabel(c.questionType) });
+      const due = m.due;
+      const tone = fmtDue(due, now);
+      chips.createSpan({ cls: "kg-chip kg-due-" + tone.tone, text: due === undefined ? (st ? "" : "新卡") : tone.text === "—" ? (st ? "" : "新卡") : tone.text });
+      if (st) {
+        const conf = masteryConfidence(st.reviewCount);
+        if (conf.low) chips.createSpan({ cls: "kg-chip", text: conf.hint });
+      }
+      const metaRow = row.createDiv({ cls: "kg-row kg-list-meta" });
+      if (typeof m.mastery === "number") {
+        metaRow.createSpan({ cls: "kg-review-qlabel", text: "掌握度" });
+        this.bar(metaRow, m.mastery);
+        metaRow.createSpan({ cls: "kg-mastery-pct", text: m.mastery + "%" });
+      }
+      if (m.retrievability !== null) {
+        metaRow.createSpan({ cls: "kg-review-qlabel", text: "保持率" });
+        this.bar(metaRow, Math.round(m.retrievability * 100), "var(--color-blue, #1e88e5)");
+        metaRow.createSpan({ cls: "kg-mastery-pct", text: Math.round(m.retrievability * 100) + "%" });
+      }
+      metaRow.createSpan({ cls: "kg-review-days", text: (st ? (due !== undefined ? "下次：" + fmtDueText(due, now) : "已调度") : "首次复习") + " · 复习 " + (st ? st.reviewCount : c.reviewCount ?? 0) + " 次" });
+      row.createDiv({ cls: "kg-review-meta" }).setText(
+        "《" + this.plugin.basename(c.sourcePath) + "》" + (c.concept ? " · ★ " + c.concept : "") +
+        (c.examId ? (examTitle ? " · 📝 " + examTitle : " · 📝 原考试已删除") : "") +
+        (sourceGone ? " · ⚠ 来源笔记已删除（卡仍可复习）" : "")
+      );
+      row.addEventListener("click", () => { this.startReviewAt(c); });
     }
-    if (filtered.length > 50) body.createDiv({ cls: "kg-empty", text: "（仅显示前 50 张，可缩小筛选范围）" });
   }
 
-  /* ---------- Card Viewer（§八十六：问题 → 显示答案 → 解释 → 证据 → 打开原笔记 → 掌握度） ---------- */
-  private renderCardViewer(inner: HTMLElement, c: SavedReviewCard): void {
-    inner.createDiv({ cls: "kg-section-title", text: "🔎 复习卡" });
-    inner.createEl("button", { cls: "kg-btn", text: "← 返回列表" })
-      .addEventListener("click", () => { this.mode = "list"; this.render(inner); });
-    const card = inner.createDiv({ cls: "kg-card kg-exam-card" });
-    card.createDiv({ cls: "kg-exam-qmeta", text: examTypeLabel(c.questionType) + (c.concept ? " · " + c.concept : "") });
-    card.createDiv({ cls: "kg-exam-question", text: c.question });
-    const showBtn = card.createEl("button", { cls: "kg-btn kg-btn-primary", text: "👁 显示答案" });
-    const answerZone = card.createDiv({ cls: "kg-exam-answer-area kg-hidden" });
-    answerZone.createDiv({ cls: "kg-exam-answer-title", text: "📖 答案" });
-    answerZone.createDiv({ cls: "kg-exam-answer-text", text: c.answer });
-    if (c.explanation) answerZone.createDiv({ cls: "kg-exam-ans-explanation", text: "说明：" + c.explanation });
-    if (c.sourceEvidence && c.sourceEvidence.length) {
-      answerZone.createDiv({ cls: "kg-exam-ans-evidence-label", text: "📎 原文依据" });
-      for (const s of c.sourceEvidence) answerZone.createDiv({ cls: "kg-exam-ans-evidence", text: "• " + s });
-    }
-    showBtn.addEventListener("click", () => { answerZone.removeClass("kg-hidden"); showBtn.addClass("kg-hidden"); this.renderSelfRatingZone(answerZone, c); });
-
-    const actions = inner.createDiv({ cls: "kg-row" });
-    actions.createEl("button", { cls: "kg-btn", text: "打开原笔记" })
-      .addEventListener("click", () => { this.plugin.openNote(c.sourcePath); });
-    const delBtn = actions.createEl("button", { cls: "kg-btn kg-btn-danger", text: "删除收藏（0 AI）" });
-    delBtn.addEventListener("click", () => { void this.plugin.deleteCard(c.id); this.mode = "list"; this.refresh(); });
-    const reviewBtn = actions.createEl("button", { cls: "kg-btn kg-btn-primary", text: "开始复习这张" });
-    reviewBtn.addEventListener("click", () => { this.reviewing = [c]; this.reviewIndex = 0; this.mode = "review"; this.render(inner); });
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private scopeEmptyText(): string {
+    return "当前范围没有复习卡（打开/刷新 0 AI）。可点上方「复习范围」调整，或在笔记右键「📝 构建知识考试」→ 作答后收藏题目。";
   }
 
-  private renderSelfRatingZone(zone: HTMLElement, c: SavedReviewCard): void {
-    const row = zone.createDiv({ cls: "kg-row" });
-    row.createSpan({ cls: "kg-review-qlabel", text: "这次复习感觉：" });
-    const btns = zone.createDiv({ cls: "kg-exam-selfrating" });
-    for (const m of MASTERY_OPTIONS) {
-      const b = btns.createEl("button", { cls: "kg-btn", text: m.label });
-      b.addEventListener("click", () => {
-        this.plugin.recordCardReview(c.id, m.value);
-        zone.createDiv({ cls: "kg-exam-ai-assessment", text: "已记录（" + m.label + "），0 AI。" });
-        btns.querySelectorAll("button").forEach((bb) => { (bb as HTMLButtonElement).disabled = true; });
+  private bar(parent: HTMLElement, value: number, color?: string): void {
+    const wrap = parent.createDiv({ cls: "kg-mastery-bar" });
+    const fill = wrap.createDiv({ cls: "kg-mastery-fill" });
+    fill.style.width = Math.max(0, Math.min(100, value)) + "%";
+    if (color) fill.style.background = color;
+  }
+
+  private sortCards(cards: SavedReviewCard[]): SavedReviewCard[] {
+    const now = Date.now();
+    type RowMeta = { due?: number; retrievability: number | null; mastery?: number; lastReviewedAt?: number };
+    const arr = cards.map((c) => ({ c, m: this.metaOf(c) as RowMeta }));
+    const statusRank = (x: { c: SavedReviewCard; m: RowMeta }): number => (this.reviewing.includes(x.c) ? 0 : 1);
+    const retr = (m: RowMeta): number => (m.retrievability !== null ? m.retrievability : Infinity);
+    const mastery = (m: RowMeta): number => (typeof m.mastery === "number" ? m.mastery : Infinity);
+    const due = (m: RowMeta): number => (typeof m.due === "number" ? m.due : Infinity);
+    const recent = (m: RowMeta): number => (typeof m.lastReviewedAt === "number" ? m.lastReviewedAt : -Infinity);
+    arr.sort((a, b) => {
+      const sa = statusRank(a) - statusRank(b);
+      if (sa !== 0) return sa;
+      let d = 0;
+      switch (this.listSort) {
+        case "forget": d = retr(a.m) - retr(b.m); if (d !== 0) return d; return due(a.m) - due(b.m);
+        case "mastery": d = mastery(a.m) - mastery(b.m); if (d !== 0) return d; return due(a.m) - due(b.m);
+        case "recent": return recent(b.m) - recent(a.m);
+        case "next": d = due(a.m) - due(b.m); if (d !== 0) return d; return retr(a.m) - retr(b.m);
+        default: return 0;
+      }
+    });
+    return arr.map((x) => x.c);
+  }
+
+  private renderHeader(inner: HTMLElement): void {
+    const head = inner.createDiv({ cls: "kg-section-title-row kg-review-head" });
+    const titleWrap = head.createDiv({ cls: "kg-review-head-title" });
+    titleWrap.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
+    // §60/62 概览（本地计算 0 AI）
+    const scoped = this.scopedCards();
+    const states = scoped.map((c) => this.stateOf(c.id)).filter((x): x is SavedCardSpacedState => !!x);
+    const ov = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now());
+    titleWrap.createDiv({ cls: "kg-review-progress", text: "共 " + scoped.length + " 张 · 到期 " + ov.due + " · 即将遗忘 " + ov.forgetting + " · 稳定掌握 " + ov.stable + " · 今日已复习 " + ov.reviewsToday });
+    const scopeBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "📚 " + this.scopeText() + " ▼" });
+    scopeBtn.addEventListener("click", () => { this.scopeEditorOpen = !this.scopeEditorOpen; this.renderList(); });
+    const refreshBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "🔄 刷新" });
+    refreshBtn.setAttr("title", "重读 ReviewCardStore + FSRS saved-card state + 日志；统计/排序/due/mastery/retrievability 重算（0 AI，§11）");
+    refreshBtn.addEventListener("click", () => { this.refresh(); });
+
+    if (this.scopeEditorOpen) this.renderScopeEditor(inner);
+    // §61/62：掌握分布 + FSRS 概览
+    const distBox = inner.createDiv({ cls: "kg-card kg-overview" });
+    distBox.createDiv({ cls: "kg-review-qlabel", text: "掌握分布（本地 0 AI）" });
+    const dist = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now()).dist;
+    const total = Object.values(dist).reduce((a, b) => a + b, 0);
+    if (total > 0) {
+      for (const band of Object.keys(BAND_LABEL) as MasteryBand[]) {
+        const n = dist[band];
+        const row = distBox.createDiv({ cls: "kg-dist-row" });
+        row.createSpan({ cls: "kg-dist-label", text: BAND_LABEL[band] });
+        const barRow = row.createDiv({ cls: "kg-dist-bar" });
+        const fill = barRow.createDiv({ cls: "kg-mastery-fill" });
+        fill.style.width = Math.round((n / total) * 100) + "%";
+        fill.style.background = BAND_COLOR[band];
+        row.createSpan({ cls: "kg-dist-count", text: String(n) });
+      }
+    } else {
+      distBox.createDiv({ cls: "kg-empty", text: "还没有评分记录（对任意卡点 😵😕🙂😎 开始建立掌握度）。" });
+    }
+
+    if (scoped.length > 0) {
+      const tool = inner.createDiv({ cls: "kg-row kg-sort-row" });
+      tool.createEl("button", { cls: "kg-btn kg-btn-primary", text: "▶ 开始复习（0 AI）" })
+        .addEventListener("click", () => { if (scoped.length) this.startReviewAt(scoped[0]); });
+      tool.createSpan({ cls: "kg-review-qlabel", text: "排序：" });
+      const opts: { id: ListSort; label: string }[] = [
+        { id: "forget", label: "最可能忘记" }, { id: "recommend", label: "推荐" },
+        { id: "mastery", label: "掌握度低" }, { id: "recent", label: "最近复习" }, { id: "next", label: "下次复习" },
+      ];
+      for (const o of opts) {
+        const b = tool.createEl("button", { cls: "kg-btn" + (this.listSort === o.id ? " kg-btn-primary" : ""), text: o.label });
+        b.addEventListener("click", () => { this.listSort = o.id; this.renderList(); });
+      }
+    }
+  }
+
+  private scopeText(): string {
+    const examTitle = this.cardScope.mode === "exam" && this.cardScope.examId ? this.plugin.examStore.get(this.cardScope.examId)?.title : undefined;
+    return savedCardScopeText(this.cardScope, examTitle);
+  }
+
+  /** §17/26/27 Scope 编辑器（0 AI） */
+  private renderScopeEditor(inner: HTMLElement): void {
+    const box = inner.createDiv({ cls: "kg-review-scope-editor" });
+    const modes: { id: SavedCardScopeMode; label: string }[] = [
+      { id: "vault", label: "🌐 整个 Vault" },
+      { id: "current-note", label: "📄 当前笔记" },
+      { id: "folder", label: "📁 当前文件夹" },
+      { id: "area", label: "🗂 知识区域" },
+      { id: "exam", label: "📝 来源考试" },
+      { id: "custom", label: "📚 自定义文件夹" },
+    ];
+    const modeRow = box.createDiv({ cls: "kg-row" });
+    for (const m of modes) {
+      const b = modeRow.createEl("button", { cls: "kg-btn" + (this.cardScope.mode === m.id ? " kg-btn-primary" : ""), text: m.label });
+      b.addEventListener("click", () => this.applyScopeMode(m.id));
+    }
+    const active = this.plugin.app.workspace.getActiveFile();
+    if (this.cardScope.mode === "current-note") {
+      box.createDiv({ cls: "kg-review-meta", text: active ? "当前：《" + active.basename + "》（只显示 sourcePath === 该笔记）" : "当前没有打开笔记。" });
+    }
+    if (this.cardScope.mode === "exam") {
+      const exams = this.plugin.examsForSavedCardsScope();
+      if (exams.length === 0) box.createDiv({ cls: "kg-empty", text: "还没有任何考试。先在某篇笔记右键 →「📝 构建知识考试」。" });
+      else {
+        const row = box.createDiv({ cls: "kg-row" });
+        for (const e of exams.slice(0, 30)) {
+          const b = row.createEl("button", { cls: "kg-btn" + (this.cardScope.examId === e.id ? " kg-btn-primary" : ""), text: "《" + e.title + "》" });
+          b.addEventListener("click", () => this.applyExam(e.id));
+        }
+        if (exams.length > 30) box.createDiv({ cls: "kg-empty", text: "…还有 " + (exams.length - 30) + " 场考试" });
+      }
+    }
+    if (this.cardScope.mode === "area") {
+      const areas = this.plugin.settings.knowledgeAreas;
+      if (areas.length === 0) box.createDiv({ cls: "kg-empty", text: "还没配置知识区域 → 设置 → Knowledge Areas。" });
+      else {
+        const row = box.createDiv({ cls: "kg-row" });
+        for (const a of areas) {
+          const b = row.createEl("button", { cls: "kg-btn" + (this.cardScope.areaId === a.id ? " kg-btn-primary" : ""), text: (a.icon || "📁") + " " + a.name });
+          b.addEventListener("click", () => this.applyArea(a.id, a.folder || undefined));
+        }
+      }
+    }
+    if (this.cardScope.mode === "custom") {
+      const folders = this.cardScope.folders ?? [];
+      box.createDiv({ cls: "kg-review-qlabel", text: "文件夹（最多 " + CUSTOM_SCOPE_FOLDER_LIMIT + " 个）" });
+      const chips = box.createDiv({ cls: "kg-row" });
+      for (const f of folders) {
+        const chip = chips.createSpan({ cls: "kg-chip" });
+        chip.setText(f + " ✕");
+        chip.addEventListener("click", () => this.applyCustom(folders.filter((x) => x !== f)));
+      }
+      const addRow = box.createDiv({ cls: "kg-row" });
+      const input = addRow.createEl("input", { cls: "kg-input", attr: { placeholder: "如 01 盒子/游戏" } });
+      input.value = this.customInput;
+      input.addEventListener("input", () => { this.customInput = input.value; });
+      addRow.createEl("button", { cls: "kg-btn", text: "添加" }).addEventListener("click", () => {
+        const f = this.customInput.trim().replace(/\/+$/, "");
+        this.customInput = "";
+        if (!f) { new Notice("请输入文件夹路径。"); return; }
+        const next = clampCustomFolders(Array.from(new Set([...folders, f])));
+        this.applyCustom(next);
       });
     }
   }
-  /* ---------- 复习模式（§二百三十六：0 AI） ---------- */
-  private startReview(): void {
-    this.reviewing = [...this.cards].sort((a, b) => masteryWeight(a.mastery) - masteryWeight(b.mastery));
-    this.reviewIndex = 0;
-    this.mode = "review";
-    this.render(this.containerEl.querySelector(".kg-inner") as HTMLElement);
-  }
 
-  private renderReviewStep(inner: HTMLElement): void {
-    const c = this.reviewing[this.reviewIndex];
-    if (!c) {
-      this.mode = "list";
-      this.render(inner);
+  private applyScopeMode(mode: SavedCardScopeMode): void {
+    if (mode === "current-note") {
+      const f = this.plugin.app.workspace.getActiveFile();
+      if (!f) { new Notice("当前没有打开的笔记。"); return; }
+      this.setScope({ mode: "current-note", notePath: f.path });
       return;
     }
-    inner.createDiv({ cls: "kg-section-title", text: "📚 复习卡复习 · " + (this.reviewIndex + 1) + " / " + this.reviewing.length });
-    inner.createEl("button", { cls: "kg-btn", text: "退出复习" })
-      .addEventListener("click", () => { this.mode = "list"; this.render(inner); });
-    const card = inner.createDiv({ cls: "kg-card kg-exam-card" });
-    card.createDiv({ cls: "kg-exam-qmeta", text: examTypeLabel(c.questionType) + (c.concept ? " · " + c.concept : "") });
-    card.createDiv({ cls: "kg-exam-question", text: c.question });
-    const ta = card.createEl("textarea", { cls: "kg-exam-answer-input", attr: { rows: 4, placeholder: "先在自己的记忆里回忆，再显示答案…" } });
-    const showBtn = card.createEl("button", { cls: "kg-btn kg-btn-primary", text: "显示答案" });
-    const zone = card.createDiv({ cls: "kg-exam-answer-area kg-hidden" });
-    zone.createDiv({ cls: "kg-exam-answer-title", text: "📖 答案" });
-    zone.createDiv({ cls: "kg-exam-answer-text", text: c.answer });
-    if (c.explanation) zone.createDiv({ cls: "kg-exam-ans-explanation", text: "说明：" + c.explanation });
-    showBtn.addEventListener("click", () => {
-      zone.removeClass("kg-hidden");
-      showBtn.addClass("kg-hidden");
-      const row = zone.createDiv({ cls: "kg-row" });
-      row.createSpan({ cls: "kg-review-qlabel", text: "自评：" });
-      const btns = zone.createDiv({ cls: "kg-exam-selfrating" });
-      for (const m of MASTERY_OPTIONS) {
-        const b = btns.createEl("button", { cls: "kg-btn", text: m.label });
-        b.addEventListener("click", () => {
-          this.plugin.recordCardReview(c.id, m.value);
-          this.reviewIndex++;
-          this.render(inner);
+    if (mode === "folder") {
+      const f = this.plugin.app.workspace.getActiveFile();
+      const folder = f ? f.path.split("/").slice(0, -1).join("/") : "";
+      if (!folder) { new Notice("当前笔记在 Vault 根目录，没有上级文件夹。"); return; }
+      this.setScope({ mode: "folder", folderPath: folder });
+      return;
+    }
+    if (mode === "vault") { this.setScope(defaultSavedCardScope()); return; }
+    // area / exam / custom：保留编辑器内细化
+    const base = { ...this.cardScope };
+    this.setScope({ mode, areaId: base.areaId, examId: base.examId, folders: base.folders });
+  }
+  private applyExam(examId: string): void { this.setScope({ mode: "exam", examId }); }
+  private applyArea(areaId: string, folderPath?: string): void {
+    this.setScope({ mode: "area", areaId, folderPath });
+  }
+  private applyCustom(folders: string[]): void { this.setScope({ mode: "custom", folders }); }
+
+  /* ================= 复习（§28/30/137：Rating=真实复习；Skip 不改 FSRS） ================= */
+
+  private startReviewAt(c: SavedReviewCard): void {
+    const scoped = this.scopedCards();
+    const sorted = this.sortCards(scoped);
+    this.reviewing = sorted;
+    const idx = sorted.findIndex((x) => x.id === c.id);
+    this.reviewIndex = Math.max(0, idx);
+    this.chosenOption = "";
+    this.ratingDone = false;
+    this.mode = "review";
+    this.renderReview();
+  }
+
+  private currentReviewCard(): SavedReviewCard | null {
+    return this.reviewing[this.reviewIndex] ?? null;
+  }
+
+  private renderReview(): void {
+    const inner = this.containerEl.querySelector(".kg-inner") as HTMLElement | null;
+    if (!inner) return;
+    inner.empty();
+    const c = this.currentReviewCard();
+    if (!c) { this.renderList(); return; }
+    const total = this.reviewing.length;
+    this.mode = "review";
+    const head = inner.createDiv({ cls: "kg-section-title-row" });
+    head.createDiv({ cls: "kg-section-title", text: "📚 复习卡 · " + (this.reviewIndex + 1) + " / " + total });
+    head.createSpan({ cls: "kg-review-progress", text: "0 AI" });
+    const back = head.createEl("button", { cls: "kg-btn", text: "← 返回列表" });
+    back.addEventListener("click", () => { this.mode = "list"; this.renderList(); });
+
+    const now = Date.now();
+    const card = inner.createDiv({ cls: "kg-card kg-review-card" });
+    const titleRow = card.createDiv({ cls: "kg-row kg-card-title-row" });
+    titleRow.createDiv({ cls: "kg-review-title", text: (c.question || "复习卡").slice(0, 90) });
+    const noteMeta = this.plugin.index.get(c.sourcePath);
+    const updatedAfterSaved = !!noteMeta && noteMeta.modified > c.createdAt + 60000;   // §143：来源已有更新（只读元数据，0 AI）
+    card.createDiv({ cls: "kg-review-meta" }).setText(
+      (c.concept ? "★ " + c.concept + " · " : "") + examTypeLabel(c.questionType) +
+      (c.examId ? " · 📝 " + (this.plugin.examStore.get(c.examId)?.title ?? "原考试已删除") : "") +
+      (noteMeta ? (updatedAfterSaved ? " · ✏ 来源笔记已有更新" : "") : " · ⚠ 来源笔记已删除")
+    );
+
+    const st = this.stateOf(c.id);
+    const sched = this.plugin.spacedScheduler();
+    const retr = st ? sched.retrievability(st.fsrsState, now) : null;
+    const due = st ? st.fsrsState.due : undefined;
+    const chips = card.createDiv({ cls: "kg-row kg-chip-row" });
+    const tone = fmtDue(due, now);
+    chips.createSpan({ cls: "kg-chip kg-due-" + tone.tone, text: due === undefined ? (st ? "已调度" : "新卡 · 首次复习") : tone.text });
+    if (st) {
+      chips.createSpan({ cls: "kg-chip", text: "复习 " + st.reviewCount + " 次" });
+      const conf = masteryConfidence(st.reviewCount);
+      if (conf.low) chips.createSpan({ cls: "kg-chip", text: conf.hint });
+    }
+
+    // 选择题：kg-card 内部 kg-exam-options（§32/34/42：保持卡片 UI，绝不转普通列表）
+    if (c.questionType === "multiple_choice" && c.options && c.options.length) {
+      card.createDiv({ cls: "kg-review-divider" });
+      const optsBox = card.createDiv({ cls: "kg-exam-options" });
+      for (let i = 0; i < c.options.length; i++) {
+        const o = c.options[i];
+        const lbl = String.fromCharCode(65 + i);
+        const row = optsBox.createDiv({ cls: "kg-exam-opt" + (this.chosenOption === lbl ? " kg-exam-opt-picked" : "") });
+        row.createSpan({ cls: "kg-exam-opt-lbl", text: lbl });
+        row.createDiv({ cls: "kg-exam-opt-text", text: o });
+        row.addEventListener("click", () => {
+          this.chosenOption = lbl;
+          this.ratingDone = false;
+          this.renderReview();
         });
       }
+      // §94：正确答案明确标注（用户仍可先做选择）
+      if (c.correctAnswer) {
+        const correct = card.createDiv({ cls: "kg-exam-answer-title kg-exam-correct-note" });
+        correct.setText("✅ 正确答案：" + c.correctAnswer + (this.chosenOption ? (this.chosenOption === c.correctAnswer.trim().toUpperCase() ? "（你选对了 🎉）" : "（你选了 " + this.chosenOption + "）") : ""));
+      }
+    }
+
+    // 📖 答案区（默认显示 §12/14/93/88；SavedReviewCard.answer 优先，不调 deriveReviewAnswer）
+    const defaultHidden = this.plugin.settings.reviewCenter?.showAnswerByDefault === false;
+    const hidden = defaultHidden ? !this.shownAnswers.has(c.id) : this.hiddenAnswers.has(c.id);
+    const answerArea = card.createDiv({ cls: "kg-answer-area" });
+    const ansHead = answerArea.createDiv({ cls: "kg-row kg-answer-header" });
+    ansHead.createDiv({ cls: "kg-answer-title", text: "📖 答案" });
+    const hideBtn = ansHead.createEl("button", { cls: "kg-btn", text: hidden ? "显示答案" : "隐藏答案" });
+    hideBtn.addEventListener("click", () => {
+      if (defaultHidden) {
+        if (this.shownAnswers.has(c.id)) this.shownAnswers.delete(c.id); else this.shownAnswers.add(c.id);
+      } else if (hidden) this.hiddenAnswers.delete(c.id); else this.hiddenAnswers.add(c.id);
+      const body = answerArea.querySelector(".kg-answer-body") as HTMLElement | null;
+      if (body) body.style.display = hidden ? "" : "none";
     });
+    if (!hidden) {
+      const body = answerArea.createDiv({ cls: "kg-answer-body" });
+      body.createDiv({ cls: "kg-answer-text", text: c.answer || "（该卡没有保存答案文字）" });
+      if (c.explanation) body.createDiv({ cls: "kg-exam-ans-explanation", text: "说明：" + c.explanation });
+      if (c.sourceEvidence && c.sourceEvidence.length) {
+        body.createDiv({ cls: "kg-exam-ans-evidence-label", text: "📎 原文依据" });
+        for (const s of c.sourceEvidence) body.createDiv({ cls: "kg-exam-ans-evidence", text: "• " + s });
+      }
+      const srcRow = body.createDiv({ cls: "kg-row kg-answer-source" });
+      srcRow.createSpan({ cls: "kg-review-qlabel", text: "来源：" + c.sourcePath });
+      srcRow.createEl("button", { cls: "kg-btn", text: "打开笔记" })
+        .addEventListener("click", () => { this.plugin.openNote(c.sourcePath); });   // §14/79：0 AI
+    }
+
+    // 掌握度 vs 保持率（§24 分离展示）
+    if (st) {
+      if (typeof st.masteryPercent === "number") {
+        const mr = card.createDiv({ cls: "kg-row kg-card-meta-row" });
+        mr.createSpan({ cls: "kg-review-qlabel", text: "掌握度（历史评分）" });
+        this.bar(mr, st.masteryPercent);
+        mr.createSpan({ cls: "kg-mastery-pct", text: st.masteryPercent + "%" });
+      }
+      if (retr !== null) {
+        const rr = card.createDiv({ cls: "kg-row kg-card-meta-row" });
+        rr.createSpan({ cls: "kg-review-qlabel", text: "当前保持率（FSRS）" });
+        this.bar(rr, Math.round(retr * 100), "var(--color-blue, #1e88e5)");
+        rr.createSpan({ cls: "kg-mastery-pct", text: Math.round(retr * 100) + "%" });
+      }
+    }
+
+    card.createDiv({ cls: "kg-review-divider" });
+
+    // §四十九 风格：真实 FSRS 预览 + 四档
+    const previews = sched.previewAll(st ? st.fsrsState : null, now);
+    const pRow = card.createDiv({ cls: "kg-review-preview-row" });
+    for (const r of FSRS_RATINGS) {
+      const cell = pRow.createDiv({ cls: "kg-preview-cell" });
+      cell.createDiv({ cls: "kg-review-qlabel", text: FSRS_RATING_EMOJI[r] + " " + FSRS_RATING_LABEL[r] });
+      cell.createDiv({ cls: "kg-preview-due", text: fmtPreview(previews[r].intervalDays, previews[r].due, now) });
+    }
+    const ratingRow = card.createDiv({ cls: "kg-row kg-rating-row" });
+    if (this.ratingDone) {
+      ratingRow.createSpan({ cls: "kg-review-days", text: "✓ 已记录。选下一张继续，或返回列表。" });
+    } else {
+      for (const r of FSRS_RATINGS) {
+        const b = ratingRow.createEl("button", { cls: "kg-btn kg-rating kg-rating-" + r, text: FSRS_RATING_EMOJI[r] + " " + FSRS_RATING_LABEL[r] });
+        b.addEventListener("click", () => { this.rate(c, r); });
+      }
+    }
+    const alt = card.createDiv({ cls: "kg-row kg-review-nav" });
+    const skip = alt.createEl("button", { cls: "kg-btn", text: "跳过（不改变 FSRS）" });
+    skip.setAttr("title", "§30：Skip 不调用 FSRS，不改 mastery/reviewCount/lastReviewedAt/due");
+    skip.addEventListener("click", () => { this.nextCard(false); });
+    const prev = alt.createEl("button", { cls: "kg-btn", text: "← 上一张" });
+    prev.disabled = this.reviewIndex <= 0;
+    prev.addEventListener("click", () => { if (this.reviewIndex > 0) { this.reviewIndex--; this.chosenOption = ""; this.ratingDone = false; this.renderReview(); } });
+    const next = alt.createEl("button", { cls: "kg-btn", text: "下一张 →" });
+    next.disabled = this.reviewIndex >= total - 1;
+    next.addEventListener("click", () => { if (this.reviewIndex < total - 1) { this.reviewIndex++; this.chosenOption = ""; this.ratingDone = false; this.renderReview(); } });
+  }
+
+  /** §28/29/138：Rating 成功 → 下一张；失败保留（main 已拦截） */
+  private rate(c: SavedReviewCard, rating: FsrsRating): void {
+    const ok = this.plugin.rateSavedCard(c.id, rating);
+    if (!ok) return;
+    this.ratingDone = true;
+    this.renderReview();
+  }
+
+  private nextCard(reviewed: boolean): void {
+    if (this.reviewIndex < this.reviewing.length - 1) {
+      this.reviewIndex++;
+      this.chosenOption = "";
+      this.ratingDone = false;
+      this.renderReview();
+    } else {
+      new Notice(reviewed ? "本组复习完成（0 AI）。" : "已跳过当前卡（0 AI）。");
+      this.renderList();
+    }
   }
 }

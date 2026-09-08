@@ -253,7 +253,10 @@ export function cardMarkdown(c: SavedReviewCard): string {
     'sourcePath: "' + c.sourcePath + '"',
     'sourceVersion: "' + c.sourceVersion + '"',
     ...(c.examId ? ['examId: "' + c.examId + '"'] : []),
+    ...(c.examQuestionId ? ['examQuestionId: "' + c.examQuestionId + '"'] : []),
     'questionType: "' + c.questionType + '"',
+    ...(c.options && c.options.length ? ["options: [" + c.options.map(escYaml).join(", ") + "]"] : []),
+    ...(c.correctAnswer ? ["correctAnswer: " + escYaml(c.correctAnswer)] : []),
     ...(c.concept ? ['concept: "' + c.concept + '"'] : []),
     ...(c.tags && c.tags.length ? ["tags: [" + c.tags.map(escYaml).join(", ") + "]"] : []),
     "createdAt: " + c.createdAt,
@@ -303,6 +306,7 @@ export function parseCardMarkdown(md: string): ParsedCard {
   };
   const id = unescYaml(kv.get("cardId") ?? "");
   if (!id) return { card: null };
+  const qtypeRaw = unescYaml(kv.get("questionType") ?? "");
   const hashIdx = md.indexOf("# ", end);
   const q = hashIdx >= 0 ? md.slice(hashIdx + 2, md.indexOf("\n", hashIdx)).trim() || id : id;
   const ansM = /^## 答案[\s\S]*?\n\n([\s\S]*?)\n\n## /m.exec(md.slice(end));
@@ -312,10 +316,13 @@ export function parseCardMarkdown(md: string): ParsedCard {
     sourcePath: unescYaml(kv.get("sourcePath") ?? ""),
     sourceVersion: unescYaml(kv.get("sourceVersion") ?? ""),
     examId: unescYaml(kv.get("examId") ?? ""),
+    examQuestionId: unescYaml(kv.get("examQuestionId") ?? ""),
     question: q,
     answer: ansM ? ansM[1].trim() : "",
     explanation: expM ? expM[1].trim() : undefined,
-    questionType: (["recall", "explanation", "comparison", "application", "true_false", "multiple_choice", "counterexample"] as string[]).includes(kv.get("questionType") ?? "") ? kv.get("questionType") as SavedReviewCard["questionType"] : "recall",
+    questionType: (["recall", "explanation", "comparison", "application", "true_false", "multiple_choice", "counterexample"] as string[]).includes(qtypeRaw) ? qtypeRaw as SavedReviewCard["questionType"] : "recall",
+    options: inlineArr(kv.get("options")),
+    correctAnswer: unescYaml(kv.get("correctAnswer") ?? ""),
     concept: unescYaml(kv.get("concept") ?? ""),
     tags: inlineArr(kv.get("tags")),
     createdAt: parseInt(kv.get("createdAt") ?? "", 10) || Date.now(),
@@ -348,7 +355,10 @@ export class ExamStore {
   count(): number { return this.entries.length; }
   get(id: string): NoteExam | undefined { return this.entries.find((e) => e.id === id); }
   findByFingerprint(fp: string): NoteExam | undefined { return this.entries.find((e) => examFingerprint(e) === fp); }
-  findBySource(sourcePath: string): NoteExam[] { return this.entries.filter((e) => e.sourcePath === sourcePath); }
+  /** §43/44：某来源笔记的全部考试，createdAt DESC（最新在前） */
+  findBySource(sourcePath: string): NoteExam[] {
+    return this.entries.filter((e) => e.sourcePath === sourcePath).sort((a, b) => b.createdAt - a.createdAt);
+  }
   add(e: NoteExam): void { this.entries.push(e); this.dirty = true; this.flush(); }
   update(id: string, patch: Partial<NoteExam>): void {
     const e = this.entries.find((x) => x.id === id);
@@ -398,6 +408,11 @@ export class ReviewCardStore {
   count(): number { return this.entries.length; }
   get(id: string): SavedReviewCard | undefined { return this.entries.find((e) => e.id === id); }
   findByExam(examId: string): SavedReviewCard[] { return this.entries.filter((e) => e.examId === examId); }
+  /** Phase 21 §54：按 考试+题目 查已收藏卡（去重主键；缺 examQuestionId 时返回 undefined，兼容旧卡） */
+  findByExamQuestion(examId: string, questionId?: string): SavedReviewCard | undefined {
+    if (!examId || !questionId) return undefined;
+    return this.entries.find((e) => e.examId === examId && e.examQuestionId === questionId);
+  }
   remove(id: string): void {
     const before = this.entries.length;
     this.entries = this.entries.filter((e) => e.id !== id);
@@ -487,6 +502,11 @@ export class CardReviewStore {
   count(): number { return this.records.length; }
   byCard(cardId: string): CardReviewRecord[] { return this.records.filter((r) => r.cardId === cardId); }
   add(r: CardReviewRecord): void { this.records.push(r); this.dirty = true; this.flush(); }
+  /** Phase 21 §39：删除卡时一并删除其 CardReviewRecord（不动 Exam/Source/AI Cache） */
+  removeByCard(cardId: string): void {
+    const kept = this.records.filter((r) => r.cardId !== cardId);
+    if (kept.length !== this.records.length) { this.records = kept; this.dirty = true; this.flush(); }
+  }
   replaceAll(r: CardReviewRecord[]): void { this.records = r; this.dirty = true; this.flush(); }
   flush(): void {
     if (!this.dirty) return;

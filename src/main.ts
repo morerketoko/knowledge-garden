@@ -8,6 +8,7 @@ import { PROMPT_VERSIONS } from "./ai/service";
 import type { DiscoveryScope, KnowledgeWorkspace, QueryExplorationResult, QueryScopeMode, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource, NoteExam, ExamSessionState, SavedReviewCard, MasteryRating, ExamQuestionType } from "./types";
 import type { ActivityEntry, KGState } from "./types";
 import type { FsrsRating, ReviewScope, ReviewScopeMode, ReviewSessionState } from "./types";
+import type { SavedCardScope, SavedCardScopeMode } from "./types";
 import { defaultProfileFrom, resolveAIFunctionRoute, resolveAIFunctionRouteWithWorkspace, routeFingerprint, routeFingerprintWithWorkspace } from "./aiRouting";
 import { defaultWorkspace, resolveWorkspace, workspaceFingerprint } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
@@ -27,6 +28,7 @@ import {
   SpacedReviewStore, FsrsScheduler, schedulerFromConfig, schedulerConfigFingerprint,
   selectDueCards, selectNewCardsFromRanked, queueKeyFor, mergeQueueForRefresh, defaultReviewScope, reviewScopeText, scopeNotesPaths,
   nextMasteryPercent, computeSpacedStats, type SpacedReviewCard, type StoredFsrsState,
+  type SavedCardSpacedState, type SavedCardReviewLogEntry,
   type ScheduleResult, type ReviewLogEntry, type SpacedStats,
 } from "./spacedReview";
 import { deriveAnswerFromMarkdown, type DerivedAnswer } from "./reviewAnswer";
@@ -34,6 +36,7 @@ import { deriveAnswerFromMarkdown, type DerivedAnswer } from "./reviewAnswer";
 /* ================= Phase 14：Note Exam / Review Cards ================= */
 import { ExamSessionView, VIEW_TYPE_EXAM } from "./examView";
 import { CardsView, VIEW_TYPE_CARDS } from "./cardsView";
+import { NoteExamHubModal, ExamReviewView, VIEW_TYPE_EXAM_REVIEW } from "./examHub";
 import { examMarkdown, cardMarkdown, examMarkdownPath, cardMarkdownPath, examFingerprint, newExamId, newCardId, examDirPath, cardsDirPath, parseExamMarkdown, parseCardMarkdown, ExamStore, ReviewCardStore, ExamSessionStore, CardReviewStore } from "./examStore";
 import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamResumeIndex, selfMasteryPercent, aiMasteryPercent, masteryLabel, masteryGapHint, weakConceptsOf, strongConceptsOf, type ExamProgressStats } from "./examEngine";
 import { ExamBuildModal, type ExamBuildParams } from "./examView";
@@ -321,6 +324,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_EXAM, (leaf) => new ExamSessionView(leaf, this));
     this.registerView(VIEW_TYPE_CARDS, (leaf) => new CardsView(leaf, this));
+    this.registerView(VIEW_TYPE_EXAM_REVIEW, (leaf) => new ExamReviewView(leaf, this));   // Phase 21：考试回顾（0 AI）
     this.registerView(VIEW_TYPE_AI_WORKBENCH, (leaf) => new AIWorkbenchView(leaf, this));
     this.addRibbonIcon("flower-2", "打开知识花园", () => { void this.activateView(); });
     this.addRibbonIcon("bot", "打开 AI 工作台（提问 / 研究 / 项目）", () => { this.openWorkbenchView(); });
@@ -389,6 +393,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.addCommand({ id: "kg-exam-rebuild", name: "知识花园：重新生成当前笔记考试（跳过 AI 缓存）", callback: () => { void this.regenerateExamForActive(); } });
     this.addCommand({ id: "kg-exam-open", name: "知识花园：打开当前笔记考试", callback: () => { void this.openExamForActive(); } });
     this.addCommand({ id: "kg-cards-open", name: "知识花园：查看收藏复习卡", callback: () => { void this.openCardsView(); } });
+    this.addCommand({ id: "kg-exam-hub", name: "知识花园：本篇笔记考试中心", callback: () => { this.openExamHubForActive(); } });
     this.addCommand({ id: "kg-application-ideas", name: "从当前笔记生成应用思路", callback: () => { const f = this.app.workspace.getActiveFile(); if (f instanceof TFile) this.toolbox.runQuickApplication({ file: f, editor: null, selectedText: "" }); else new Notice("当前没有打开的笔记。"); } });
     this.addCommand({ id: "kg-wb-open", name: "打开 Knowledge Garden AI 工作台（提问/研究/项目）", callback: () => { this.openWorkbenchView(); } });
     this.addCommand({ id: "kg-wb-ask", name: "向 Knowledge Garden 提问", callback: () => { this.openWorkbenchView("ask"); } });
@@ -2126,15 +2131,17 @@ export default class KnowledgeGardenPlugin extends Plugin {
   }
 
   /**
-   * §75/76：立即按新设置重排（ConfirmModal 后调用）。实现 = 用新参数把每张卡的 reviewLogs 重放一遍
+   * §75/76/147：立即按新设置重排（ConfirmModal 后调用）。实现 = 用新参数把每张卡的 reviewLogs 重放一遍
    * （ts-fsrs 真实调度，不发明公式）；备份 → 批量替换 → 失败 restoreSnapshot rollback。
-   * 重排不动 Activity/AI（§91/140）。
+   * Phase 21：Note FSRS 与 Saved Card FSRS 一起重排（§146/147）；不动 Activity/AI（§91/140）。
    */
   rescheduleSpacedAll(now = Date.now()): { ok: boolean; message: string } {
     if (!this.spacedEnabled()) return { ok: true, message: "间隔重复(FSRS)未启用，无需重排。" };
-    const snapshot = this.spaced.fileSnapshot();   // §76：重排前备份
+    const snapshot = this.spaced.fileSnapshot();   // §76：重排前备份（同一文件含 saved 部分）
     try {
       const sched = this.spacedScheduler();
+
+      // Note-based FSRS 重放（Phase 20）
       const logsByPath = new Map<string, ReviewLogEntry[]>();
       for (const log of this.spaced.logsAll()) {
         const arr = logsByPath.get(log.path) ?? [];
@@ -2172,8 +2179,45 @@ export default class KnowledgeGardenPlugin extends Plugin {
       // 没有日志的存量卡（异常态）原样保留
       const covered = new Set(nextCards.map((c) => c.path));
       for (const c of this.spaced.all()) if (!covered.has(c.path)) nextCards.push(c);
-      this.spaced.replaceAllCards(nextCards);   // 抛错 → catch rollback
-      return { ok: true, message: "已按当前设置重排 " + nextCards.length + " 张卡（0 AI）。" };
+
+      // Saved Card FSRS 重放（Phase 21 §147：savedCardReviewLogs → scReplaceAll）
+      const logsByCard = new Map<string, SavedCardReviewLogEntry[]>();
+      for (const log of this.spaced.scLogsAll()) {
+        const arr = logsByCard.get(log.cardId) ?? [];
+        arr.push(log);
+        logsByCard.set(log.cardId, arr);
+      }
+      const existingByCard = new Map(this.spaced.scAll().map((s) => [s.cardId, s] as const));
+      const nextStates: SavedCardSpacedState[] = [];
+      for (const [id, logs] of logsByCard) {
+        if (!logs.length) continue;
+        const sorted = [...logs].sort((a, b) => a.timestamp - b.timestamp);
+        let state: StoredFsrsState | null = null;
+        let lastRating: FsrsRating | undefined;
+        for (const log of sorted) {
+          const res = sched.schedule(log.rating, state, log.timestamp);
+          state = res.next;
+          lastRating = log.rating;
+        }
+        if (!state) continue;
+        const existing = existingByCard.get(id);
+        nextStates.push({
+          cardId: id,
+          fsrsState: state,
+          lastRating,
+          reviewCount: Math.max(existing?.reviewCount ?? 0, sorted.length),
+          lastReviewedAt: existing?.lastReviewedAt,
+          masteryPercent: existing?.masteryPercent,
+          createdAt: existing?.createdAt ?? sorted[0].timestamp,
+          updatedAt: now,
+        });
+      }
+      const coveredCards = new Set(nextStates.map((s) => s.cardId));
+      for (const s of this.spaced.scAll()) if (!coveredCards.has(s.cardId)) nextStates.push(s);
+
+      this.spaced.replaceAllCards(nextCards);   // 抛错 → catch rollback（含 saved 未写场景由统一 snapshot 兜底）
+      this.spaced.scReplaceAll(nextStates);
+      return { ok: true, message: "已按当前设置重排 " + nextCards.length + " 篇笔记卡 + " + nextStates.length + " 张复习卡（0 AI）。" };
     } catch (e) {
       this.spaced.restoreSnapshot(snapshot);    // §76：失败 rollback（旧状态仍存在，§164）
       return { ok: false, message: "重排失败，已回滚到原状态：" + ((e as Error).message ?? String(e)) };
@@ -2797,13 +2841,18 @@ export default class KnowledgeGardenPlugin extends Plugin {
     new Notice("已将《" + e.title + "》计为复习（只更新 lastReviewedAt/reviewCount，不记录访问）。");
   }
 
-  /** 收藏一张卡（§一百四十七 快照：0 AI；独立于 AI Cache / Exam §七十七/七十八/七十九） */
+  /** 收藏一张卡（§一百四十七 快照：0 AI；独立于 AI Cache / Exam §七十七/七十八/七十九）。
+   *  Phase 21 §54：优先按 examId + examQuestionId 去重（旧卡回退 sourcePath+question 去重，§55 不破坏旧数据）。 */
   async saveReviewCard(input: {
-    sourcePath: string; sourceVersion: string; examId?: string;
+    sourcePath: string; sourceVersion: string; examId?: string; examQuestionId?: string;
     question: string; answer: string; explanation?: string;
-    questionType: ExamQuestionType; sourceEvidence?: string[]; concept?: string; tags?: string[];
+    questionType: ExamQuestionType; options?: string[]; correctAnswer?: string;
+    sourceEvidence?: string[]; concept?: string; tags?: string[];
   }): Promise<void> {
-    const dup = this.cards.all().find((c) => c.sourcePath === input.sourcePath && c.question === input.question);
+    const existing = input.examId && input.examQuestionId
+      ? this.cards.findByExamQuestion(input.examId, input.examQuestionId)
+      : undefined;
+    const dup = existing ?? this.cards.all().find((c) => c.sourcePath === input.sourcePath && c.question === input.question);
     if (dup) { new Notice("这张卡已收藏过（不重复，0 AI）。"); return; }
     try { await this.ensureVaultFolder(cardsDirPath()); } catch { /* ignore */ }
     const now = Date.now();
@@ -2812,10 +2861,13 @@ export default class KnowledgeGardenPlugin extends Plugin {
       sourcePath: input.sourcePath,
       sourceVersion: input.sourceVersion,
       examId: input.examId,
+      examQuestionId: input.examQuestionId,
       question: input.question.trim().slice(0, 240),
       answer: input.answer.trim().slice(0, 3000),
       explanation: input.explanation?.trim().slice(0, 1200),
       questionType: input.questionType,
+      options: input.options,
+      correctAnswer: input.correctAnswer,
       sourceEvidence: input.sourceEvidence,
       concept: input.concept,
       tags: input.tags,
@@ -2841,54 +2893,145 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (!e) return;
     let saved = 0;
     for (const q of e.questions) {
-      const dup = this.cards.all().find((c) => c.sourcePath === e.sourcePath && c.question === q.question);
+      const dup = this.cards.findByExamQuestion(e.id, q.id) ?? this.cards.all().find((c) => c.sourcePath === e.sourcePath && c.question === q.question);
       if (dup) continue;
       await this.saveReviewCard({
-        sourcePath: e.sourcePath, sourceVersion: e.sourceVersion, examId: e.id,
+        sourcePath: e.sourcePath, sourceVersion: e.sourceVersion, examId: e.id, examQuestionId: q.id,
         question: q.question, answer: q.referenceAnswer, explanation: q.explanation,
-        questionType: q.type, sourceEvidence: q.sourceEvidence, concept: q.concept,
+        questionType: q.type, options: q.type === "multiple_choice" ? q.options : undefined,
+        correctAnswer: q.type === "multiple_choice" || q.type === "true_false" ? q.correctAnswer : undefined,
+        sourceEvidence: q.sourceEvidence, concept: q.concept,
       });
       saved++;
     }
     new Notice("已收藏 " + saved + " 张复习卡（0 AI；可在复习卡视图删除不需要的）。");
   }
 
-  /** 删除收藏卡（§一百一十二：0 AI；只删卡 Markdown + 索引，绝不删原笔记 §一百四十二） */
+  /** 删除收藏卡（§一百一十二/39：0 AI；只删卡 Markdown + 索引 + 该卡 FSRS 状态/历史，绝不删原笔记/Exam/AI Cache） */
   async deleteCard(cardId: string): Promise<void> {
     const c = this.cards.get(cardId);
     if (!c) { new Notice("复习卡不存在。"); return; }
     const f = this.app.vault.getAbstractFileByPath(normalizePath(cardMarkdownPath(c)));
     if (f instanceof TFile) await this.app.vault.trash(f, true);
     this.cards.remove(cardId);
+    this.spaced?.scRemoveCard(cardId);            // Phase 21 §39：FSRS 状态 + 日志
+    this.cardReviews?.removeByCard(cardId);       // Phase 21 §39：CardReviewRecord
     this.rerenderDashboard();
     new Notice("已删除复习卡（0 AI）。");
   }
 
-  /** 记录复习卡复习（§九十一/二百一十四：0 AI；不调 markReviewed §二百零七） */
+  /** 旧式记录复习卡复习（保留兼容入口；Phase 21 起路由到 FSRS rateSavedCard） */
   recordCardReview(cardId: string, rating: MasteryRating): void {
-    const c = this.cards.get(cardId);
-    if (!c) return;
-    const now = Date.now();
-    c.mastery = rating;
-    c.reviewCount = (c.reviewCount ?? 0) + 1;
-    c.lastReviewedAt = now;
-    this.cards.update(c.id, { mastery: rating, reviewCount: c.reviewCount, lastReviewedAt: now });
-    this.cardReviews.add({ cardId, reviewedAt: now, rating });
-    this.rerenderDashboard();
-    new Notice("复习卡已记录（" + rating + "，0 AI；不修改原笔记复习状态）。");
+    const map: Record<MasteryRating, FsrsRating> = { forgot: "again", hard: "hard", good: "good", easy: "easy" };
+    this.rateSavedCard(cardId, map[rating]);
   }
 
-  /** 打开我的复习卡 View（§八十四：搜索/来源/掌握度；首页最近 5 张 §一百三十） */
-  async openCardsView(): Promise<void> {
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS);
+  /**
+   * Phase 21 §28/29/137~140：Saved Card 四档评分（唯一真实复习路径）。
+   * 顺序：FSRS save（失败即中止，绝不标记已复习）→ SavedReviewCard.lastReviewedAt/reviewCount/mastery/masteryScore 更新
+   * → CardReviewRecord 写入（§122）→ activity.recordAccess + markReviewed(sourcePath) 一次（§138/139，防连点 §140 由 guard）。
+   * Skip / Snooze / Refresh 不调用本方法（§30/31/11）。
+   */
+  rateSavedCard(cardId: string, rating: FsrsRating): boolean {
+    if (!this.reviewActionGuard()) return false;
+    const c = this.cards.get(cardId);
+    if (!c) return false;
+    const now = Date.now();
+    try {
+      const sched = this.spacedScheduler();
+      const existing = this.spaced.scGet(cardId);
+      const res = sched.schedule(rating, existing ? existing.fsrsState : null, now);   // 无状态 → createEmptyCard 起步（§38）
+      const prevCount = existing?.reviewCount ?? c.reviewCount ?? 0;
+      const state: SavedCardSpacedState = {
+        cardId,
+        fsrsState: res.next,
+        lastRating: rating,
+        reviewCount: prevCount + 1,
+        lastReviewedAt: res.log.timestamp,
+        masteryPercent: nextMasteryPercent(existing?.masteryPercent, prevCount, rating),
+        createdAt: existing?.createdAt ?? c.createdAt ?? now,
+        updatedAt: now,
+      };
+      this.spaced.scCommitReview(cardId, state, res.log);   // 抛错 → 不标记（§29）
+      // FSRS 成功 → 同步 SavedReviewCard 快照字段（FSRS 状态本身不写入卡片/不塞进 SavedReviewCard，§8）
+      this.cards.update(c.id, {
+        mastery: rating === "again" ? "forgot" : rating,
+        masteryScore: state.masteryPercent,
+        reviewCount: state.reviewCount,
+        lastReviewedAt: state.lastReviewedAt,
+      });
+      this.cardReviews.add({ cardId, reviewedAt: now, rating: rating === "again" ? "forgot" : rating as MasteryRating });   // §九十一/122：CardReviewRecord 照常记录
+      // §138：复习来源笔记（同一来源多卡只随每次真实评分记录一次 Activity；recordAccess 同 file-open 语义）
+      this.activity.recordAccess(c.sourcePath);
+      this.activity.markReviewed(c.sourcePath);
+    } catch (e) {
+      new Notice("保存复习卡 FSRS 状态失败，未标记已复习：" + ((e as Error).message ?? String(e)));
+      return false;
+    }
+    this.rerenderDashboard();
+    return true;
+  }
+
+  /** Saved Card FSRS 状态读取（View 用；0 AI） */
+  savedCardStateOf(cardId: string): SavedCardSpacedState | null {
+    return this.spaced.scGet(cardId) ?? null;
+  }
+
+  /** §15/16：考试下拉来源（Exam Hub/我的复习卡用；只读 ExamStore，0 AI） */
+  examsForSavedCardsScope(): NoteExam[] {
+    return this.examStore.all();
+  }
+
+  /** Phase 21：本篇笔记考试中心（右键/命令入口，§42/127） */
+  openExamHubForFile(file: TFile): void {
+    new NoteExamHubModal(this.app, this, file.path).open();
+  }
+  openExamHubForActive(): void {
+    const f = this.app.workspace.getActiveFile();
+    if (!(f instanceof TFile)) { new Notice("请先打开一篇笔记。"); return; }
+    this.openExamHubForFile(f);
+  }
+
+  /** §47/131/58：打开考试回顾（Exam Review；绝不重新生成，0 AI） */
+  async openExamReview(examId: string): Promise<void> {
+    const exam = this.examStore.get(examId);
+    if (!exam) { new Notice("考试不存在（收藏卡不受影响）。"); return; }
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW);
     if (leaves.length > 0) {
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      (leaves[0].view as CardsView).refresh();
+      (leaves[0].view as ExamReviewView).loadExam(examId);
+      return;
+    }
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) { new Notice("无法创建回顾窗口。"); return; }
+    await leaf.setViewState({ type: VIEW_TYPE_EXAM_REVIEW, active: true });
+    (leaf.view as ExamReviewView).loadExam(examId);
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** Exam Review 视图刷新（对外部变化响应；0 AI） */
+  rerenderExamReview(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW)) {
+      (leaf.view as ExamReviewView).refresh();
+    }
+  }
+
+  /** 打开我的复习卡 View（§84：搜索/来源/掌握度；首页最近 5 张 §130；Phase 21：scope 可预置，§52/57/58） */
+  async openCardsView(opts?: { scope?: SavedCardScope }): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS);
+    if (leaves.length > 0) {
+      const view = leaves[0].view as CardsView;
+      this.app.workspace.revealLeaf(leaves[0]);
+      this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
+      if (opts?.scope) view.setScope(opts.scope);
+      else view.refresh();
       return;
     }
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: VIEW_TYPE_CARDS, active: true });
+    const view = leaf.view as CardsView;
+    if (opts?.scope) view.setScope(opts.scope);
     this.app.workspace.revealLeaf(leaf);
   }
 

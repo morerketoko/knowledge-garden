@@ -679,3 +679,12 @@
 .kg-list-meta { gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 0; }
 .kg-list-meta .kg-review-qlabel { margin-right: 0; }
 .kg-list-meta .kg-mastery-pct { width: 34px; }
+/* ================= Phase 21: Exam Hub + 我的复习卡 (FSRS) ================= */
+.kg-hub-exam { display: flex; flex-direction: column; gap: 6px; }
+.kg-hub-head { align-items: center; justify-content: space-between; gap: 8px; margin-top: 0; }
+.kg-hub-exam .kg-card-question { font-weight: 700; }
+.kg-exam-correct-note { margin-top: 4px; font-size: var(--font-ui-smaller); }
+.kg-exam-opt-correct { font-weight: 600; }
+.kg-cards-body { display: flex; flex-direction: column; gap: 8px; }
+.kg-cards-body .kg-list-item { cursor: pointer; }
+.kg-list-item:hover { background: var(--background-secondary); }
