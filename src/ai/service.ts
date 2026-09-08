@@ -4,7 +4,7 @@ import { extractJsonBlockText, parseExamGeneration, parseExamGrading, examCacheD
 import { buildConnectionsSystem, buildCuriositySystem, buildDailyReviewUser, buildMonthlyEvolutionUser, buildQuarterlyEvolutionUser, buildQueryExplorationSystem, buildWeeklyReviewUser, type DiscoveryPromptContext, type EvolutionPromptInput, type WeeklyReviewInput } from "../prompts";
 import { buildReviewQuestionsSystem, buildReviewQuestionsUser } from "../prompts";
 import { buildCaptureProcessingSystem } from "../prompts";
-import { buildExamGenerationSystem, buildExamGradingSystem, buildExamGradingUser, EXAM_GENERATION_PROMPT_VERSION, EXAM_GRADING_PROMPT_VERSION, type ExamGenerationInput } from "../prompts";
+import { buildExamGenerationSystem, buildExamGradingSystem, buildExamGradingUser, examGenerationMaxTokens, EXAM_GENERATION_PROMPT_VERSION, EXAM_GRADING_PROMPT_VERSION, type ExamGenerationInput } from "../prompts";
 import { filterValidQuestions } from "../reviewCenter";
 import { PROCESSING_TYPE_CAPTURE, PROCESSING_VERSION, parseProcessingResult } from "../knowledgeProcessor";
 import { filterConnectionEdges, filterConnectionNodes } from "../knowledgeGraph";
@@ -336,6 +336,7 @@ export class AIService {
 
   private errorCode(e: AIError): string {
     const m = e.message;
+    if (e.code === "TRUNCATED" || m.includes("截断") || m.includes("finish_reason")) return "TRUNCATED";
     if (m.includes("考试") && m.includes("JSON")) return "EXAM_INVALID_JSON";
     if (m.includes("考试") && m.includes("字段")) return "EXAM_INVALID_SCHEMA";
     if (m.includes("无有效题目")) return "EXAM_NO_VALID_QUESTIONS";
@@ -975,7 +976,8 @@ export class AIService {
       ],
         examQuestionMax: opts.questionCount,
       messages,
-      chatOpts: this.chatOpts("note_exam_generation", 3000),
+      // Phase 21.x Hotfix：maxTokens 随题数联动（>15 题时提升预算，避免输出截断成非法 JSON）
+      chatOpts: this.chatOpts("note_exam_generation", examGenerationMaxTokens(opts.questionCount)),
       allowReview: false,
     }, force);
   }

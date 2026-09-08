@@ -23,6 +23,21 @@ function httpErrorMessage(status: number): string {
   return "API 返回错误（" + status + "）。";
 }
 
+/**
+ * Phase 21.x Hotfix：finish_reason=length → 输出被 max_tokens 截断。
+ * 截断的 JSON/Markdown 必然不完整，继续解析只会得到误导性的“格式非法”。
+ * 返回 AIError（code=TRUNCATED），否则 null。纯函数便于 Node 自动测试。
+ */
+export function truncationError(finishReason: unknown): AIError | null {
+  if (finishReason === "length") {
+    return new AIError(
+      "AI 输出被长度上限截断（finish_reason=length），结果不完整已拒绝。请减少生成数量（如考试题数 15 题以内）或重试。",
+      "TRUNCATED"
+    );
+  }
+  return null;
+}
+
 export class SiliconFlowProvider {
   constructor(private cfg: ProviderConfig) {}
 
@@ -74,10 +89,13 @@ export class SiliconFlowProvider {
     }
     try {
       const data = (await res.json()) as {
-        choices?: { message?: { content?: string } }[];
+        choices?: { message?: { content?: string }; finish_reason?: unknown }[];
       };
       const content = data.choices?.[0]?.message?.content;
       if (!content || typeof content !== "string") throw new AIError("API 返回了空响应。", "EMPTY");
+      // Phase 21.x Hotfix：finish_reason=length → 截断结果直接拒绝（code=TRUNCATED，见 truncationError）
+      const trunc = truncationError(data.choices?.[0]?.finish_reason);
+      if (trunc) throw trunc;
       return { content, model: this.cfg.model };
     } catch (e) {
       if (e instanceof AIError) throw e;

@@ -697,6 +697,16 @@ export interface ExamGenerationInput {
   skillInstructions?: string; // Exam Skill（§三十五/三十六，可选）
 }
 
+/**
+ * 考试生成的输出 token 预算（Phase 21.x Hotfix）：随题数线性增长，避免 >15 题被 max_tokens 截断成非法 JSON。
+ * 公式：max(3000, 题数 × 400)，封顶 8192（模型输出上限兜底；Qwen2.5-7B 常见 8K 输出窗口）。
+ * 纯函数，供 service.generateExam 与 Node 自动测试使用。
+ */
+export function examGenerationMaxTokens(questionCount: number): number {
+  const n = Math.max(1, Math.floor(questionCount));
+  return Math.min(8192, Math.max(3000, n * 400));
+}
+
 /** 生成考试（§一百五十六）：笔记是资料不是指令；JSON schema；覆盖优先 */
 export function buildExamGenerationSystem(input: ExamGenerationInput): string {
   const coverageHint =
