@@ -1069,12 +1069,15 @@ export function savedMasteryDistribution(states: ReadonlyArray<{ masteryPercent?
   return dist;
 }
 
-/** §60/62：Saved Card 概况（本地计算；due = 今天到期卡数用于概览；忘记/稳定/总数/掌握分布） */
+/** §60/62：Saved Card 概况（本地计算；due = 今天到期卡数用于概览；忘记/稳定/总数/掌握分布）。
+ *  Phase 21.x：newCount 由调用方传入（新卡=无 FSRS 状态或 reviewCount<=0，见 isNewSavedCard），
+ *  未评分新卡不计入掌握分布（§29/30）。 */
 export interface SavedCardOverview {
   total: number;
   due: number;            // due <= now（含已到期）
   forgetting: number;     // due<=now 且保持率 <0.7（即将遗忘）
   stable: number;         // masteryPercent >= 80（稳定掌握）
+  newCount: number;       // 新卡（未进行过真实 FSRS Rating）
   reviewsToday: number;
   avgRetrievability: number | null;
   avgMastery: number | null;
@@ -1085,7 +1088,8 @@ export function savedCardOverview(
   states: ReadonlyArray<SavedCardSpacedState>,
   logs: ReadonlyArray<SavedCardReviewLogEntry>,
   scheduler: FsrsScheduler,
-  now: number
+  now: number,
+  newCount = 0
 ): SavedCardOverview {
   const d = new Date(now);
   const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
@@ -1105,13 +1109,120 @@ export function savedCardOverview(
     }
   }
   return {
-    total: states.length,
+    total: states.length + Math.max(0, newCount),
     due,
     forgetting,
     stable,
+    newCount: Math.max(0, newCount),
     reviewsToday: logs.filter((l) => l.timestamp >= startOfDay).length,
     avgRetrievability: retr.length ? retr.reduce((a, b) => a + b, 0) / retr.length : null,
     avgMastery: mastery.length ? mastery.reduce((a, b) => a + b, 0) / mastery.length : null,
     dist: savedMasteryDistribution(states),
   };
+}
+
+/* ---------- Phase 21.x：新卡定义 + 排序（纯函数，0 AI；不读 Markdown 正文 §66） ---------- */
+
+/** 设置校验（0~100，§39） */
+export function isValidSavedCardNewWeight(v: number): boolean {
+  return Number.isInteger(v) && v >= 0 && v <= 100;
+}
+
+/**
+ * 新卡统一定义（§15/16）：从未进行过真实 FSRS Rating ⇔ 没有 SavedCardSpacedState 或 reviewCount<=0。
+ * 禁止用 lastReviewedAt / 卡片旧 reviewCount 判断（旧数据可能缺失）。
+ */
+export function isNewSavedCard(state: SavedCardSpacedState | null | undefined): boolean {
+  return !state || (state.reviewCount ?? 0) <= 0;
+}
+
+export type SavedCardSortMode = "forget" | "new" | "mastery" | "recent" | "next" | "recommend";
+
+/** 排序所需元数据（由 View 从 Store/FSRS 缓存读取，绝不全量读 Markdown） */
+export interface SavedCardSortMeta {
+  due?: number;
+  retrievability: number | null;   // null = 无 FSRS 状态/新卡
+  mastery?: number;
+  lastReviewedAt?: number;
+}
+
+/**
+ * 推荐评分（§20~23）：只做内部排序，绝不展示。
+ * score = newBonus + forgetRisk + masteryRisk + overdueBonus − recentPenalty
+ * - newBonus = isNew ? savedCardNewWeight(0~100) : 0
+ * - forgetRisk = retrievability===null ? 0 : (1-retr)*50
+ * - masteryRisk = mastery undefined ? 0 : (100-mastery)*0.25
+ * - overdueBonus = due<now ? min(20, overdueDays*2) : 0
+ * - recentPenalty = 3 天内复习过 ? 5 : 0
+ */
+export function recommendSavedCardScore(m: SavedCardSortMeta, isNew: boolean, newWeight: number, now: number): number {
+  const newBonus = isNew ? Math.max(0, Math.min(100, newWeight)) : 0;
+  const forgetRisk = m.retrievability === null ? 0 : Math.max(0, 1 - m.retrievability) * 50;
+  const masteryRisk = typeof m.mastery === "number" ? Math.max(0, 100 - m.mastery) * 0.25 : 0;
+  const overdueBonus = typeof m.due === "number" && m.due < now ? Math.min(20, Math.max(0, (now - m.due) / 86400000) * 2) : 0;
+  const recentPenalty = typeof m.lastReviewedAt === "number" && m.lastReviewedAt >= now - 3 * 86400000 ? 5 : 0;
+  return newBonus + forgetRisk + masteryRisk + overdueBonus - recentPenalty;
+}
+
+/**
+ * 列表排序（§17/18/19/24/71）：返回排好序的 id 数组；同分以 createdAt（升序）、再以 id 兜底稳定排序。
+ * - forget：retrievability 升序 → due 升序（新卡 retr=null 自然沉底，不会误标“最可能忘记”，§25）
+ * - new（🌱 新卡优先）：新卡整组在前（createdAt 升序），其余按 forget 语义
+ * - mastery：mastery 升序 → due；recent：lastReviewedAt 降序；next：due 升序 → retr 升序
+ * - recommend：score 降序（新卡按 savedCardNewWeight 加权，§24 非“永远第一”）
+ */
+export function rankSavedCards(
+  cards: ReadonlyArray<{ id: string; createdAt: number }>,
+  stateOf: (id: string) => SavedCardSpacedState | null | undefined,
+  metaOf: (id: string) => SavedCardSortMeta,
+  mode: SavedCardSortMode,
+  newWeight: number,
+  now: number
+): string[] {
+  const retr = (m: SavedCardSortMeta): number => (m.retrievability !== null ? m.retrievability : Infinity);
+  const mastery = (m: SavedCardSortMeta): number => (typeof m.mastery === "number" ? m.mastery : Infinity);
+  const due = (m: SavedCardSortMeta): number => (typeof m.due === "number" ? m.due : Infinity);
+  const recent = (m: SavedCardSortMeta): number => (typeof m.lastReviewedAt === "number" ? m.lastReviewedAt : -Infinity);
+  const scores = new Map<string, number>();
+  const isNew = new Map<string, boolean>();
+  for (const c of cards) {
+    isNew.set(c.id, isNewSavedCard(stateOf(c.id)));
+    scores.set(c.id, recommendSavedCardScore(metaOf(c.id), isNew.get(c.id) ?? false, newWeight, now));
+  }
+  const list = [...cards];
+  list.sort((a, b) => {
+    const ma = metaOf(a.id);
+    const mb = metaOf(b.id);
+    let d = 0;
+    switch (mode) {
+      case "new": {
+        const na = isNew.get(a.id) ?? false;
+        const nb = isNew.get(b.id) ?? false;
+        if (na !== nb) return na ? -1 : 1;               // 新卡组在前
+        if (na && nb) return a.createdAt - b.createdAt;  // 新卡内：最早收藏优先（§17/34）
+        d = retr(ma) - retr(mb);                         // 旧卡：forget 语义
+        if (d !== 0) return d;
+        return due(ma) - due(mb);
+      }
+      case "forget":
+        d = retr(ma) - retr(mb);
+        if (d !== 0) return d;
+        return due(ma) - due(mb);
+      case "mastery":
+        d = mastery(ma) - mastery(mb);
+        if (d !== 0) return d;
+        return due(ma) - due(mb);
+      case "recent":
+        return recent(mb) - recent(ma);
+      case "next":
+        d = due(ma) - due(mb);
+        if (d !== 0) return d;
+        return retr(ma) - retr(mb);
+      case "recommend":
+        d = (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0);   // 高分优先
+        if (d !== 0) return d;
+        return a.createdAt - b.createdAt;
+    }
+  });
+  return list.map((c) => c.id);
 }

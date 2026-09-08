@@ -8,7 +8,7 @@ import { defaultWorkspace, workspaceInstructions } from "./workspace";
 import { BUILTIN_SKILL_SUMMARIES } from "./skills";
 import { capabilityLabel, recommendModels, scoreModelFor, mergedCapabilities } from "./capabilities";
 import { AI_ACTION_CATEGORIES, DEFAULT_PERMISSIONS, actionLabel, effectivePermission } from "./permissions";
-import { parseLearningSteps, isValidDesiredRetention, isValidMaxIntervalDays, isValidDailyNewCards, isValidMaxReviewsPerDay, isValidSavedCardsDailyLimit } from "./spacedReview";
+import { parseLearningSteps, isValidDesiredRetention, isValidMaxIntervalDays, isValidDailyNewCards, isValidMaxReviewsPerDay, isValidSavedCardsDailyLimit, isValidSavedCardNewWeight } from "./spacedReview";
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -779,6 +779,14 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
         const n = Number(v);
         if (Number.isNaN(n) || !isValidSavedCardsDailyLimit(n)) { new Notice("每日复习卡上限必须是 0~500 的整数。"); t.setValue(String(s.spacedReview.dailySavedCardsLimit)); return; }
         s.spacedReview.dailySavedCardsLimit = Math.floor(n);
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("新卡推荐权重（Phase 21.x）")
+      .setDesc("影响「我的复习卡 → 推荐」排序：0 = 不额外优先新卡，100 = 强烈优先新卡（默认 30；只影响排序，不改变 FSRS 状态、不重排已有 due，§64）。")
+      .addText((t) => t.setValue(String(s.spacedReview.savedCardNewWeight)).onChange(async (v) => {
+        const n = Number(v);
+        if (Number.isNaN(n) || !isValidSavedCardNewWeight(n)) { new Notice("新卡推荐权重必须是 0~100 的整数。"); t.setValue(String(s.spacedReview.savedCardNewWeight)); return; }
+        s.spacedReview.savedCardNewWeight = Math.floor(n);
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl).setName("逾期优先")

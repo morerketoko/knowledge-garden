@@ -688,3 +688,7 @@
 .kg-cards-body { display: flex; flex-direction: column; gap: 8px; }
 .kg-cards-body .kg-list-item { cursor: pointer; }
 .kg-list-item:hover { background: var(--background-secondary); }
+/* Phase 21.x: 卡片删除 + 新卡标记 */
+.kg-card-del { align-self: flex-end; margin-top: 4px; }
+.kg-btn-danger { color: var(--color-red, #e53935); border-color: var(--color-red, #e53935); }
+.kg-btn-danger:hover { background: color-mix(in srgb, var(--color-red, #e53935) 10%, transparent); }

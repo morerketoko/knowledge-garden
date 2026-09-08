@@ -458,6 +458,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     dailyNewCards: 10,
     maxReviewsPerDay: 30,
     dailySavedCardsLimit: 10,
+    savedCardNewWeight: 30,
     overdueFirst: true,
     sortByRetrievability: true,
     autoReschedule: false,
@@ -917,6 +918,7 @@ export interface SpacedReviewConfig {
   dailyNewCards: number;         // 每日新卡（默认 10，范围 0~100，§70）
   maxReviewsPerDay: number;      // 每日最大复习（默认 30，范围 1~500，§71）
   dailySavedCardsLimit: number;  // Phase 21 §67：每日「我的复习卡」处理上限（默认 10；与今日笔记复习独立计数 §68）
+  savedCardNewWeight: number;    // Phase 21.x：新卡在「推荐」排序中的额外权重（0~100，默认 30；只影响推荐排序，不改 FSRS/不重排 due）
   overdueFirst: boolean;         // 逾期优先（默认 true，§72）
   sortByRetrievability: boolean; // 按 retrievability 排序（默认 true，§73）
   autoReschedule: boolean;       // 设置变化自动重排（默认 false：仅影响未来复习，§74）

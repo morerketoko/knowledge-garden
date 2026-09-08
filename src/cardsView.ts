@@ -6,7 +6,7 @@
  * - Skip 不调用 FSRS（§30）；Snooze 不模拟 Again（§31）；Rating = 真实复习（§137）。
  * - 选择题保持卡片 UI（§32/34）：选项 → 作答 → ✅ 正确答案 → FSRS Rating（§94）。
  */
-import { ItemView, WorkspaceLeaf, Notice } from "obsidian";
+import { App, ItemView, Modal, WorkspaceLeaf, Notice } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
 import type { SavedReviewCard, SavedCardScope, SavedCardScopeMode, FsrsRating } from "./types";
 import { examTypeLabel } from "./examView";
@@ -16,7 +16,7 @@ import {
 import {
   FSRS_RATINGS, FSRS_RATING_LABEL, FSRS_RATING_EMOJI, masteryConfidence,
   defaultSavedCardScope, savedCardScopeText, savedCardOverview, clampCustomFolders, CUSTOM_SCOPE_FOLDER_LIMIT,
-  type SavedCardSpacedState, type MasteryBand,
+  isNewSavedCard, rankSavedCards, type SavedCardSpacedState, type MasteryBand, type SavedCardSortMode,
 } from "./spacedReview";
 
 export const VIEW_TYPE_CARDS = "knowledge-garden-cards";
@@ -37,7 +37,28 @@ const BAND_COLOR: Record<MasteryBand, string> = {
 };
 const DAY_MS = 86400000;
 
-type ListSort = "forget" | "mastery" | "recent" | "next" | "recommend";
+/** 删除确认 Modal（Phase 21.x §4/61：Obsidian Modal，不用 window.confirm） */
+class CardDeleteConfirmModal extends Modal {
+  constructor(app: App, private question: string, private onConfirm: () => void) {
+    super(app);
+  }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.addClass("kg-dashboard");
+    this.contentEl.createEl("h3", { text: "确定删除这张复习卡？" });
+    this.contentEl.createEl("p", { text: "《" + (this.question || "无题").slice(0, 60) + "》" });
+    this.contentEl.createEl("p", { text: "删除将同时移除：复习卡、其 FSRS 状态、该卡复习历史。不会删除：原笔记、来源考试、AI Cache。" });
+    const row = this.contentEl.createDiv({ cls: "kg-row" });
+    row.createEl("button", { cls: "kg-btn", text: "取消" }).addEventListener("click", () => this.close());
+    row.createEl("button", { cls: "kg-btn kg-btn-primary", text: "确认删除" }).addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+type ListSort = SavedCardSortMode;
 
 function fmtDue(due: number | undefined, now: number): { text: string; tone: string } {
   if (typeof due !== "number") return { text: "—", tone: "green" };
@@ -72,6 +93,7 @@ export class CardsView extends ItemView {
   private scopeEditorOpen = false;
   private customInput = "";
   private listSort: ListSort = "forget";           // §27：默认最可能忘记
+  private deleting = new Set<string>();            // Phase 21.x：连点防重（P-HF-DELETE-15）
   private hiddenAnswers = new Set<string>();
   private shownAnswers = new Set<string>();
   private reviewing: SavedReviewCard[] = [];
@@ -160,13 +182,14 @@ export class CardsView extends ItemView {
       inner.createDiv({ cls: "kg-empty", text: this.scopeEmptyText() });
       return;
     }
-    // 排序（默认最可能忘记）
+    // 排序（默认最可能忘记；支持 🌱 新卡优先 / 推荐）
     const sorted = this.sortCards(scoped);
     const list = inner.createDiv({ cls: "kg-note-list kg-cards-body" });
     const now = Date.now();
     for (const c of sorted) {
       const m = this.metaOf(c);
       const st = this.stateOf(c.id);
+      const isNew = isNewSavedCard(st);
       const examTitle = c.examId ? this.plugin.examStore.get(c.examId)?.title : undefined;
       const sourceGone = !this.plugin.index.get(c.sourcePath);
       const row = list.createDiv({ cls: "kg-note-item kg-list-item" });
@@ -174,9 +197,13 @@ export class CardsView extends ItemView {
       const chips = row.createDiv({ cls: "kg-row kg-chip-row" });
       if (c.questionType === "multiple_choice") chips.createSpan({ cls: "kg-chip", text: "🅰 选择" });
       else chips.createSpan({ cls: "kg-chip", text: examTypeLabel(c.questionType) });
-      const due = m.due;
-      const tone = fmtDue(due, now);
-      chips.createSpan({ cls: "kg-chip kg-due-" + tone.tone, text: due === undefined ? (st ? "" : "新卡") : tone.text === "—" ? (st ? "" : "新卡") : tone.text });
+      if (isNew) {
+        chips.createSpan({ cls: "kg-chip", text: "🌱 新卡 · 尚未复习" });   // §26：不显示成“最可能忘记/遗忘风险”
+      } else {
+        const due = m.due;
+        const tone = fmtDue(due, now);
+        chips.createSpan({ cls: "kg-chip kg-due-" + tone.tone, text: tone.text === "—" ? "已调度" : tone.text });
+      }
       if (st) {
         const conf = masteryConfidence(st.reviewCount);
         if (conf.low) chips.createSpan({ cls: "kg-chip", text: conf.hint });
@@ -192,19 +219,72 @@ export class CardsView extends ItemView {
         this.bar(metaRow, Math.round(m.retrievability * 100), "var(--color-blue, #1e88e5)");
         metaRow.createSpan({ cls: "kg-mastery-pct", text: Math.round(m.retrievability * 100) + "%" });
       }
-      metaRow.createSpan({ cls: "kg-review-days", text: (st ? (due !== undefined ? "下次：" + fmtDueText(due, now) : "已调度") : "首次复习") + " · 复习 " + (st ? st.reviewCount : c.reviewCount ?? 0) + " 次" });
+      metaRow.createSpan({ cls: "kg-review-days", text: isNew ? "首次复习（评分后生成下次时间）" : (m.due !== undefined ? "下次：" + fmtDueText(m.due, now) : "已调度") + " · 复习 " + (st ? st.reviewCount : 0) + " 次" });
       row.createDiv({ cls: "kg-review-meta" }).setText(
         "《" + this.plugin.basename(c.sourcePath) + "》" + (c.concept ? " · ★ " + c.concept : "") +
         (c.examId ? (examTitle ? " · 📝 " + examTitle : " · 📝 原考试已删除") : "") +
         (sourceGone ? " · ⚠ 来源笔记已删除（卡仍可复习）" : "")
       );
       row.addEventListener("click", () => { this.startReviewAt(c); });
+      // 删除入口（§3/60）：stopPropagation 防止同时打开复习卡
+      const delBtn = row.createEl("button", { cls: "kg-btn kg-btn-danger kg-card-del", text: "删除" });
+      delBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this.confirmDelete(c);
+      });
     }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private scopeEmptyText(): string {
+    if (this.cards.length === 0) return "还没有复习卡。";   // §76：区分“没有卡”与“没有到期卡”
     return "当前范围没有复习卡（打开/刷新 0 AI）。可点上方「复习范围」调整，或在笔记右键「📝 构建知识考试」→ 作答后收藏题目。";
+  }
+
+  /** 排序（§14/17/19/24/61）：复用纯函数 rankSavedCards（含稳定 tie-break createdAt/id，§71） */
+  private sortCards(cards: SavedReviewCard[]): SavedReviewCard[] {
+    const now = Date.now();
+    const byId = new Map(cards.map((c) => [c.id, c] as const));
+    const weight = this.plugin.settings.spacedReview?.savedCardNewWeight ?? 30;   // §21/22：推荐中的新卡权重（默认 30）
+    const order = rankSavedCards(
+      cards,
+      (id) => this.stateOf(id),
+      (id) => this.metaOf(byId.get(id) as SavedReviewCard),
+      this.listSort,
+      weight,
+      now
+    );
+    return order.map((id) => byId.get(id)).filter((x): x is SavedReviewCard => !!x);
+  }
+
+  /* ---------- Phase 21.x：删除（后端一律走 plugin.deleteCard，§5/9；本层只做 UI+本地移除） ---------- */
+
+  private confirmDelete(c: SavedReviewCard): void {
+    new CardDeleteConfirmModal(this.app, c.question, () => { void this.doDelete(c); }).open();   // §4/61
+  }
+
+  private async doDelete(c: SavedReviewCard): Promise<void> {
+    if (this.deleting.has(c.id)) return;                                   // P-HF-DELETE-15：连点防重
+    this.deleting.add(c.id);
+    try {
+      await this.plugin.deleteCard(c.id);   // main：删 Markdown + store + FSRS(scRemoveCard) + CardReviewRecord；保留 Exam/Source/AI（§9/11/12）
+    } finally {
+      this.deleting.delete(c.id);
+    }
+    // 本地同步移除（§6/73），Store 生命周期由 main 统一
+    this.cards = this.cards.filter((x) => x.id !== c.id);
+    const wasReview = this.reviewing.some((x) => x.id === c.id);
+    this.reviewing = this.reviewing.filter((x) => x.id !== c.id);
+    if (wasReview && this.reviewing.length > 0) {
+      this.reviewIndex = Math.min(this.reviewIndex, this.reviewing.length - 1);   // §74 clamp
+      this.chosenOption = "";
+      this.ratingDone = false;
+      this.renderReview();                                                       // §7：进入下一张
+    } else {
+      this.reviewIndex = 0;
+      this.mode = "list";
+      this.renderList();                                                         // §72：只刷新本列表
+    }
   }
 
   private bar(parent: HTMLElement, value: number, color?: string): void {
@@ -234,39 +314,22 @@ export class CardsView extends ItemView {
     return body;
   }
 
-  private sortCards(cards: SavedReviewCard[]): SavedReviewCard[] {
-    const now = Date.now();
-    type RowMeta = { due?: number; retrievability: number | null; mastery?: number; lastReviewedAt?: number };
-    const arr = cards.map((c) => ({ c, m: this.metaOf(c) as RowMeta }));
-    const statusRank = (x: { c: SavedReviewCard; m: RowMeta }): number => (this.reviewing.includes(x.c) ? 0 : 1);
-    const retr = (m: RowMeta): number => (m.retrievability !== null ? m.retrievability : Infinity);
-    const mastery = (m: RowMeta): number => (typeof m.mastery === "number" ? m.mastery : Infinity);
-    const due = (m: RowMeta): number => (typeof m.due === "number" ? m.due : Infinity);
-    const recent = (m: RowMeta): number => (typeof m.lastReviewedAt === "number" ? m.lastReviewedAt : -Infinity);
-    arr.sort((a, b) => {
-      const sa = statusRank(a) - statusRank(b);
-      if (sa !== 0) return sa;
-      let d = 0;
-      switch (this.listSort) {
-        case "forget": d = retr(a.m) - retr(b.m); if (d !== 0) return d; return due(a.m) - due(b.m);
-        case "mastery": d = mastery(a.m) - mastery(b.m); if (d !== 0) return d; return due(a.m) - due(b.m);
-        case "recent": return recent(b.m) - recent(a.m);
-        case "next": d = due(a.m) - due(b.m); if (d !== 0) return d; return retr(a.m) - retr(b.m);
-        default: return 0;
-      }
-    });
-    return arr.map((x) => x.c);
-  }
+
+
+
+
+
 
   private renderHeader(inner: HTMLElement): void {
     const head = inner.createDiv({ cls: "kg-section-title-row kg-review-head" });
     const titleWrap = head.createDiv({ cls: "kg-review-head-title" });
     titleWrap.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
-    // §60/62 概览（本地计算 0 AI）
+    // §60/62/28 概览（本地计算 0 AI；新卡单独统计 §29/30）
     const scoped = this.scopedCards();
     const states = scoped.map((c) => this.stateOf(c.id)).filter((x): x is SavedCardSpacedState => !!x);
-    const ov = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now());
-    titleWrap.createDiv({ cls: "kg-review-progress", text: "共 " + scoped.length + " 张 · 到期 " + ov.due + " · 即将遗忘 " + ov.forgetting + " · 稳定掌握 " + ov.stable + " · 今日已复习 " + ov.reviewsToday });
+    const newCount = scoped.filter((c) => isNewSavedCard(this.stateOf(c.id))).length;
+    const ov = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now(), newCount);
+    titleWrap.createDiv({ cls: "kg-review-progress", text: "共 " + ov.total + " 张 · 到期 " + ov.due + " · 即将遗忘 " + ov.forgetting + " · 新卡 " + ov.newCount + " · 稳定掌握 " + ov.stable + " · 今日已复习 " + ov.reviewsToday });
     const scopeBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "📚 " + this.scopeText() + " ▼" });
     scopeBtn.addEventListener("click", () => { this.scopeEditorOpen = !this.scopeEditorOpen; this.renderList(); });
     const refreshBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "🔄 刷新" });
@@ -274,10 +337,11 @@ export class CardsView extends ItemView {
     refreshBtn.addEventListener("click", () => { this.refresh(); });
 
     if (this.scopeEditorOpen) this.renderScopeEditor(inner);
-    // §61/62：掌握分布 + FSRS 概览
+    // §61/62/29/30：掌握分布 + FSRS 概览（未评分新卡不计入五档分布）
     const distBox = inner.createDiv({ cls: "kg-card kg-overview" });
     distBox.createDiv({ cls: "kg-review-qlabel", text: "掌握分布（本地 0 AI）" });
-    const dist = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now()).dist;
+    if (ov.newCount > 0) distBox.createDiv({ cls: "kg-review-meta", text: "🌱 新卡 " + ov.newCount + "（尚未评分，不计入下面分布）" });
+    const dist = ov.dist;
     const total = Object.values(dist).reduce((a, b) => a + b, 0);
     if (total > 0) {
       for (const band of Object.keys(BAND_LABEL) as MasteryBand[]) {
@@ -300,7 +364,7 @@ export class CardsView extends ItemView {
         .addEventListener("click", () => { if (scoped.length) this.startReviewAt(scoped[0]); });
       tool.createSpan({ cls: "kg-review-qlabel", text: "排序：" });
       const opts: { id: ListSort; label: string }[] = [
-        { id: "forget", label: "最可能忘记" }, { id: "recommend", label: "推荐" },
+        { id: "forget", label: "最可能忘记" }, { id: "new", label: "🌱 新卡优先" }, { id: "recommend", label: "推荐" },
         { id: "mastery", label: "掌握度低" }, { id: "recent", label: "最近复习" }, { id: "next", label: "下次复习" },
       ];
       for (const o of opts) {
@@ -578,6 +642,9 @@ export class CardsView extends ItemView {
     const next = alt.createEl("button", { cls: "kg-btn", text: "下一张 →" });
     next.disabled = this.reviewIndex >= total - 1;
     next.addEventListener("click", () => { if (this.reviewIndex < total - 1) { this.reviewIndex++; this.chosenOption = ""; this.ratingDone = false; this.renderReview(); } });
+    // Phase 21.x：复习页也可删除当前卡（§6/7；后端仍走 plugin.deleteCard）
+    const del = alt.createEl("button", { cls: "kg-btn kg-btn-danger", text: "删除这张卡" });
+    del.addEventListener("click", () => { this.confirmDelete(c); });
   }
 
   /** §28/29/138：Rating 成功 → 下一张；失败保留（main 已拦截） */
