@@ -18,6 +18,8 @@ export interface ExamBuildParams {
   answerMode: ExamAnswerMode;
   webEnabled: boolean;
   cardMode: boolean;
+  contentStrategy?: "new_content" | "new_angle" | "broad_coverage" | "custom";   // Phase 23 §4
+  repeatPolicy?: "strict" | "balanced" | "allow";                                  // Phase 23 §5
   force?: boolean;
 }
 
@@ -28,7 +30,7 @@ const MASTERY_OPTIONS: { value: MasteryRating; label: string }[] = [
   { value: "easy", label: "😎 很熟练" },
 ];
 
-const COUNT_OPTIONS = [3, 5, 8, 10, 15, 20];
+const COUNT_OPTIONS = [3, 5, 8, 10, 15, 20, 30];   // Phase 23 §47：提供 30 题预设
 
 /** 构建考试 Modal（§六/七/十一~十四/十五）：Holistic / Custom 主题 / 题量 / 难度 / 答案来源 / Web（默认 OFF）。 */
 export class ExamBuildModal extends Modal {
@@ -49,6 +51,8 @@ export class ExamBuildModal extends Modal {
       answerMode: (e.defaultAnswerMode === "source_only" || e.defaultAnswerMode === "web_allowed" ? e.defaultAnswerMode : "source_preferred"),
       webEnabled: !!e.webEnabled,
       cardMode: e.cardMode !== false,
+      contentStrategy: e.defaultContentStrategy ?? "new_content",   // Phase 23 §6
+      repeatPolicy: e.defaultRepeatPolicy ?? "strict",
     };
   }
 
@@ -80,9 +84,35 @@ export class ExamBuildModal extends Modal {
         t.setPlaceholder("例如：为什么要划分模块边界");
         t.onChange((v) => { this.params.topic = v.trim() || undefined; });
       });
+    // Phase 23 §81：已有历史考试提示（0 AI）
+    const prior = this.plugin.examStore.findBySource(this.file.path).length;
+    if (prior > 0) {
+      contentEl.createDiv({ cls: "kg-review-meta", text: "这篇笔记已有 " + prior + " 份考试；本次将优先避开过去已经考过的知识点（0 AI）。" });
+    }
+    new Setting(contentEl)
+      .setName("考察内容")
+      .setDesc("想考哪里（§4）：未考知识点优先（默认）/ 换角度 / 全面覆盖 / 自定义主题")
+      .addDropdown((dd) => {
+        dd.addOption("new_content", "🌱 未考知识点优先");
+        dd.addOption("new_angle", "🔄 换角度考察");
+        dd.addOption("broad_coverage", "🧠 全面覆盖");
+        dd.addOption("custom", "✎ 自定义主题（配合上方自定义主题填写）");
+        dd.setValue(this.params.contentStrategy ?? "new_content");
+        dd.onChange((v) => { this.params.contentStrategy = v as NonNullable<ExamBuildParams["contentStrategy"]>; });
+      });
+    new Setting(contentEl)
+      .setName("避免重复")
+      .setDesc("距离过去考试多远（§5）：严格（默认）/ 平衡 / 允许重复（同一批内仍禁止重复）")
+      .addDropdown((dd) => {
+        dd.addOption("strict", "🔒 严格：避开历史题与知识点");
+        dd.addOption("balanced", "⚖ 平衡：可少量同知识点但换题型");
+        dd.addOption("allow", "🔓 允许重复历史知识点");
+        dd.setValue(this.params.repeatPolicy ?? "strict");
+        dd.onChange((v) => { this.params.repeatPolicy = v as NonNullable<ExamBuildParams["repeatPolicy"]>; });
+      });
     new Setting(contentEl)
       .setName("题目数量")
-      .setDesc("OpenAI 生成题数。")
+      .setDesc("15 题以内单次生成；16~30 题自动分批（10+10+…），严格保证最终题数。")
       .addDropdown((dd) => {
         for (const n of COUNT_OPTIONS) dd.addOption(String(n), String(n) + " 题");
         dd.addOption("custom", "自定义…");

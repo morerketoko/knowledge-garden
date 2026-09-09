@@ -277,6 +277,18 @@ export class KnowledgeGardenSettingTab extends PluginSettingTab {
   new Setting(containerEl).setName("相关知识上下文 · 默认关闭（§三十二/三十三）").setDesc("OFF：不把其他笔记塞进出题上下文，保证题目聚焦当前笔记。").addToggle((t) => t.setValue(s.exam.relatedNotesEnabled).onChange(async (v) => { s.exam.relatedNotesEnabled = v; await this.plugin.saveSettings(); }));
   new Setting(containerEl).setName("AI 自动评分 · 默认关闭（§二百二十七）").setDesc("OFF：作答后按需点「AI 评估」，0~1 次 Token，不自动消耗。").addToggle((t) => t.setValue(s.exam.autoGrade).onChange(async (v) => { s.exam.autoGrade = v; await this.plugin.saveSettings(); }));
   new Setting(containerEl).setName("Card Mode · 默认开启（§七十二）").setDesc("ON：考试以卡片式逐题作答（先答后示）。").addToggle((t) => t.setValue(s.exam.cardMode !== false).onChange(async (v) => { s.exam.cardMode = v; await this.plugin.saveSettings(); }));
+  new Setting(containerEl).setName("默认考察内容（Phase 23）").setDesc("新建考试 Modal 的「考察内容」默认值：未考知识点优先 / 换角度 / 全面覆盖 / 自定义主题。")
+    .addDropdown((d) => {
+      d.addOption("new_content", "🌱 未考知识点优先").addOption("new_angle", "🔄 换角度考察").addOption("broad_coverage", "🧠 全面覆盖").addOption("custom", "✎ 自定义主题");
+      d.setValue(s.exam.defaultContentStrategy ?? "new_content");
+      d.onChange(async (v) => { s.exam.defaultContentStrategy = v as "new_content" | "new_angle" | "broad_coverage" | "custom"; await this.plugin.saveSettings(); });
+    });
+  new Setting(containerEl).setName("默认避免重复（Phase 23）").setDesc("新建考试 Modal 的「避免重复」默认值：严格 / 平衡 / 允许重复。")
+    .addDropdown((d) => {
+      d.addOption("strict", "🔒 严格").addOption("balanced", "⚖ 平衡").addOption("allow", "🔓 允许重复");
+      d.setValue(s.exam.defaultRepeatPolicy ?? "strict");
+      d.onChange(async (v) => { s.exam.defaultRepeatPolicy = v as "strict" | "balanced" | "allow"; await this.plugin.saveSettings(); });
+    });
 
 
   // ---------- Phase 15：AI Workbench（§二百五十七/二百五十八；模型走功能级路由，不在代码写死） ----------

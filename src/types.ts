@@ -503,6 +503,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     relatedNotesEnabled: false,
     autoGrade: false,
     cardMode: true,
+    defaultContentStrategy: "new_content",   // Phase 23 §6：默认 🌱 未考知识点优先
+    defaultRepeatPolicy: "strict",           // Phase 23 §6：默认 严格
   },
   // Phase 13：Workspace / Skills / Capability / Permission（默认跟随旧行为，§一百二十九）
   workspaces: [],
@@ -1236,6 +1238,19 @@ export type ExamAnswerMode = "source_only" | "source_preferred" | "web_allowed";
 export type ExamDifficulty = "easy" | "medium" | "hard";
 export type ExamMode = "holistic" | "custom";
 
+/** Phase 23：考察内容策略（§4/21/68~71）——“这次想考哪里” */
+export type ExamContentStrategy =
+  | "new_content"   // 🌱 未考知识点优先（默认）
+  | "new_angle"     // 🔄 换角度考察（允许同 concept，但换题型/认知层级/场景）
+  | "broad_coverage"// 🧠 全面覆盖整篇结构
+  | "custom";       // ✎ 自定义主题（topic 必填）
+
+/** Phase 23：避免重复策略（§5/18~20）——“距离过去考试多远” */
+export type ExamRepeatPolicy =
+  | "strict"    // 严格：避开相同/高相似题干 + 同 concept + 已覆盖 topic（默认）
+  | "balanced"  // 平衡：少量同 concept 允许，但需换问法/题型/层级
+  | "allow";    // 允许重复：不做历史 concept 排除；仍禁止同批内重复
+
 /** 自评 / 掌握度（§五十七：😵😕🙂😎 → forgot/hard/good/easy） */
 export type MasteryRating = "forgot" | "hard" | "good" | "easy";
 
@@ -1279,6 +1294,9 @@ export interface NoteExam {
   createdAt: number;
   updatedAt: number;
   generatedModel?: string;  // 生成所用模型（信息性，不入 Key 外泄）
+  contentStrategy?: ExamContentStrategy;   // Phase 23 §64/65：本次考察内容策略（Markdown frontmatter 可读）
+  repeatPolicy?: ExamRepeatPolicy;         // Phase 23 §64/65：避免重复策略（旧 Exam 缺省 → 见 parse 默认，仍参与去重 §67）
+  previousExamCount?: number;              // Phase 23 §64（可选信息，不存完整历史 exclusion）
 }
 
 /** 用户对单题的作答（§五十六 / 一百八十六） */
@@ -1351,6 +1369,8 @@ export interface ExamConfig {
   relatedNotesEnabled: boolean; // 相关知识默认 OFF（§三十二/三十三）
   autoGrade: boolean;           // AI 自动评分默认 OFF（§二百二十七 按需触发）
   cardMode: boolean;            // 默认 Card Mode（§七十二）
+  defaultContentStrategy: ExamContentStrategy;   // Phase 23 §6：默认 🌱 未考知识点优先
+  defaultRepeatPolicy: ExamRepeatPolicy;         // Phase 23 §6：默认 严格
 }
 /* =====================================================================
  * Phase 15：AI Workbench / Research Agent / Knowledge Workspace（§一~三百一十一）

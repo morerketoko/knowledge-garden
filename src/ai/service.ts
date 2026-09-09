@@ -26,6 +26,8 @@ import type {
   KnowledgeCandidate,
   ReviewCacheData,
   LongTermReflectionData,
+  ExamContentStrategy,
+  ExamRepeatPolicy,
   ExamAnswerMode,
   ExamQuestion,
   ReviewQuestion,
@@ -912,7 +914,8 @@ export class AIService {
   }
 
 
-  /** Phase 14 §一百一十四~一百一十六：生成笔记知识考试（§40/41 cache key：sourcePath+sourceVersion+mode+topic+count+difficulty+answerMode+model+promptVersion+contextHash+workspace+skill+web）。 */
+  /** Phase 14 §一百一十四~一百一十六：生成笔记知识考试（§40/41 cache key：sourcePath+sourceVersion+mode+topic+count+difficulty+answerMode+model+promptVersion+contextHash+workspace+skill+web）。
+   *  Phase 23：支持 Exam 2.0 上下文（contentStrategy/repeatPolicy/historyFingerprint/diversityKey/assignedTopics），并入 cache key（§51/53）。 */
   async generateExam(
     opts: {
       sourcePath: string;
@@ -930,6 +933,13 @@ export class AIService {
       workspaceFingerprint?: string;       // §四十六：Workspace 参与 → 缓存失效
       skillFingerprint?: string;           // §四十六
       contextHash?: string;                // §四十一：Exam Context Hash
+      contentStrategy?: ExamContentStrategy;   // Phase 23
+      repeatPolicy?: ExamRepeatPolicy;         // Phase 23
+      historyFingerprint?: string;             // Phase 23 §52
+      diversityKey?: string;                   // Phase 23：本批排除指纹（历史+已生成批次+assignedTopics）
+      historyLines?: string;                   // Phase 23：压缩历史题干/concept（仅排除用）
+      assignedTopics?: string[];               // Phase 23：本批建议覆盖主题
+      priorBatchQuestions?: string;            // Phase 23：已生成批次摘要
     },
     force = false
   ): Promise<AIOutcome<{ title: string; coverageTopics?: string[]; questions: ExamQuestion[] }>> {
@@ -946,6 +956,11 @@ export class AIService {
           noteText: opts.noteText,
           webContextLines: opts.webContextLines,
           skillInstructions: opts.skillInstructions,
+          contentStrategy: opts.contentStrategy,
+          repeatPolicy: opts.repeatPolicy,
+          historyLines: opts.historyLines,
+          assignedTopics: opts.assignedTopics,
+          priorBatchQuestions: opts.priorBatchQuestions,
         }),
       },
       { role: "user", content: "请只输出符合 schema 的 JSON。若原文信息不足，题目的 referenceAnswer 明确写“原文没有足够信息回答该题”，不要编造。" },
@@ -973,6 +988,10 @@ export class AIService {
         "ws:" + (opts.workspaceFingerprint ?? ""),
         "skill:" + (opts.skillFingerprint ?? ""),
         "ctx:" + (opts.contextHash ?? ""),
+        "strategy:" + (opts.contentStrategy ?? ""),
+        "repeat:" + (opts.repeatPolicy ?? ""),
+        "hist:" + (opts.historyFingerprint ?? ""),
+        "div:" + (opts.diversityKey ?? ""),
       ],
         examQuestionMax: opts.questionCount,
       messages,

@@ -6,6 +6,7 @@ import { QueryHistoryStore } from "./queryHistory";
 import { QUERY_MAX_LENGTH, buildQueryCacheKey, parseQuery, queryScopePaths, rankSearchResults, selectQueryCandidates } from "./queryExplorer";
 import { PROMPT_VERSIONS } from "./ai/service";
 import type { DiscoveryScope, KnowledgeWorkspace, QueryExplorationResult, QueryScopeMode, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource, NoteExam, ExamSessionState, SavedReviewCard, MasteryRating, ExamQuestionType } from "./types";
+import type { ExamQuestion, ExamContentStrategy, ExamRepeatPolicy, ExamAnswerMode, ExamDifficulty, ExamMode } from "./types";
 import type { ActivityEntry, KGState } from "./types";
 import type { FsrsRating, ReviewScope, ReviewScopeMode, ReviewSessionState } from "./types";
 import type { SavedCardScope, SavedCardScopeMode } from "./types";
@@ -39,6 +40,12 @@ import { CardsView, VIEW_TYPE_CARDS } from "./cardsView";
 import { NoteExamHubModal, ExamReviewView, VIEW_TYPE_EXAM_REVIEW } from "./examHub";
 import { hydrateSavedCardBatch, legacyMcCandidates, needsSavedCardHydration } from "./savedCardHydration";
 import { validateSavedCardEdit, applySavedCardEdit, type SavedCardEditInput } from "./savedCardEditor";
+import {
+  buildExamHistoryContext, planExamBatches, splitUnitForRetry, dedupeExamQuestions,
+  extractHeadings as extractNoteHeadings, uncoveredTopics, assignBatchTopics, examQuestionFingerprint, normalizeExamText,
+  EXAM_MAX_BATCH_REQUESTS, EXAM_REPLACEMENT_ROUNDS,
+  type ExamHistoryContext,
+} from "./examGen";
 import { examMarkdown, cardMarkdown, examMarkdownPath, cardMarkdownPath, examFingerprint, newExamId, newCardId, examDirPath, cardsDirPath, parseExamMarkdown, parseCardMarkdown, ExamStore, ReviewCardStore, ExamSessionStore, CardReviewStore } from "./examStore";
 import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamResumeIndex, selfMasteryPercent, aiMasteryPercent, masteryLabel, masteryGapHint, weakConceptsOf, strongConceptsOf, type ExamProgressStats } from "./examEngine";
 import { ExamBuildModal, type ExamBuildParams } from "./examView";
@@ -2530,7 +2537,14 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const ctxHash = fingerprintKey([file.path, sourceVersion, JSON.stringify({ topic: p.topic ?? "", count: p.questionCount, difficulty: p.difficulty ?? "medium", answerMode: p.answerMode, web: p.webEnabled })]);
     const wsFp = workspaceFingerprint(this.currentWorkspace());
     const skillFp = fingerprintKey(["skill", skill ?? "none"]);
-    const out = await this.ai.generateExam({
+    const contentStrategy: ExamContentStrategy = p.contentStrategy ?? "new_content";   // Phase 23 §4/6
+    const repeatPolicy: ExamRepeatPolicy = p.repeatPolicy ?? "strict";                 // Phase 23 §5/6
+    if (contentStrategy === "custom" && !(p.mode === "custom" && p.topic)) {
+      new Notice("「✎ 自定义主题」内容策略需要配合「考试方式=自定义主题」并填写主题。");
+      return;
+    }
+    const history = buildExamHistoryContext(this.examStore.findBySource(file.path));   // §9/10：历史（压缩 + fingerprint，不复制全文）
+    const gen = await this.generateExamReliable({
       sourcePath: file.path,
       sourceVersion,
       noteTitle: file.basename,
@@ -2546,9 +2560,13 @@ export default class KnowledgeGardenPlugin extends Plugin {
       workspaceFingerprint: wsFp,
       skillFingerprint: skillFp,
       contextHash: ctxHash,
-    }, p.force ?? false);
-    if (!out.ok) {
-      this.examError = out.error?.message ?? "考试生成失败";
+      contentStrategy,
+      repeatPolicy,
+      history,
+      force: p.force ?? false,
+    });
+    if (!gen.ok) {
+      this.examError = gen.error ?? "考试生成失败";
       const old = this.examStore.findBySource(file.path);
       if (old.length) {
         new Notice("AI 生成失败，保留已有考试（" + this.examError + "）。");
@@ -2559,7 +2577,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       new Notice("AI 生成失败：" + this.examError + "。可去 设置→AI 检查 Key/网络后重试。");
       return;
     }
-    const questions = filterValidExamQuestions(out.data.questions, p.questionCount);
+    const questions = gen.questions;
     if (!questions.length) {
       this.examError = "AI 返回的题目全部无效";
       new Notice("考试生成失败：" + this.examError + "。");
@@ -2574,7 +2592,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
       return;
     }
     if (exam && p.force) {
-      this.examStore.update(exam.id, { questions, coverageTopics: out.data.coverageTopics, examVersion: (exam.examVersion ?? 1) + 1, updatedAt: Date.now() });
+      this.examStore.update(exam.id, {
+        questions, coverageTopics: gen.coverageTopics, contentStrategy, repeatPolicy,
+        previousExamCount: history.examCount, examVersion: (exam.examVersion ?? 1) + 1, updatedAt: Date.now(),
+      });
       const updated = this.examStore.get(exam.id)!;
       await this.writeExamMarkdown(updated);
       this.lastExamId = updated.id;
@@ -2586,7 +2607,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       id: newExamId(),
       sourcePath: file.path,
       sourceVersion,
-      title: (out.data.title || file.basename + " 知识考试").trim().slice(0, 80),
+      title: (file.basename + " 知识考试").trim().slice(0, 80),
       mode: p.mode,
       topic: p.topic,
       questionCount: p.questionCount,
@@ -2594,7 +2615,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
       answerMode: p.answerMode,
       questions,
       examVersion: 1,
-      coverageTopics: out.data.coverageTopics,
+      coverageTopics: gen.coverageTopics,
+      contentStrategy,
+      repeatPolicy,
+      previousExamCount: history.examCount,
       createdAt: now,
       updatedAt: now,
     };
@@ -2603,8 +2627,104 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.lastExamId = newexam.id;
     this.examError = null;
     this.rerenderDashboard();
-    new Notice("考试已生成：" + newexam.title + "（" + questions.length + " 题）。");
+    new Notice("考试已生成：" + newexam.title + "（" + questions.length + "/" + p.questionCount + " 题" + (history.examCount > 0 ? " · 已避开 " + history.examCount + " 份历史考试" : "") + "）。");
     await this.openExamSession(newexam.id);
+  }
+
+  /**
+   * Phase 23：可靠生成器（§28~50）。
+   * - <=15 单批；>15 按 10 分批；截断 → 自适应拆分（10→5+5→3+2），只重试/拆分当前 batch（§35~38/106）；
+   * - 每批带历史排除 + 内容策略 + 已生成批次摘要（防批间重复，§31~34）；
+   * - 合并后两级去重（批内已做 + 合并后再做 + 历史 exact/near/concept，§40~44）；
+   * - 缺题 → replacement（≤3 轮，每次明确要 N 道新题，§44~46）；
+   * - 总请求 ≤ 8（§108/109）；最终必须精确题数才成功，绝不保存半成品（§85/86/50）。
+   */
+  private async generateExamReliable(o: {
+    sourcePath: string; sourceVersion: string; noteTitle: string; noteText: string;
+    mode: "holistic" | "custom"; topic?: string; questionCount: number;
+    difficulty?: "easy" | "medium" | "hard"; answerMode: ExamAnswerMode;
+    webEnabled: boolean; webContextLines: string[];
+    skillInstructions?: string; workspaceFingerprint?: string; skillFingerprint?: string; contextHash?: string;
+    contentStrategy: ExamContentStrategy; repeatPolicy: ExamRepeatPolicy; history: ExamHistoryContext; force: boolean;
+  }): Promise<{ ok: true; questions: ExamQuestion[]; coverageTopics?: string[] } | { ok: false; error: string }> {
+    const target = o.questionCount;
+    const plan = planExamBatches(target);
+    const headings = extractNoteHeadings(o.noteText);
+    const uncovered = uncoveredTopics(headings, o.history);
+    const histLines = o.history.priorQuestions
+      .map((q, i) => (i + 1) + ". " + q.question + (q.concept ? "（concept:" + q.concept + "）" : ""))
+      .join("\n");
+    let requests = 0;
+    const kept: ExamQuestion[] = [];
+    const summaryOf = (list: ExamQuestion[]): string => list.map((q) => "- " + q.question + (q.concept ? "（concept:" + q.concept + "）" : "")).join("\n");
+    const call = async (count: number, assigned: string[]): Promise<{ ok: boolean; code?: string; message?: string; questions?: ExamQuestion[] }> => {
+      if (requests >= EXAM_MAX_BATCH_REQUESTS) return { ok: false, code: "REQUESTS", message: "已达到最大生成请求数（" + EXAM_MAX_BATCH_REQUESTS + "）。" };
+      requests++;
+      const diversity = fingerprintKey([
+        ...o.history.priorQuestions.map((q) => examQuestionFingerprint(q)),
+        ...kept.map((q) => examQuestionFingerprint(q)),
+        ...assigned.map((t) => normalizeExamText(t)),
+      ].sort());
+      const out = await this.ai.generateExam({
+        sourcePath: o.sourcePath, sourceVersion: o.sourceVersion, noteTitle: o.noteTitle, noteText: o.noteText,
+        mode: o.mode, topic: o.topic, questionCount: count, difficulty: o.difficulty, answerMode: o.answerMode,
+        webEnabled: o.webEnabled, webContextLines: o.webContextLines,
+        skillInstructions: o.skillInstructions, workspaceFingerprint: o.workspaceFingerprint,
+        skillFingerprint: o.skillFingerprint, contextHash: o.contextHash,
+        contentStrategy: o.contentStrategy, repeatPolicy: o.repeatPolicy,
+        historyFingerprint: o.history.historyFingerprint, diversityKey: diversity,
+        historyLines: histLines || undefined, assignedTopics: assigned.length ? assigned : undefined,
+        priorBatchQuestions: kept.length ? summaryOf(kept) : undefined,
+      }, o.force);   // force 仍遵守 history exclusion（§54/89/118）
+      if (out.ok) return { ok: true, questions: filterValidExamQuestions(out.data.questions, count) };
+      return { ok: false, code: out.error?.code, message: out.error?.message };
+    };
+    const batchCount = Math.max(1, plan.length);
+    for (let bi = 0; bi < plan.length; bi++) {
+      const assigned = assignBatchTopics(uncovered.length ? uncovered : headings, bi, batchCount);
+      const queue: number[] = [plan[bi]];
+      const tries = new Map<number, number>();
+      while (queue.length) {
+        const unit = queue.shift() as number;
+        const n = (tries.get(unit) ?? 0) + 1;
+        tries.set(unit, n);
+        const res = await call(unit, assigned);
+        if (res.ok) {
+          if (res.questions && res.questions.length) kept.push(...res.questions);
+          new Notice("考试生成中：已生成 " + Math.min(target, kept.length) + " / " + target + " 题（真实批次数，0 假进度）");
+          continue;
+        }
+        if (res.code === "TRUNCATED") {
+          const parts = splitUnitForRetry(unit);   // §35/36：截断只拆当前批次
+          if (parts.length && n < 3) { queue.unshift(...parts); continue; }
+        }
+        if (res.code === "REQUESTS" || n >= 2) {
+          return { ok: false, error: (res.message ?? "批次生成失败") + "（已保留已有考试）" };
+        }
+        queue.unshift(unit);   // §38：网络/JSON 失败只重试当前 batch（一次）
+      }
+    }
+    // §41/42：合并后与历史一起去重
+    let valid = dedupeExamQuestions(kept, o.history, o.repeatPolicy).questions;
+    let deficit = target - valid.length;
+    let round = 0;
+    while (deficit > 0 && round < EXAM_REPLACEMENT_ROUNDS) {
+      const res = await call(deficit, headings.slice(0, 8));
+      if (!res.ok) { round++; continue; }
+      const after = dedupeExamQuestions([...valid, ...(res.questions ?? [])], o.history, o.repeatPolicy).questions;
+      if (after.length > valid.length) valid = after;
+      deficit = target - valid.length;
+      if (deficit > 0) new Notice("正在补充未重复题目：" + valid.length + " / " + target + "（仅补充缺口，不整卷重来）");
+      round++;
+    }
+    if (valid.length !== target) {
+      return {
+        ok: false,
+        error: "原文可用于构建的独立知识点不足以形成 " + target + " 道" + (o.repeatPolicy === "strict" ? "严格去重" : "") + "题目（当前可得 " + valid.length + " 道）。可「生成 " + valid.length + " 题 / 改为平衡去重 / 降低题数」；绝不自动降低或编造（§46/76/111）。",
+      };
+    }
+    const coverage = headings.slice(0, 12);
+    return { ok: true, questions: valid, coverageTopics: coverage.length ? coverage : undefined };
   }
 
   /** 写入 Exam Markdown（§一百一十八；0 AI 的恢复源） */
@@ -2683,7 +2803,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
     await this.buildExamForNote(f, {
       mode: e.mode, topic: e.topic, questionCount: e.questionCount, difficulty: e.difficulty ?? "medium",
       answerMode: e.answerMode, webEnabled: e.answerMode === "web_allowed", cardMode: this.settings.exam.cardMode !== false,
-      force: true,
+      contentStrategy: e.contentStrategy ?? "broad_coverage",   // Phase 23：重新生成沿用该考试策略（旧考试默认 broad_coverage）
+      repeatPolicy: e.repeatPolicy ?? "allow",                  // 旧考试默认 allow（§66）
+      force: true,   // §89/118：force 仍遵守 history exclusion
     });
   }
 

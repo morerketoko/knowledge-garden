@@ -31,7 +31,7 @@ function httpErrorMessage(status: number): string {
 export function truncationError(finishReason: unknown): AIError | null {
   if (finishReason === "length") {
     return new AIError(
-      "AI 输出被长度上限截断（finish_reason=length），结果不完整已拒绝。请减少生成数量（如考试题数 15 题以内）或重试。",
+      "当前批次输出被长度上限截断（finish_reason=length），系统会自动尝试拆分/重试该批次；若仍失败，请降低总题数或检查模型输出窗口。",
       "TRUNCATED"
     );
   }

@@ -3,7 +3,7 @@
  * - 保存/打开/收藏/删除全部 0 AI（§一百一十一~一百一十三）；清空 AI Cache 不影响 Exam / Card（§七十八）。
  * - 纯函数（examMarkdown / cardMarkdown / 解析）无 Obsidian DOM 依赖，便于 Node 测试。
  */
-import type { CardReviewRecord, ExamAnswer, ExamAnswerMode, ExamDifficulty, ExamMode, ExamQuestion, ExamSessionState, ExamSource, MasteryRating, NoteExam, SavedReviewCard } from "./types";
+import type { CardReviewRecord, ExamAnswer, ExamAnswerMode, ExamDifficulty, ExamContentStrategy, ExamMode, ExamQuestion, ExamSessionState, ExamSource, ExamRepeatPolicy, MasteryRating, NoteExam, SavedReviewCard } from "./types";
 import { fingerprintKey } from "./ai/cache";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import * as fs from "fs";
@@ -79,6 +79,9 @@ export function examMarkdown(e: NoteExam): string {
     "questionCount: " + e.questionCount,
     ...(e.difficulty ? ['difficulty: "' + e.difficulty + '"'] : []),
     'answerMode: "' + e.answerMode + '"',
+    'contentStrategy: "' + (e.contentStrategy ?? "broad_coverage") + '"',   // Phase 23 §64/65
+    'repeatPolicy: "' + (e.repeatPolicy ?? "allow") + '"',
+    ...(e.previousExamCount !== undefined ? ["previousExamCount: " + e.previousExamCount] : []),
     "examVersion: " + (e.examVersion ?? 1),
     ...(e.coverageTopics && e.coverageTopics.length ? ["coverageTopics: [" + e.coverageTopics.map(escYaml).join(", ") + "]"] : []),
     "questions:",
@@ -118,6 +121,8 @@ export function parseExamMarkdown(md: string): ParsedExam {
       difficulty: fm.difficulty === "easy" || fm.difficulty === "hard" ? fm.difficulty : fm.difficulty === "medium" ? "medium" : undefined,
       answerMode: fm.answerMode === "source_only" || fm.answerMode === "web_allowed" ? fm.answerMode : "source_preferred",
       questions: fm.questions,
+      contentStrategy: (fm.contentStrategy ?? "broad_coverage") as ExamContentStrategy | undefined,   // Phase 23 §64：旧缺省 broad_coverage
+      repeatPolicy: (fm.repeatPolicy ?? "allow") as ExamRepeatPolicy | undefined,
       examVersion: fm.examVersion ?? 1,
       coverageTopics: fm.coverageTopics,
       createdAt: fm.createdAt ?? Date.now(),
@@ -143,6 +148,9 @@ interface ExamFrontmatter {
   examVersion?: number;
   coverageTopics?: string[];
   createdAt?: number;
+  contentStrategy?: string;   // Phase 23
+  repeatPolicy?: string;
+  previousExamCount?: number;
   questions: ExamQuestion[];
 }
 
@@ -242,6 +250,9 @@ function parseExamFrontmatter(md: string): ExamFrontmatter | null {
     answerMode: kv.get("answerMode") ?? "source_preferred",
     examVersion: parseInt(kv.get("examVersion") ?? "1", 10) || 1,
     coverageTopics: inlineArr(kv.get("coverageTopics")),
+    contentStrategy: (["new_content", "new_angle", "broad_coverage", "custom"] as string[]).includes(kv.get("contentStrategy") ?? "") ? kv.get("contentStrategy") : undefined,
+    repeatPolicy: (["strict", "balanced", "allow"] as string[]).includes(kv.get("repeatPolicy") ?? "") ? kv.get("repeatPolicy") : undefined,
+    previousExamCount: parseInt(kv.get("previousExamCount") ?? "", 10) || undefined,
     createdAt: parseInt(kv.get("createdAt") ?? "", 10) || undefined,
     questions,
   };
