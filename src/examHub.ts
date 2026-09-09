@@ -11,10 +11,11 @@
  */
 import { App, ItemView, Modal, Notice, TFile, WorkspaceLeaf } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
-import type { NoteExam, ExamQuestion } from "./types";
+import type { NoteExam, ExamQuestion, SavedReviewCard } from "./types";
 import { examProgress, examSessionFinished } from "./examEngine";
 import { examTypeLabel } from "./examView";
 import { examMarkdownPath } from "./examStore";
+import { sourceNoteHasTag } from "./spacedReview";
 import { FSRS_RATINGS, FSRS_RATING_LABEL, FSRS_RATING_EMOJI } from "./spacedReview";
 
 export const VIEW_TYPE_EXAM_REVIEW = "knowledge-garden-exam-review";
@@ -277,4 +278,91 @@ export class ExamReviewView extends ItemView {
       return false;
     }
   }
+}
+
+/* ================= Phase 22 §25~29/77~82：Tag Exam Preview（浏览该标签下的考试题） ================= */
+
+/** 「该标签下考试题」预览：来源笔记 → 考试 → 题目（收藏状态）+ 单题 ☆收藏；全部本地 0 AI（§77/78）。 */
+export class TagExamPreviewModal extends Modal {
+  constructor(
+    app: App,
+    private plugin: KnowledgeGardenPlugin,
+    private tag: string,
+    private matchMode: "exact" | "include-children"
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.render();
+  }
+
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("kg-dashboard");
+    contentEl.createEl("h3", { text: "🏷 #" + this.tag.replace(/^#+/, "") + " · 该标签下的考试题" });
+    const plugin = this.plugin;
+    const notes = plugin.index.all();
+    const sources = notes.filter((n) => sourceNoteHasTag(n.tags ?? [], this.tag, this.matchMode));   // §6/14：源笔记→NoteIndex tags
+    let examQTotal = 0;
+    let savedTotal = 0;
+    const rows: { source: string; exam: NoteExam; q: ExamQuestion; saved: SavedReviewCard | undefined }[] = [];
+    for (const n of sources) {
+      for (const e of plugin.examStore.findBySource(n.path)) {   // §25/9/10
+        for (const q of e.questions) {
+          const saved = plugin.cards.findByExamQuestion(e.id, q.id)
+            ?? plugin.cards.all().find((c) => c.sourcePath === e.sourcePath && c.examId === e.id && c.question.trim() === (q.question || "").trim());
+          examQTotal++;
+          if (saved) savedTotal++;
+          rows.push({ source: n.path, exam: e, q, saved });
+        }
+      }
+    }
+    contentEl.createDiv({ cls: "kg-review-progress", text: "来源笔记 " + sources.length + " 篇 · 考试题 " + examQTotal + " 道 · 已收藏 " + savedTotal + " 张（浏览/收藏全程 0 AI，§12/27）" });
+    if (rows.length === 0) {
+      contentEl.createDiv({ cls: "kg-empty", text: "该标签下还没有考试题（先在某篇带此标签的笔记右键 → 📝 构建知识考试）。" });
+      return;
+    }
+    let lastSource = "";
+    let lastExam = "";
+    for (const r of rows) {
+      if (r.source !== lastSource) {
+        lastSource = r.source;
+        contentEl.createDiv({ cls: "kg-section-title-row" })
+          .createDiv({ cls: "kg-section-title", text: "《" + this.plugin.basename(r.source) + "》 · " + r.source });
+        lastExam = "";
+      }
+      if (r.exam.id !== lastExam) {
+        lastExam = r.exam.id;
+        contentEl.createDiv({ cls: "kg-review-meta", text: "📝 " + r.exam.title + (r.exam.mode === "custom" ? " · 主题卷" : " · 整体考察") + " · " + r.exam.questionCount + " 题" });
+      }
+      const row = contentEl.createDiv({ cls: "kg-row kg-hub-exam" });
+      const qtext = row.createDiv({ cls: "kg-card-question", text: (r.q.question || "").slice(0, 90) });
+      void qtext;
+      row.createSpan({ cls: "kg-chip", text: examTypeLabel(r.q.type) });
+      const savedBtn = row.createEl("button", { cls: "kg-btn" + (r.saved ? " kg-btn-primary" : ""), text: r.saved ? "✓ 已收藏" : "☆ 收藏（0 AI）" });
+      savedBtn.addEventListener("click", () => {
+        if (r.saved) { new Notice("已收藏过（examId+questionId 去重，§54/82）。"); return; }
+        void plugin.saveReviewCard({
+          sourcePath: r.exam.sourcePath,
+          sourceVersion: r.exam.sourceVersion,
+          examId: r.exam.id,
+          examQuestionId: r.q.id,
+          question: r.q.question,
+          answer: r.q.referenceAnswer,
+          explanation: r.q.explanation,
+          questionType: r.q.type,
+          options: r.q.type === "multiple_choice" ? r.q.options : undefined,
+          correctAnswer: r.q.type === "multiple_choice" || r.q.type === "true_false" ? r.q.correctAnswer : undefined,
+          sourceEvidence: r.q.sourceEvidence,
+          concept: r.q.concept,
+        }).then(() => this.render());   // §27：单题收藏；不自动全收（§28）
+      });
+      const openBtn = row.createEl("button", { cls: "kg-btn", text: "查看" });
+      openBtn.addEventListener("click", () => { this.close(); void plugin.openExamReview(r.exam.id); });   // §80
+    }
+  }
+
+  onClose(): void { this.contentEl.empty(); }
 }

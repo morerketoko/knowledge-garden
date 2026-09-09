@@ -38,6 +38,7 @@ import { ExamSessionView, VIEW_TYPE_EXAM } from "./examView";
 import { CardsView, VIEW_TYPE_CARDS } from "./cardsView";
 import { NoteExamHubModal, ExamReviewView, VIEW_TYPE_EXAM_REVIEW } from "./examHub";
 import { hydrateSavedCardBatch, legacyMcCandidates, needsSavedCardHydration } from "./savedCardHydration";
+import { validateSavedCardEdit, applySavedCardEdit, type SavedCardEditInput } from "./savedCardEditor";
 import { examMarkdown, cardMarkdown, examMarkdownPath, cardMarkdownPath, examFingerprint, newExamId, newCardId, examDirPath, cardsDirPath, parseExamMarkdown, parseCardMarkdown, ExamStore, ReviewCardStore, ExamSessionStore, CardReviewStore } from "./examStore";
 import { filterValidExamQuestions, examProgress, examSessionFinished, safeExamResumeIndex, selfMasteryPercent, aiMasteryPercent, masteryLabel, masteryGapHint, weakConceptsOf, strongConceptsOf, type ExamProgressStats } from "./examEngine";
 import { ExamBuildModal, type ExamBuildParams } from "./examView";
@@ -138,6 +139,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
   captureSummaryText = { inbox: 0, candidates: 0, accepted: 0, archived: 0 };
   /** Phase 9：Review 操作连点防抖时间戳（§二十八~三十：✓/跳过/稍后 快速连点只生效一次） */
   private reviewActionUntil = 0;
+  /** Phase 22：卡片编辑保存防重（300ms，§71） */
+  private cardWriteUntil = 0;
   /** Query Explorer：本地全库检索索引（§九/十六~二十二：内存索引 + NoteIndex 事件联动增量） */
   searchIndex!: SearchIndex;
   /** Query Explorer：最近探索历史（cache/query-history.json，§五十四/五十五） */
@@ -3087,6 +3090,72 @@ export default class KnowledgeGardenPlugin extends Plugin {
       const existing = this.app.vault.getAbstractFileByPath(normalizePath(p));
       if (existing instanceof TFile) await this.app.vault.modify(existing, body);
       else await this.app.vault.create(p, body);
+    } catch (err) {
+      new Notice("写入复习卡 Markdown 失败：" + String((err as Error)?.message ?? err));
+    }
+  }
+
+  /**
+   * Phase 22 §55~57/61~65：保存复习卡编辑（校验 → Store + Markdown 双写 → 可选重置 FSRS）。
+   * - 只改 SavedReviewCard 快照字段（sourcePath/examId/cardId/createdAt 只读，§49~52）；
+   * - 普通编辑：FSRS / SavedCardReviewLogs / CardReviewRecord / Exam / Source Note 全部不动（§59~62/66）；
+   * - resetFsrs=true：删除 Saved Card FSRS 状态与日志 + CardReviewRecord → 下次评分 createEmptyCard（§63~65）；
+   * - 0 AI（§89）；失败返回原因（含“该复习卡已不存在，请刷新”，§72）。
+   */
+  async updateSavedReviewCard(cardId: string, input: SavedCardEditInput, opts?: { resetFsrs?: boolean }): Promise<{ ok: boolean; message: string }> {
+    if (Date.now() < this.cardWriteUntil) return { ok: false, message: "操作过于频繁，请稍后再试。" };   // §71
+    const card = this.cards.get(cardId);
+    if (!card) return { ok: false, message: "该复习卡已不存在，请刷新。" };   // §72
+    const validation = validateSavedCardEdit(input, card.questionType);
+    if (!validation.ok) return { ok: false, message: validation.errors.join("；") };
+    const next = applySavedCardEdit(card, input);
+    const same =
+      next.question === card.question && next.answer === card.answer && next.explanation === card.explanation
+      && next.concept === card.concept && JSON.stringify(next.options ?? null) === JSON.stringify(card.options ?? null)
+      && next.correctAnswer === card.correctAnswer && JSON.stringify(next.tags ?? null) === JSON.stringify(card.tags ?? null);
+    this.cardWriteUntil = Date.now() + 300;
+    if (same && !opts?.resetFsrs) return { ok: true, message: "没有修改内容。" };
+    try {
+      if (opts?.resetFsrs) {   // §63~65：重置=删 FSRS 状态+日志+复习历史（普通编辑不动）
+        this.spaced?.scRemoveCard(cardId);
+        this.cardReviews?.removeByCard(cardId);
+      }
+      const now = Date.now();
+      this.cards.update(cardId, {
+        question: next.question, answer: next.answer, explanation: next.explanation,
+        concept: next.concept, tags: next.tags, options: next.options, correctAnswer: next.correctAnswer,
+        editedAt: now,
+      });
+      await this.updateSavedCardMarkdown(card, { ...next, editedAt: now });   // §57：同步 Markdown（失败会 Notice）
+      this.rerenderDashboard();
+      for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS)) {
+        void (leaf.view as CardsView).refresh();
+      }
+    } catch (e) {
+      return { ok: false, message: "保存失败：" + ((e as Error)?.message ?? String(e)) };
+    }
+    return { ok: true, message: opts?.resetFsrs ? "已保存并重置复习进度（重新成为新卡，0 AI）。" : "已保存修改（0 AI；FSRS 与复习历史不变）。" };
+  }
+
+  /** Phase 22 §57/86：编辑后同步单张 Markdown——题干变更会改文件名：优先原位覆写；文件名不同且新名无冲突则 rename（只写这一张，§86） */
+  private async updateSavedCardMarkdown(card: SavedReviewCard, next: SavedReviewCard): Promise<void> {
+    try {
+      await this.ensureVaultFolder(cardsDirPath());
+      const body = cardMarkdown(next) + "\n";
+      const oldPath = cardMarkdownPath(card);
+      const newPath = cardMarkdownPath(next);
+      const existing = this.app.vault.getAbstractFileByPath(normalizePath(oldPath));
+      if (existing instanceof TFile) {
+        if (oldPath !== newPath && !(this.app.vault.getAbstractFileByPath(normalizePath(newPath)) instanceof TFile)) {
+          await this.app.vault.rename(existing, normalizePath(newPath));   // 文件名跟随新题干（无冲突时）
+          return;
+        }
+        await this.app.vault.modify(existing, body);
+        return;
+      }
+      const fresh = this.app.vault.getAbstractFileByPath(normalizePath(newPath));
+      if (fresh instanceof TFile) await this.app.vault.modify(fresh, body);
+      else await this.app.vault.create(normalizePath(newPath), body);
     } catch (err) {
       new Notice("写入复习卡 Markdown 失败：" + String((err as Error)?.message ?? err));
     }

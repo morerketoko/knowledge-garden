@@ -937,10 +937,55 @@ export function savedCardInFolder(sourcePath: string, folderPath: string): boole
   return sourcePath.startsWith(fp + "/");
 }
 
-/** §17~22：Saved Card Scope 过滤（按 SavedReviewCard.sourcePath / examId；只读索引元数据，0 AI） */
+/** §17/Phase22：Tag 规范化：去前导 #、trim、保留大小写（不擅自改用户 tag 语义，§7） */
+export function normalizeTag(tag: string | undefined | null): string {
+  return (tag ?? "").replace(/^#+/, "").trim();
+}
+
+export function tagMatchModeOf(scope: SavedCardScope | null | undefined): "exact" | "include-children" {
+  return scope?.tagMatchMode === "exact" ? "exact" : "include-children";   // §4：默认 include-children
+}
+
+/** Phase 22 §8/9：判定某篇笔记的一组 tags 是否命中指定 tag。
+ *  exact：只允许逐字符相等；include-children：允许相等或 tag/子标签 前缀（边界为 '/',#game 不匹配 #gamestuff）。 */
+export function sourceNoteHasTag(noteTags: ReadonlyArray<string>, tag: string | undefined, mode: "exact" | "include-children"): boolean {
+  const want = normalizeTag(tag);
+  if (!want) return false;
+  const normTags = (noteTags ?? []).map(normalizeTag).filter(Boolean);
+  if (mode === "exact") return normTags.includes(want);
+  const prefix = want + "/";
+  return normTags.some((t) => t === want || t.startsWith(prefix));
+}
+
+/** Phase 22 §10/11/84：从 NoteIndex 元数据聚合标签计数（本地内存，不扫 Markdown；count DESC，名称 ASC tie） */
+export interface NoteTagCount { tag: string; count: number; }
+export function aggregateNoteTags(notes: ReadonlyArray<{ tags?: string[] }>): NoteTagCount[] {
+  const counts = new Map<string, number>();
+  for (const n of notes) {
+    for (const raw of n.tags ?? []) {
+      const t = normalizeTag(raw);
+      if (!t) continue;
+      counts.set(t, (counts.get(t) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count || (a.tag < b.tag ? -1 : a.tag > b.tag ? 1 : 0));
+}
+
+/** Phase 22 §12：Tag Picker 过滤（纯本地；中英文 substring） */
+export function filterTagOptions(options: NoteTagCount[], query: string): NoteTagCount[] {
+  const q = normalizeTag(query).toLowerCase();
+  if (!q) return options;
+  return options.filter((o) => o.tag.toLowerCase().includes(q));
+}
+
+/** §17~22：Saved Card Scope 过滤（按 SavedReviewCard.sourcePath / examId / tag；只读索引元数据，0 AI）。
+ *  tag 模式需要 noteTagsOf（sourcePath → 该笔记 tags）；未提供时 tag 模式返回空（调用方应传 NoteIndex 聚合映射，§83）。 */
 export function filterSavedCardObjects<T extends { sourcePath: string; examId?: string }>(
   cards: ReadonlyArray<T>,
-  scope: SavedCardScope | null | undefined
+  scope: SavedCardScope | null | undefined,
+  noteTagsOf?: (sourcePath: string) => string[]
 ): T[] {
   if (!scope || scope.mode === "vault") return cards as T[];
   const match = (c: { sourcePath: string; examId?: string }): boolean => {
@@ -953,6 +998,10 @@ export function filterSavedCardObjects<T extends { sourcePath: string; examId?: 
         return !!scope.folderPath && savedCardInFolder(c.sourcePath, scope.folderPath);
       case "exam":
         return !!scope.examId && c.examId === scope.examId;
+      case "tag": {
+        if (!noteTagsOf) return false;
+        return sourceNoteHasTag(noteTagsOf(c.sourcePath), scope.tag, tagMatchModeOf(scope));   // §14/15
+      }
       case "custom": {
         if (scope.folders && scope.folders.length) {
           if (!scope.folders.some((f) => savedCardInFolder(c.sourcePath, f))) return false;
@@ -966,13 +1015,14 @@ export function filterSavedCardObjects<T extends { sourcePath: string; examId?: 
   return (cards as unknown as { sourcePath: string; examId?: string }[]).filter(match) as T[];
 }
 
-/** §17/29：Saved Card scope fingerprint（排序后 hash；exam 模式含 examId） */
+/** §17/29/Phase22 §21：Saved Card scope fingerprint（排序后 hash；exam 模式含 examId；tag 模式含 tag+tagMatchMode） */
 export function savedCardScopeFingerprint(scope: SavedCardScope | null | undefined): string {
   const o: Record<string, unknown> = { mode: scope?.mode ?? "vault" };
   if (scope?.notePath) o["notePath"] = scope.notePath;
   if (scope?.folderPath) o["folderPath"] = scope.folderPath;
   if (scope?.areaId) o["areaId"] = scope.areaId;
   if (scope?.examId) o["examId"] = scope.examId;
+  if (scope?.tag) { o["tag"] = normalizeTag(scope.tag); o["tagMatchMode"] = tagMatchModeOf(scope); }
   if (scope?.folders && scope.folders.length) o["folders"] = [...scope.folders].sort();
   const s = JSON.stringify(o);
   let h = 0x811c9dc5;
@@ -984,7 +1034,7 @@ export function defaultSavedCardScope(): SavedCardScope {
   return { mode: "vault" };
 }
 
-/** §17 范围显示名（View 用） */
+/** §17 范围显示名（View 用；Phase 22 tag） */
 export function savedCardScopeText(scope: SavedCardScope | null | undefined, examTitle?: string): string {
   if (!scope || scope.mode === "vault") return "整个 Vault";
   switch (scope.mode) {
@@ -992,6 +1042,7 @@ export function savedCardScopeText(scope: SavedCardScope | null | undefined, exa
     case "folder": return scope.folderPath || "（未选文件夹）";
     case "area": return scope.areaId || "（未选区域）";
     case "exam": return examTitle || scope.examId || "（未选考试）";
+    case "tag": return scope.tag ? "#" + normalizeTag(scope.tag) : "（未选标签）";
     case "custom": {
       const folders = (scope.folders ?? []).slice(0, 2);
       const more = (scope.folders ?? []).length > 2 ? " 等 " + (scope.folders?.length ?? 0) + " 个" : "";

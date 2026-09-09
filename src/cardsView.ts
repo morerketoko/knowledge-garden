@@ -16,8 +16,13 @@ import {
 import {
   FSRS_RATINGS, FSRS_RATING_LABEL, FSRS_RATING_EMOJI, masteryConfidence,
   defaultSavedCardScope, savedCardScopeText, savedCardOverview, clampCustomFolders, CUSTOM_SCOPE_FOLDER_LIMIT,
-  isNewSavedCard, rankSavedCards, type SavedCardSpacedState, type MasteryBand, type SavedCardSortMode,
+  isNewSavedCard, rankSavedCards, normalizeTag, tagMatchModeOf, sourceNoteHasTag,
+  aggregateNoteTags, filterTagOptions, type NoteTagCount,
+  type SavedCardSpacedState, type MasteryBand, type SavedCardSortMode,
 } from "./spacedReview";
+import { filterSavedCardsByQuery } from "./savedCardSearch";
+import { editDraftFromCard, validateSavedCardEdit, parseTagsText, letterIndex, indexToLetter, type SavedCardEditInput } from "./savedCardEditor";
+import { TagExamPreviewModal } from "./examHub";
 
 export const VIEW_TYPE_CARDS = "knowledge-garden-cards";
 
@@ -58,6 +63,101 @@ class CardDeleteConfirmModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+/* ================= Phase 22 §43~72：卡片编辑 Modal ================= */
+class CardEditModal extends Modal {
+  private draft: SavedCardEditInput;
+  private resetFsrs = false;
+
+  constructor(app: App, private plugin: KnowledgeGardenPlugin, private card: SavedReviewCard, private onSaved: () => void) {
+    super(app);
+    this.draft = editDraftFromCard(card);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("kg-dashboard");
+    contentEl.createEl("h3", { text: "✎ 编辑复习卡" });
+    contentEl.createDiv({ cls: "kg-review-meta", text: "只修改这张复习卡快照；来源笔记 / 来源考试 / FSRS 均不受影响（§59~62）。" });
+    const f = contentEl.createDiv({ cls: "kg-exam-modal" });
+
+    const field = (label: string, value: string, multiline: boolean, cb: (v: string) => void): HTMLInputElement | HTMLTextAreaElement => {
+      const wrap = f.createDiv({ cls: "kg-row kg-edit-field" });
+      wrap.createSpan({ cls: "kg-review-qlabel", text: label });
+      const el = multiline
+        ? wrap.createEl("textarea", { cls: "kg-input", attr: { rows: multiline ? 3 : 1 } })
+        : wrap.createEl("input", { cls: "kg-input" });
+      el.value = value;
+      el.addEventListener("input", () => cb(multiline ? (el as HTMLTextAreaElement).value : el.value));
+      return el;
+    };
+    field("题干 *", this.draft.question, false, (v) => { this.draft.question = v; });
+    field("答案（可空）", this.draft.answer, true, (v) => { this.draft.answer = v; });
+    field("说明", this.draft.explanation, true, (v) => { this.draft.explanation = v; });
+    field("概念（考点）", this.draft.concept, false, (v) => { this.draft.concept = v; });
+    field("标签（逗号分隔）", this.draft.tagsText, false, (v) => { this.draft.tagsText = v; });
+    f.createDiv({ cls: "kg-review-meta", text: "来源：" + this.card.sourcePath + (this.card.examId ? " · 考试 " + (this.plugin.examStore.get(this.card.examId)?.title ?? "（原考试已删除）") : "") + "（只读）" });
+
+    if (this.card.questionType === "multiple_choice") {
+      // §46/47：选项编辑（≥2，可增删）；correctAnswer 单选对应选项
+      const box = f.createDiv({ cls: "kg-exam-options" });
+      const renderOptions = (): void => {
+        box.empty();
+        this.draft.options.forEach((_, i) => {
+          const row = box.createDiv({ cls: "kg-row kg-edit-field" });
+          const lbl = indexToLetter(i);
+          row.createSpan({ cls: "kg-exam-opt-lbl", text: lbl });
+          const input = row.createEl("input", { cls: "kg-input" });
+          input.value = this.draft.options[i];
+          input.addEventListener("input", () => { this.draft.options[i] = input.value; });
+          const radio = row.createEl("button", { cls: "kg-btn" + (this.draft.correctAnswer.trim().toUpperCase() === lbl ? " kg-btn-primary" : ""), text: "✓ 正确答案" });
+          radio.addEventListener("click", () => { this.draft.correctAnswer = lbl; renderOptions(); });
+          if (this.draft.options.length > 2) {
+            const del = row.createEl("button", { cls: "kg-btn kg-btn-danger", text: "删除" });
+            del.addEventListener("click", () => { this.draft.options.splice(i, 1); renderOptions(); });
+          }
+        });
+        const addBtn = f.createEl("button", { cls: "kg-btn", text: "+ 添加选项" });
+        addBtn.addEventListener("click", () => { if (this.draft.options.length < 8) { this.draft.options.push(""); renderOptions(); } });
+      };
+      renderOptions();
+    } else if (this.card.questionType === "true_false") {
+      const wrap = f.createDiv({ cls: "kg-row kg-edit-field" });
+      wrap.createSpan({ cls: "kg-review-qlabel", text: "正确答案" });
+      const sel = wrap.createEl("select", { cls: "kg-select" });
+      sel.createEl("option", { value: "true", text: "true" });
+      sel.createEl("option", { value: "false", text: "false" });
+      sel.value = (this.draft.correctAnswer || "true").toLowerCase();
+      sel.addEventListener("change", () => { this.draft.correctAnswer = sel.value; });
+    }
+
+    // §62~65：可选重置（默认否；重置=删除 FSRS 状态与历史，重新成为新卡）
+    const resetWrap = f.createDiv({ cls: "kg-row kg-edit-field" });
+    const resetChk = resetWrap.createEl("input", { attr: { type: "checkbox" } });
+    resetChk.addEventListener("change", () => { this.resetFsrs = resetChk.checked; });
+    resetWrap.createSpan({ cls: "kg-review-days", text: "重置复习进度（删除 FSRS 状态与历史，重新成为 🌱 新卡；默认不重置）" });
+
+    const row = f.createDiv({ cls: "kg-row" });
+    row.createEl("button", { cls: "kg-btn", text: "取消" }).addEventListener("click", () => this.close());   // §70
+    row.createEl("button", { cls: "kg-btn kg-btn-primary", text: "保存修改" }).addEventListener("click", () => {
+      void this.save();
+    });
+  }
+
+  private async save(): Promise<void> {
+    const v = validateSavedCardEdit(this.draft, this.card.questionType);
+    if (!v.ok) { new Notice(v.errors.join("；")); return; }   // §54
+    const res = await this.plugin.updateSavedReviewCard(this.card.id, this.draft, { resetFsrs: this.resetFsrs });   // §55/71
+    new Notice(res.message);
+    if (res.ok) {
+      this.close();
+      this.onSaved();   // §69：搜索/列表立即刷新
+    }
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
 type ListSort = SavedCardSortMode;
 
 function fmtDue(due: number | undefined, now: number): { text: string; tone: string } {
@@ -90,8 +190,12 @@ function fmtPreview(intervalDays: number, due: number, now: number): string {
 export class CardsView extends ItemView {
   private cards: SavedReviewCard[] = [];
   private cardScope: SavedCardScope = defaultSavedCardScope();
+  private sourceTags = new Map<string, string[]>();   // Phase 22 §83：sourcePath → tags（一次性 NoteIndex 聚合）
   private scopeEditorOpen = false;
   private customInput = "";
+  private tagQuery = "";                  // Phase 22：Tag Picker 过滤（§12）
+  private tagSortByName = false;          // Phase 22 §13：默认 count DESC；可切名称 ASC
+  private searchQuery = "";               // Phase 22 §30：关键词搜索（scope 内，§31/73）
   private listSort: ListSort = "forget";           // §27：默认最可能忘记
   private deleting = new Set<string>();            // Phase 21.x：连点防重（P-HF-DELETE-15）
   private hiddenAnswers = new Set<string>();
@@ -127,6 +231,18 @@ export class CardsView extends ItemView {
   private reloadCards(): void {
     // Phase 21 Hotfix §11/34：惰性 hydration——只对 options 缺失/无效的 MC 卡尝试从真实 ExamQuestion 恢复（0 AI）
     this.cards = this.plugin.hydrateSavedReviewCards(this.plugin.cards.all());
+    // Phase 22 §83/84：Tag Scope 用 NoteIndex 元数据（内存 Map），绝不扫 Markdown
+    this.sourceTags.clear();
+    for (const n of this.plugin.index.all()) this.sourceTags.set(n.path, n.tags ?? []);
+  }
+
+  /** Tag Scope 的源笔记计数（§76：用于“N 篇来源笔记”） */
+  private tagSourceNotesCount(): number {
+    if (this.cardScope.mode !== "tag" || !this.cardScope.tag) return 0;
+    const s = this.cardScope;
+    let n = 0;
+    for (const tags of this.sourceTags.values()) if (sourceNoteHasTag(tags, s.tag, tagMatchModeOf(s))) n++;
+    return n;
   }
 
   private scopedCards(): SavedReviewCard[] {
@@ -141,6 +257,7 @@ export class CardsView extends ItemView {
       case "folder": return !!s.folderPath && this.inFolder(c.sourcePath, s.folderPath);
       case "area": return !!s.folderPath && this.inFolder(c.sourcePath, s.folderPath);
       case "exam": return !!s.examId && c.examId === s.examId;
+      case "tag": return !!s.tag && sourceNoteHasTag(this.sourceTags.get(c.sourcePath) ?? [], s.tag, tagMatchModeOf(s));   // §14/15：源笔记删除→自动退出（§99）
       case "custom": {
         if (s.folders && s.folders.length && !s.folders.some((f) => this.inFolder(c.sourcePath, f))) return false;
         return true;
@@ -182,8 +299,18 @@ export class CardsView extends ItemView {
       inner.createDiv({ cls: "kg-empty", text: this.scopeEmptyText() });
       return;
     }
-    // 排序（默认最可能忘记；支持 🌱 新卡优先 / 推荐）
-    const sorted = this.sortCards(scoped);
+    // §31/41：先 scope 过滤 → 再 search 过滤 → 再排序
+    const searched = this.searchQuery.trim()
+      ? filterSavedCardsByQuery(scoped, this.searchQuery, (c) => ({
+          examTitle: c.examId ? this.plugin.examStore.get(c.examId)?.title : undefined,
+          sourceBasename: this.plugin.basename(c.sourcePath),
+        }))
+      : scoped;
+    if (searched.length === 0) {
+      inner.createDiv({ cls: "kg-empty", text: "没有符合条件的复习卡（只搜索当前范围，0 AI）。可点上方 🔍 的 × 清除搜索。" });
+      return;
+    }
+    const sorted = this.sortCards(searched);
     const list = inner.createDiv({ cls: "kg-note-list kg-cards-body" });
     const now = Date.now();
     for (const c of sorted) {
@@ -204,6 +331,7 @@ export class CardsView extends ItemView {
         const tone = fmtDue(due, now);
         chips.createSpan({ cls: "kg-chip kg-due-" + tone.tone, text: tone.text === "—" ? "已调度" : tone.text });
       }
+      if (typeof c.editedAt === "number" && c.editedAt > c.createdAt) chips.createSpan({ cls: "kg-chip", text: "✎ 最近修改" });   // Phase 22 §97
       if (st) {
         const conf = masteryConfidence(st.reviewCount);
         if (conf.low) chips.createSpan({ cls: "kg-chip", text: conf.hint });
@@ -226,7 +354,9 @@ export class CardsView extends ItemView {
         (sourceGone ? " · ⚠ 来源笔记已删除（卡仍可复习）" : "")
       );
       row.addEventListener("click", () => { this.startReviewAt(c); });
-      // 删除入口（§3/60）：stopPropagation 防止同时打开复习卡
+      // Phase 22：✎ 编辑 + 删除（§43/60）；stopPropagation 防止同时打开复习卡
+      const editBtn = row.createEl("button", { cls: "kg-btn kg-card-del", text: "✎ 编辑" });
+      editBtn.addEventListener("click", (ev) => { ev.stopPropagation(); this.openEditor(c); });
       const delBtn = row.createEl("button", { cls: "kg-btn kg-btn-danger kg-card-del", text: "删除" });
       delBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -238,6 +368,7 @@ export class CardsView extends ItemView {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private scopeEmptyText(): string {
     if (this.cards.length === 0) return "还没有复习卡。";   // §76：区分“没有卡”与“没有到期卡”
+    if (this.cardScope.mode === "tag" && !this.cardScope.tag) return "请点上方「复习范围 → 🏷 标签」选择一个标签。";
     return "当前范围没有复习卡（打开/刷新 0 AI）。可点上方「复习范围」调整，或在笔记右键「📝 构建知识考试」→ 作答后收藏题目。";
   }
 
@@ -261,6 +392,21 @@ export class CardsView extends ItemView {
 
   private confirmDelete(c: SavedReviewCard): void {
     new CardDeleteConfirmModal(this.app, c.question, () => { void this.doDelete(c); }).open();   // §4/61
+  }
+
+  private openEditor(c: SavedReviewCard): void {
+    new CardEditModal(this.app, this.plugin, c, () => this.onCardEdited(c.id)).open();   // §43/44：Modal 编辑
+  }
+
+  /** §69：编辑保存后立即刷新（列表/搜索/统计随之更新；复习页保持当前卡） */
+  private onCardEdited(id: string): void {
+    this.reloadCards();
+    const updated = this.cards.find((x) => x.id === id);
+    if (this.mode === "review" && updated) {
+      const idx = this.reviewing.findIndex((x) => x.id === id);
+      if (idx >= 0) { this.reviewing[idx] = updated; this.renderReview(); return; }
+    }
+    this.renderList();
   }
 
   private async doDelete(c: SavedReviewCard): Promise<void> {
@@ -321,6 +467,7 @@ export class CardsView extends ItemView {
 
 
   private renderHeader(inner: HTMLElement): void {
+    const MODE_ICON: Record<SavedCardScopeMode, string> = { vault: "🌐", "current-note": "📄", folder: "📁", area: "🗂", exam: "📝", tag: "🏷", custom: "📚" };
     const head = inner.createDiv({ cls: "kg-section-title-row kg-review-head" });
     const titleWrap = head.createDiv({ cls: "kg-review-head-title" });
     titleWrap.createDiv({ cls: "kg-section-title", text: "📚 我的复习卡" });
@@ -330,13 +477,37 @@ export class CardsView extends ItemView {
     const newCount = scoped.filter((c) => isNewSavedCard(this.stateOf(c.id))).length;
     const ov = savedCardOverview(states, [], this.plugin.spacedScheduler(), Date.now(), newCount);
     titleWrap.createDiv({ cls: "kg-review-progress", text: "共 " + ov.total + " 张 · 到期 " + ov.due + " · 即将遗忘 " + ov.forgetting + " · 新卡 " + ov.newCount + " · 稳定掌握 " + ov.stable + " · 今日已复习 " + ov.reviewsToday });
-    const scopeBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "📚 " + this.scopeText() + " ▼" });
+    const scopeBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: MODE_ICON[this.cardScope.mode] + " " + this.scopeText() + " ▼" });
     scopeBtn.addEventListener("click", () => { this.scopeEditorOpen = !this.scopeEditorOpen; this.renderList(); });
     const refreshBtn = head.createEl("button", { cls: "kg-btn kg-btn-icon", text: "🔄 刷新" });
     refreshBtn.setAttr("title", "重读 ReviewCardStore + FSRS saved-card state + 日志；统计/排序/due/mastery/retrievability 重算（0 AI，§11）");
     refreshBtn.addEventListener("click", () => { this.refresh(); });
 
+    // Phase 22 §30/31/73：🔎 搜索（只搜当前 scope；输入后局部重渲染并保持焦点）
+    const searchRow = inner.createDiv({ cls: "kg-row kg-sort-row" });
+    const search = searchRow.createEl("input", { cls: "kg-input kg-search", attr: { placeholder: "🔎 搜索题目、答案、来源、概念、考试……（只在当前范围，0 AI）" } });
+    search.value = this.searchQuery;
+    const refocus = (): void => {
+      const neo = inner.querySelector(".kg-search") as HTMLInputElement | null;
+      if (neo) { neo.focus(); const len = neo.value.length; try { neo.setSelectionRange(len, len); } catch { /* ignore */ } }
+    };
+    search.addEventListener("input", () => {
+      this.searchQuery = search.value;
+      this.renderList();
+      refocus();
+    });
+    searchRow.createSpan({ cls: "kg-review-days", text: this.searchQuery ? "🔎 在当前范围找到 " + scoped.length + " 张卡中的匹配项（按当前排序）" : "" });
+    if (this.searchQuery) {
+      searchRow.createEl("button", { cls: "kg-btn", text: "× 清除" }).addEventListener("click", () => { this.searchQuery = ""; this.renderList(); });   // §40
+    }
+
     if (this.scopeEditorOpen) this.renderScopeEditor(inner);
+    // Phase 22 §18/76：Tag Scope 描述（范围必须可见）
+    if (this.cardScope.mode === "tag" && this.cardScope.tag) {
+      const notesN = this.tagSourceNotesCount();
+      inner.createDiv({ cls: "kg-review-meta", text: "所有带 #" + normalizeTag(this.cardScope.tag) + " 标签的笔记对应的复习卡（" + notesN + " 篇来源笔记 · " + scoped.length + " 张已收藏复习卡" + (tagMatchModeOf(this.cardScope) === "include-children" ? " · 包含子标签" : "") + "）" });
+    }
+
     // §61/62/29/30：掌握分布 + FSRS 概览（未评分新卡不计入五档分布）
     const distBox = inner.createDiv({ cls: "kg-card kg-overview" });
     distBox.createDiv({ cls: "kg-review-qlabel", text: "掌握分布（本地 0 AI）" });
@@ -362,6 +533,11 @@ export class CardsView extends ItemView {
       const tool = inner.createDiv({ cls: "kg-row kg-sort-row" });
       tool.createEl("button", { cls: "kg-btn kg-btn-primary", text: "▶ 开始复习（0 AI）" })
         .addEventListener("click", () => { if (scoped.length) this.startReviewAt(scoped[0]); });
+      // Phase 22 §26/29：Tag → 浏览该标签下的考试题
+      if (this.cardScope.mode === "tag" && this.cardScope.tag) {
+        tool.createEl("button", { cls: "kg-btn", text: "🗂 浏览该标签下的考试题" })
+          .addEventListener("click", () => { new TagExamPreviewModal(this.app, this.plugin, this.cardScope.tag as string, tagMatchModeOf(this.cardScope)).open(); });
+      }
       tool.createSpan({ cls: "kg-review-qlabel", text: "排序：" });
       const opts: { id: ListSort; label: string }[] = [
         { id: "forget", label: "最可能忘记" }, { id: "new", label: "🌱 新卡优先" }, { id: "recommend", label: "推荐" },
@@ -388,6 +564,7 @@ export class CardsView extends ItemView {
       { id: "folder", label: "📁 当前文件夹" },
       { id: "area", label: "🗂 知识区域" },
       { id: "exam", label: "📝 来源考试" },
+      { id: "tag", label: "🏷 标签" },   // Phase 22 §75：标签（exam 与 custom 之间）
       { id: "custom", label: "📚 自定义文件夹" },
     ];
     const modeRow = box.createDiv({ cls: "kg-row" });
@@ -420,6 +597,33 @@ export class CardsView extends ItemView {
           const b = row.createEl("button", { cls: "kg-btn" + (this.cardScope.areaId === a.id ? " kg-btn-primary" : ""), text: (a.icon || "📁") + " " + a.name });
           b.addEventListener("click", () => this.applyArea(a.id, a.folder || undefined));
         }
+      }
+    }
+    if (this.cardScope.mode === "tag") {
+      // Phase 22 §10~13/19：Tag Picker（NoteIndex 聚合，不扫 Markdown；count DESC 默认 / 名称 ASC 可切）
+      const all = aggregateNoteTags(Array.from(this.sourceTags.values()).map((tags) => ({ tags })));
+      const filtered = filterTagOptions(this.tagSortByName ? [...all].sort((a, b) => a.tag.localeCompare(b.tag) || b.count - a.count) : all, this.tagQuery);
+      const childMode = tagMatchModeOf(this.cardScope);
+      const toggleBtn = box.createEl("button", { cls: "kg-btn" + (childMode === "include-children" ? " kg-btn-primary" : ""), text: childMode === "include-children" ? "✓ 包含子标签（#游戏 含 #游戏/设计）" : "仅精确标签（#游戏 不含子标签）" });
+      toggleBtn.addEventListener("click", () => this.applyTag(this.cardScope.tag ?? "", childMode === "include-children" ? "exact" : "include-children"));
+      const sortBtn = box.createEl("button", { cls: "kg-btn", text: this.tagSortByName ? "按名称排序" : "按使用次数排序" });
+      sortBtn.addEventListener("click", () => { this.tagSortByName = !this.tagSortByName; this.renderList(); });
+      const tagSearch = box.createEl("input", { cls: "kg-input", attr: { placeholder: "🔎 过滤标签（中文/英文，0 AI）" } });
+      tagSearch.value = this.tagQuery;
+      tagSearch.addEventListener("input", () => { this.tagQuery = tagSearch.value; this.renderList(); });
+      if (filtered.length === 0) {
+        box.createDiv({ cls: "kg-empty", text: all.length === 0 ? "还没有任何笔记带标签。" : "没有匹配的标签。" });
+      } else {
+        const tagList = box.createDiv({ cls: "kg-row" });
+        for (const t of filtered.slice(0, 200)) {
+          const b = tagList.createEl("button", { cls: "kg-btn" + (this.cardScope.tag && normalizeTag(this.cardScope.tag) === t.tag ? " kg-btn-primary" : ""), text: "#" + t.tag + " · " + t.count + " 篇" });
+          b.addEventListener("click", () => this.applyTag(t.tag, childMode));
+        }
+        if (filtered.length > 200) box.createDiv({ cls: "kg-empty", text: "…还有 " + (filtered.length - 200) + " 个标签（用上方搜索缩小范围）" });
+      }
+      if (this.cardScope.tag) {
+        box.createEl("button", { cls: "kg-btn", text: "🗂 浏览该标签下的考试题（0 AI）" })
+          .addEventListener("click", () => { new TagExamPreviewModal(this.app, this.plugin, this.cardScope.tag as string, childMode).open(); });
       }
     }
     if (this.cardScope.mode === "custom") {
@@ -460,6 +664,13 @@ export class CardsView extends ItemView {
       return;
     }
     if (mode === "vault") { this.setScope(defaultSavedCardScope()); return; }
+    if (mode === "tag") {   // Phase 22：进入标签面板（保留原 tag 选择，避免闪空）
+      const base = this.cardScope;
+      this.setScope(base.mode === "tag"
+        ? { mode: "tag", tag: base.tag, tagMatchMode: tagMatchModeOf(base) }
+        : { mode: "tag" });
+      return;
+    }
     // area / exam / custom：保留编辑器内细化
     const base = { ...this.cardScope };
     this.setScope({ mode, areaId: base.areaId, examId: base.examId, folders: base.folders });
@@ -469,6 +680,12 @@ export class CardsView extends ItemView {
     this.setScope({ mode: "area", areaId, folderPath });
   }
   private applyCustom(folders: string[]): void { this.setScope({ mode: "custom", folders }); }
+  /** Phase 22：应用 Tag Scope（默认 include-children，§19/8/9/99） */
+  private applyTag(tag: string, mode: "exact" | "include-children"): void {
+    const t = normalizeTag(tag);
+    if (!t) { new Notice("请输入标签名。"); return; }
+    this.setScope({ mode: "tag", tag: t, tagMatchMode: mode });
+  }
 
   /* ================= 复习（§28/30/137：Rating=真实复习；Skip 不改 FSRS） ================= */
 
@@ -643,6 +860,8 @@ export class CardsView extends ItemView {
     next.disabled = this.reviewIndex >= total - 1;
     next.addEventListener("click", () => { if (this.reviewIndex < total - 1) { this.reviewIndex++; this.chosenOption = ""; this.ratingDone = false; this.renderReview(); } });
     // Phase 21.x：复习页也可删除当前卡（§6/7；后端仍走 plugin.deleteCard）
+    const editR = alt.createEl("button", { cls: "kg-btn", text: "✎ 编辑" });
+    editR.addEventListener("click", () => { this.openEditor(c); });
     const del = alt.createEl("button", { cls: "kg-btn kg-btn-danger", text: "删除这张卡" });
     del.addEventListener("click", () => { this.confirmDelete(c); });
   }

@@ -891,9 +891,10 @@ export interface ReviewScope {
 
 /** ---------- Phase 21：Saved Review Card 范围（§17~22；与 ReviewScope(笔记) 分离，不破坏 Phase 20） ---------- */
 
-export type SavedCardScopeMode = "vault" | "current-note" | "folder" | "area" | "exam" | "custom";
+export type SavedCardScopeMode = "vault" | "current-note" | "folder" | "area" | "exam" | "tag" | "custom";
 
-/** 「我的复习卡」范围（§17/19/20/21/22）：按 SavedReviewCard.sourcePath 过滤；exam 模式按 examId（§19）。
+/** 「我的复习卡」范围（§17/19/20/21/22/Phase22 Tag）：按 SavedReviewCard.sourcePath 过滤；exam 模式按 examId（§19）；
+ *  tag 模式 = 所有带该 Tag 的源笔记所对应的考试/复习卡内容（Phase 22：sourcePath→NoteIndex tags→filter，§6）。
  *  是 Scope 不是 Permission（§28 同语义）。 */
 export interface SavedCardScope {
   mode: SavedCardScopeMode;
@@ -901,6 +902,8 @@ export interface SavedCardScope {
   folderPath?: string;    // folder/area：sourcePath 前缀（§20/21）
   areaId?: string;
   examId?: string;        // exam：只显示 examId === 该考试（§19）
+  tag?: string;           // tag（Phase 22）：去掉前导 # 的规范化标签名
+  tagMatchMode?: "exact" | "include-children";   // Phase 22 §4：默认 include-children（§19）
   folders?: string[];     // custom：多个文件夹，最多 10（§22）
 }
 
@@ -1326,6 +1329,7 @@ export interface SavedReviewCard {
   lastReviewedAt?: number;
   createdAt: number;
   updatedAt: number;
+  editedAt?: number;      // Phase 22 §94~97（可选）：最近一次手动编辑时间（普通编辑；重置/迁移不改 createdAt）
 }
 
 /** 复习卡复习历史（§九十一：CardReviewRecord） */

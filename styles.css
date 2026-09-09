@@ -692,3 +692,11 @@
 .kg-card-del { align-self: flex-end; margin-top: 4px; }
 .kg-btn-danger { color: var(--color-red, #e53935); border-color: var(--color-red, #e53935); }
 .kg-btn-danger:hover { background: color-mix(in srgb, var(--color-red, #e53935) 10%, transparent); }
+/* Phase 22: Tag Scope / 搜索 / 卡片编辑器 */
+.kg-search { flex: 1 1 220px; min-width: 160px; }
+.kg-edit-field { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.kg-edit-field .kg-review-qlabel { width: 84px; flex-shrink: 0; }
+.kg-edit-field .kg-input { flex: 1; }
+.kg-edit-field textarea.kg-input { min-height: 56px; resize: vertical; }
+.kg-exam-modal .kg-select { background: var(--background-primary); color: var(--text-normal); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); padding: 4px 8px; }
+.kg-row.kg-edit-field { flex-wrap: wrap; }
