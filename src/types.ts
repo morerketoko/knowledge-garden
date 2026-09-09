@@ -1297,6 +1297,7 @@ export interface NoteExam {
   contentStrategy?: ExamContentStrategy;   // Phase 23 §64/65：本次考察内容策略（Markdown frontmatter 可读）
   repeatPolicy?: ExamRepeatPolicy;         // Phase 23 §64/65：避免重复策略（旧 Exam 缺省 → 见 parse 默认，仍参与去重 §67）
   previousExamCount?: number;              // Phase 23 §64（可选信息，不存完整历史 exclusion）
+  generationCacheKeys?: string[];          // Hotfix：本考试生成用到的 note_exam 缓存 key 清单（只存索引 cache/exams.json，不写 Markdown；旧考试无 → 删除时跳过精确失效）
 }
 
 /** 用户对单题的作答（§五十六 / 一百八十六） */

@@ -99,6 +99,18 @@ export class AICache {
     return this.entries.get(key);
   }
 
+  /** Hotfix：删除单个缓存条目（精确失效指定考试/任务对应 key；绝不用 clearType 波及他人，§26/27） */
+  remove(key: string): boolean {
+    if (!this.entries.has(key)) return false;
+    this.entries.delete(key);
+    try {
+      atomicWriteJson(this.file, Array.from(this.entries.values()));
+    } catch (e) {
+      console.error("[KnowledgeGarden][AI] 缓存删除写入失败：", (e as Error).message);
+    }
+    return true;
+  }
+
   /** 只缓存「有效结果」+ 元数据；绝不写入 API Key / header / 原始 prompt / 笔记全文 */
   put(entry: AICacheEntry): void {
     this.entries.set(entry.key, { ...entry, updatedAt: Date.now() });

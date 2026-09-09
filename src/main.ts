@@ -2544,6 +2544,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       return;
     }
     const history = buildExamHistoryContext(this.examStore.findBySource(file.path));   // §9/10：历史（压缩 + fingerprint，不复制全文）
+    const cacheKeys: string[] = [];   // Hotfix：记录本考试实际命中的 note_exam 缓存 key（用于删除时精确失效）
     const gen = await this.generateExamReliable({
       sourcePath: file.path,
       sourceVersion,
@@ -2564,6 +2565,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       repeatPolicy,
       history,
       force: p.force ?? false,
+      onCacheKey: (k) => { if (!cacheKeys.includes(k)) cacheKeys.push(k); },
     });
     if (!gen.ok) {
       this.examError = gen.error ?? "考试生成失败";
@@ -2595,6 +2597,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       this.examStore.update(exam.id, {
         questions, coverageTopics: gen.coverageTopics, contentStrategy, repeatPolicy,
         previousExamCount: history.examCount, examVersion: (exam.examVersion ?? 1) + 1, updatedAt: Date.now(),
+        generationCacheKeys: [...new Set([...(exam.generationCacheKeys ?? []), ...cacheKeys])],
       });
       const updated = this.examStore.get(exam.id)!;
       await this.writeExamMarkdown(updated);
@@ -2619,6 +2622,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       contentStrategy,
       repeatPolicy,
       previousExamCount: history.examCount,
+      generationCacheKeys: cacheKeys,   // Hotfix §29/30/34：只存 cache/exams.json 索引，不写 Markdown
       createdAt: now,
       updatedAt: now,
     };
@@ -2646,6 +2650,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     webEnabled: boolean; webContextLines: string[];
     skillInstructions?: string; workspaceFingerprint?: string; skillFingerprint?: string; contextHash?: string;
     contentStrategy: ExamContentStrategy; repeatPolicy: ExamRepeatPolicy; history: ExamHistoryContext; force: boolean;
+    onCacheKey: (key: string) => void;
   }): Promise<{ ok: true; questions: ExamQuestion[]; coverageTopics?: string[] } | { ok: false; error: string }> {
     const target = o.questionCount;
     const plan = planExamBatches(target);
@@ -2675,6 +2680,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
         historyFingerprint: o.history.historyFingerprint, diversityKey: diversity,
         historyLines: histLines || undefined, assignedTopics: assigned.length ? assigned : undefined,
         priorBatchQuestions: kept.length ? summaryOf(kept) : undefined,
+        onCacheKey: o.onCacheKey,
       }, o.force);   // force 仍遵守 history exclusion（§54/89/118）
       if (out.ok) return { ok: true, questions: filterValidExamQuestions(out.data.questions, count) };
       return { ok: false, code: out.error?.code, message: out.error?.message };
@@ -3048,6 +3054,61 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.cardReviews?.removeByCard(cardId);       // Phase 21 §39：CardReviewRecord
     this.rerenderDashboard();
     new Notice("已删除复习卡（0 AI）。");
+  }
+
+  /** Hotfix：删除指定考试（统一入口，§8/9）。删除顺序：定位 → Markdown 验证并删除 → Store → Session → 精确失效本考试 AI cache → 刷新。
+   *  保留：源笔记 / SavedReviewCard / Saved Card FSRS / CardReviewRecord / 其他 Exam 与其他缓存（§3/4/24~25）。全程 0 AI（§43）。 */
+  async deleteExam(examId: string): Promise<boolean> {
+    const exam = this.examStore.get(examId);
+    if (!exam) { new Notice("考试已经不存在。"); return false; }   // §13/18
+    // 1) Markdown：存在则校验 frontmatter examId 一致后删除（§6/7/10/11/41/42）；不存在 → 孤儿索引允许继续清理
+    const mdPath = examMarkdownPath(exam);
+    const file = this.app.vault.getAbstractFileByPath(normalizePath(mdPath));
+    let mdMissing = false;
+    if (file instanceof TFile) {
+      try {
+        const text = await this.app.vault.cachedRead(file);
+        if (!text.includes('examId: "' + examId + '"')) {
+          new Notice("考试文件与记录不符（examId 不一致），已停止删除以防误删文件。");
+          return false;
+        }
+        await this.app.vault.trash(file, true);
+      } catch {
+        new Notice("考试文件删除失败，考试仍然保留。");   // §41：停止，不删 Store（避免数据失配）
+        return false;
+      }
+    } else {
+      mdMissing = true;
+    }
+    // 2/3) Store + Session（§5/38/40）
+    this.examStore.remove(examId);
+    this.examSessions.remove(examId);
+    // 4) 精确失效本考试 AI cache（§26~32）：只删 exam.generationCacheKeys 对应条目；旧考试缺 key → 跳过并说明
+    let cacheRemoved = 0;
+    let cacheFailed = false;
+    for (const k of exam.generationCacheKeys ?? []) {
+      try { if (this.cache.remove(k)) cacheRemoved++; } catch { cacheFailed = true; }
+    }
+    // 5) 刷新相关 UI（§8/19~23）
+    this.rerenderDashboard();
+    this.notifyExamDeleted(exam.sourcePath);
+    const parts: string[] = [];
+    parts.push(mdMissing ? "考试文件不存在，已清理考试索引与会话记录。" : "已删除考试：《" + exam.title + "》。");
+    if (!(exam.generationCacheKeys ?? []).length) parts.push("旧考试缺少 cache key，未执行精确缓存删除（可忽略，不影响删除）。");
+    if (cacheFailed) parts.push("旧 AI 缓存未能全部自动清理。");
+    if (cacheRemoved > 0) parts.push("已精确失效 " + cacheRemoved + " 条该考试 AI 缓存。");
+    new Notice(parts.join(" "));
+    return true;
+  }
+
+  /** Hotfix：通知已打开的 Exam Review / Exam Session 视图“考试已被删除”（§22/23；0 AI） */
+  private notifyExamDeleted(sourcePath: string): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW)) {
+      (leaf.view as ExamReviewView).notifyDeleted(sourcePath);
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM)) {
+      (leaf.view as ExamSessionView).notifyDeleted(sourcePath);
+    }
   }
 
   /** 旧式记录复习卡复习（保留兼容入口；Phase 21 起路由到 FSRS rateSavedCard） */

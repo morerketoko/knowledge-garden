@@ -194,12 +194,35 @@ export class ExamSessionView extends ItemView {
   private skipLockUntil = 0;     // Hotfix2 §26：跳过连点 300ms 锁（HF2-13）
   private aiGrading = false;
   private aiResult: { correctness: string; score: number; strengths: string[]; missing: string[]; misconceptions: string[] } | null = null;
+  private deletedSource: string | null = null;   // Hotfix：考试被删除通知（§23）
 
   constructor(leaf: WorkspaceLeaf, private plugin: KnowledgeGardenPlugin) { super(leaf); }
 
   getViewType(): string { return VIEW_TYPE_EXAM; }
   getDisplayText(): string { return this.exam ? "📝 " + this.exam.title : "知识考试"; }
   getIcon(): string { return "graduation-cap"; }
+
+  /** Hotfix §23：考试被删除 → 会话不可继续，显示已删除；允许继续回到考试中心（无孤儿 session，main 已删） */
+  notifyDeleted(sourcePath: string): void {
+    if (this.exam && this.exam.sourcePath === sourcePath) this.exam = null;
+    if (!this.exam) this.deletedSource = sourcePath;
+    this.state = null;
+    this.refresh();
+  }
+
+  /** Hotfix §23：考试已被删除 → 会话不可继续，给出返回入口（不崩溃） */
+  private renderDeletedNotice(inner: HTMLElement): void {
+    inner.createDiv({ cls: "kg-empty", text: "该考试已被删除。" });
+    const row = inner.createDiv({ cls: "kg-row" });
+    const src = this.deletedSource;
+    row.createEl("button", { cls: "kg-btn kg-btn-primary", text: "返回当前笔记考试中心" })
+      .addEventListener("click", () => {
+        if (!src) return;
+        const f = this.plugin.app.vault.getAbstractFileByPath(src);
+        if (f instanceof TFile) this.plugin.openExamHubForFile(f);
+        else this.plugin.openExamHubForActive();
+      });
+  }
 
   async onOpen(): Promise<void> {
     this.containerEl.empty();
@@ -209,6 +232,7 @@ export class ExamSessionView extends ItemView {
     const examId = (this as unknown as { examIdParam?: string }).examIdParam;
     const st = this.plugin.getActiveExamSession();
     if (!st) {
+      if (this.deletedSource) { this.renderDeletedNotice(inner); return; }
       inner.createDiv({ cls: "kg-empty", text: "还没有进行中的考试。右键任意笔记 → 📝 构建知识考试，或从命令面板运行「构建知识考试」。" });
       return;
     }
@@ -244,6 +268,7 @@ export class ExamSessionView extends ItemView {
   private render(inner: HTMLElement): void {
     inner.empty();
     if (!this.exam || !this.state) {
+      if (this.deletedSource) { this.renderDeletedNotice(inner); return; }
       inner.createDiv({ cls: "kg-empty", text: "没有进行中的考试。" });
       return;
     }

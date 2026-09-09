@@ -27,7 +27,38 @@ function fmtDate(ts: number): string {
 
 /* ================= 考试中心 Modal（§43~48/80/129/130） ================= */
 
+/* ================= Hotfix：删除考试确认 Modal（§14/15/16；Obsidian Modal，危险样式，0 AI） ================= */
+
+class ExamDeleteConfirmModal extends Modal {
+  constructor(
+    app: App,
+    private exam: NoteExam,
+    private onConfirm: () => void
+  ) {
+    super(app);
+  }
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("kg-dashboard");
+    contentEl.createEl("h3", { text: "删除这场考试？" });
+    contentEl.createEl("p", { text: "《" + this.exam.title + "》 · " + this.exam.questionCount + " 题 · 创建 " + fmtDate(this.exam.createdAt) });
+    contentEl.createEl("p", { text: "将删除：这场考试、考试 Markdown、本场考试答题进度。" });
+    contentEl.createEl("p", { text: "不会删除：原笔记、已收藏复习卡、复习卡 FSRS、复习历史、其他考试。" });
+    contentEl.createEl("p", { text: "注意：删除后无法从考试中心恢复。" });
+    const row = contentEl.createDiv({ cls: "kg-row" });
+    row.createEl("button", { cls: "kg-btn", text: "取消" }).addEventListener("click", () => this.close());
+    row.createEl("button", { cls: "kg-btn kg-btn-danger", text: "删除考试" }).addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 考试中心 Modal（§43~48/80/129/130） */
 export class NoteExamHubModal extends Modal {
+  private deleting = new Set<string>();   // Hotfix §18：per-exam 防连点
   constructor(app: App, private plugin: KnowledgeGardenPlugin, private sourcePath: string) {
     super(app);
   }
@@ -93,6 +124,20 @@ export class NoteExamHubModal extends Modal {
       const cardsBtn = actions.createEl("button", { cls: "kg-btn", text: "📚 已收藏 " + savedCount + " 张" });
       cardsBtn.addEventListener("click", () => { this.close(); void plugin.openCardsView({ scope: { mode: "exam", examId: e.id } }); });   // §52/57
     }
+    // Hotfix：🗑 删除考试（统一入口 main.deleteExam；保留卡/FSRS/历史/其他考试，§三/八；0 AI）
+    const delBtn = actions.createEl("button", { cls: "kg-btn kg-btn-danger", text: "🗑 删除" });
+    delBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();   // §17：避免同时触发回顾/打开
+      if (this.deleting.has(e.id)) return;   // §18：防连点
+      new ExamDeleteConfirmModal(this.app, e, () => {
+        if (this.deleting.has(e.id)) return;
+        this.deleting.add(e.id);
+        void plugin.deleteExam(e.id).then((ok) => {
+          this.deleting.delete(e.id);
+          if (ok) this.onOpen();   // §19/20/21/50/51：重列当前考试（N→N-1；删空→空状态）
+        });
+      }).open();
+    });
   }
 
   onClose(): void { this.contentEl.empty(); }
@@ -104,6 +149,7 @@ export class ExamReviewView extends ItemView {
   private exam: NoteExam | null = null;
   private qIndex = 0;
   private savedByQuestion = new Map<string, boolean>();
+  private deletedSource: string | null = null;   // Hotfix：考试被删除通知（§22）
 
   constructor(leaf: WorkspaceLeaf, private plugin: KnowledgeGardenPlugin) { super(leaf); }
 
@@ -111,11 +157,19 @@ export class ExamReviewView extends ItemView {
   getDisplayText(): string { return this.exam ? "回顾 · " + this.exam.title : "考试回顾"; }
   getIcon(): string { return "book-open"; }
 
+  /** Hotfix §22：考试被删除 → 显示“该考试已被删除”，可返回考试中心；绝不崩溃 */
+  notifyDeleted(sourcePath: string): void {
+    if (this.exam && this.exam.sourcePath === sourcePath) this.exam = null;
+    if (!this.exam) this.deletedSource = sourcePath;
+    this.render();
+  }
+
   loadExam(examId: string): void {
     const e = this.plugin.examStore.get(examId);
     if (!e) { new Notice("考试不存在或已删除（收藏卡不受影响）。"); return; }
     this.exam = e;
     this.qIndex = 0;
+    this.deletedSource = null;
     this.syncSavedMap();
     this.render();
   }
@@ -153,6 +207,13 @@ export class ExamReviewView extends ItemView {
     const inner = this.containerEl.querySelector(".kg-inner") as HTMLElement | null;
     if (!inner) return;
     inner.empty();
+    if (!this.exam && this.deletedSource) {   // Hotfix §22：该考试已被删除
+      inner.createDiv({ cls: "kg-empty", text: "该考试已被删除。" });
+      inner.createDiv({ cls: "kg-row" })
+        .createEl("button", { cls: "kg-btn kg-btn-primary", text: "返回当前笔记考试中心" })
+        .addEventListener("click", () => { new NoteExamHubModal(this.app, this.plugin, this.deletedSource as string).open(); });
+      return;
+    }
     const e = this.exam;
     if (!e) return;
     const q = e.questions[this.qIndex];

@@ -140,6 +140,8 @@ export interface AIGenerateRequest extends AICallOpts {
   customKeyParts?: string[];
   /** Capture Processing：来源 Capture 路径（validate 填充 candidate.sourcePath） */
   processingSourcePath?: string;
+  /** Hotfix：请求实际使用的缓存 key 回调（考试删除精确失效用，§29/30） */
+  onCacheKey?: (key: string) => void;
 }
 
 function cap(s: string, max: number): string {
@@ -262,6 +264,7 @@ export class AIService {
 
   private async exec<T>(req: AIGenerateRequest, force: boolean): Promise<AIOutcome<T>> {
     const key = this.buildKey(req);
+    req.onCacheKey?.(key);   // Hotfix：把真实缓存 key 暴露给调用方（如考试生成后记录，用于精确失效）
     const kf = force ? key + ":force" : key;
 
     // 1) 未强制且缓存命中 → 直接复用（成功或已缓存的错误，都不再请求）
@@ -940,6 +943,7 @@ export class AIService {
       historyLines?: string;                   // Phase 23：压缩历史题干/concept（仅排除用）
       assignedTopics?: string[];               // Phase 23：本批建议覆盖主题
       priorBatchQuestions?: string;            // Phase 23：已生成批次摘要
+      onCacheKey?: (key: string) => void;      // Hotfix：记录本考试实际命中的缓存 key
     },
     force = false
   ): Promise<AIOutcome<{ title: string; coverageTopics?: string[]; questions: ExamQuestion[] }>> {
@@ -998,6 +1002,7 @@ export class AIService {
       // Phase 21.x Hotfix：maxTokens 随题数联动（>15 题时提升预算，避免输出截断成非法 JSON）
       chatOpts: this.chatOpts("note_exam_generation", examGenerationMaxTokens(opts.questionCount)),
       allowReview: false,
+      onCacheKey: opts.onCacheKey,
     }, force);
   }
 
