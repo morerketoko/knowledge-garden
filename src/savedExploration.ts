@@ -7,7 +7,7 @@
 import type { DiscoveryScope, SavedExploration, SavedExplorationEdge, SavedExplorationNode, SavedExplorationSource } from "./types";
 import { fingerprintKey } from "./ai/cache";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
-import * as fs from "./portable/fsPortable";
+import * as fs from "fs";
 
 /** 收藏文件名安全化（§十五：YYYY-MM-DD <title>.md；防路径注入） */
 export function safeTitle(text: string, max = 48): string {

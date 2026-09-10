@@ -3,8 +3,8 @@
  *  快照幂等（§九）：同一 periodKey 重复 upsert 为覆盖，绝不 append 相同快照。
  *  生命周期（§四十三）：只保留最近 keepWeeks（默认 52）个快照；历史快照不因删除/改名而篡改（§四十四）。
  */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import type { KnowledgeEvolutionSnapshot, PersistentQuestion } from "./types";
 import { mergeQuestions } from "./knowledgeEvolution";
 import { atomicWriteJson, isolateCorruptFile, withFormatVersion } from "./migrations";

@@ -11,24 +11,7 @@ cache/
 *.corrupt-*
 .tmp/
 
-# Phase 24：便携存储（桌面旧位置 + Vault 内新位置）
-# 这些是运行时状态（索引 / Activity / AI 缓存 / FSRS / 考试 …），不属于源码
-**/.state/
-.state/
-
-# 测试临时目录（便携存储的 Node 测试会用到）
-.kg-tests/
-.kgvault-probe/
-tests/.build/
-
-# 数据恢复备份（v1.1.0 布局 bug 的一次性备份，仅本地保留）
-cache-recovery-backup/
-
 # 系统文件
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# 一次性提交信息文件（避免误提交）
-.kgmsg*.txt
-

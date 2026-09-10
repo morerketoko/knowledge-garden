@@ -4,7 +4,6 @@
  * - 第二层：extractEvidenceSnippet 返回真实原文片段；existingVaultSources 过滤已删除的 vault source。
  * - 全部纯函数，0 AI 请求，无 Obsidian DOM 依赖。
  */
-import "./portable-bootstrap";
 import { linkifyAnswerText, extractEvidenceSnippet, existingVaultSources } from "../src/workbenchLinks";
 import type { AIAnswerSource } from "../src/types";
 

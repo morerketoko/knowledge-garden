@@ -1,15 +1,12 @@
 /**
  * Phase 9：统一数据版本化 / 损坏隔离 / 原子写（§三~五 / §八~十三 / §七十）。
- * Phase 24：改为平台无关实现 —— 不再 import Node fs/path，改用 portable 存储层：
- * 桌面与 iOS/Android 走同一套代码，路径一律是存储根相对路径，绝不产生绝对路径。
- *
  * - FORMAT_VERSION：持久化文件顶层版本号（未知字段一律保留，绝不 parse→rewrite 删字段）。
- * - isolateCorruptFile：损坏文件移入 `.corrupt/` 并保留可恢复副本（§九/§十二）。
- * - atomicWriteJson：写 `.tmp` 后 rename 原子替换；rename 不可用时退化为直接写（§十三：
- *   原子性以平台能力为准，不假装移动端存在 fs atomic rename）。
- * 本模块不依赖 Obsidian API（只依赖 portable 层），便于 Node 自动测试。
+ * - isolateCorruptFile：损坏的 cache 文件隔离重命名为 *.corrupt-YYYYMMDD-HHmmss，不直接覆盖（§九：不能丢唯一原文件）。
+ * - atomicWriteJson：写 .tmp 后 rename 原子替换，避免崩溃留下半截文件（§七十 Crash Consistency）。
+ * 本模块不依赖 Obsidian API，便于 Node 自动测试。
  */
-import * as fs from "./portable/fsPortable";
+import * as fs from "fs";
+import * as path from "path";
 
 /** 当前持久化格式版本 */
 export const FORMAT_VERSION = 1;
@@ -31,96 +28,31 @@ export function corruptStamp(now = new Date()): string {
   );
 }
 
-/** 损坏副本目标路径：<dir>/.corrupt/<name>.<stamp>（纯字符串，无 Node path） */
-export function corruptTargetPath(filePath: string, now = new Date()): string {
-  const p = String(filePath).replace(/\\/g, "/");
-  const i = p.lastIndexOf("/");
-  const dir = i < 0 ? "" : p.slice(0, i);
-  const name = i < 0 ? p : p.slice(i + 1);
-  const stamp = name + "." + corruptStamp(now);
-  return dir ? dir + "/.corrupt/" + stamp : ".corrupt/" + stamp;
-}
-
 /**
- * 损坏文件隔离：<file> → <dir>/.corrupt/<name>.<stamp>（保留可恢复副本，不直接删除）。
- * 返回是否真的执行了隔离（文件存在且移动成功）。失败不抛错（不阻塞启动）。
+ * 损坏文件隔离：<file> → <file>.corrupt-<stamp>。
+ * 返回是否真的执行了隔离（文件存在且 rename 成功）。失败不抛错（不阻塞启动）。
  */
 export function isolateCorruptFile(filePath: string): boolean {
   try {
     if (!fs.existsSync(filePath)) return false;
-    fs.renameSync(filePath, corruptTargetPath(filePath));
+    fs.renameSync(filePath, filePath + ".corrupt-" + corruptStamp());
     return true;
   } catch {
-    // rename 不可用（后端不支持）→ 读出来写到副本再删原文件，语义等价
-    try {
-      const raw = fs.readFileSync(filePath, "utf8");
-      fs.writeFileSync(corruptTargetPath(filePath), raw);
-      fs.unlinkSync(filePath);
-      return true;
-    } catch {
-      return false;
-    }
+    return false;
   }
 }
 
 /**
- * 原子写 JSON（平台无关）。
- *
- * 关键正确性要求（v1.1.1 事故复盘）：
- * `fsPortable.renameSync` 会更新**内存镜像**并把目标标脏，落盘是 800ms 防抖的异步过程。
- * 如果只依赖它，进程在防抖窗口内退出（插件卸载 / 关窗 / 崩溃）时，
- * 磁盘上的目标文件仍是**旧字节**，而内存里是新的 —— 下次启动读到残缺状态。
- * 真实症状：`index.json` 507 字节（1 条笔记）、`index.json.tmp` 12.7KB（37 条笔记），
- * 于是 Dashboard 几乎全部显示为「新知识」。
- *
- * 因此这里显式做三步，保证「同步写目标 + 清理临时文件」：
- *  1. 写 `<file>.tmp`（模拟 Node fs 的原子写语义，同时保留 mid-write 崩溃的可恢复副本）；
- *  2. rename 到目标（更新镜像，并让本次写入尽快落盘）；
- *  3. **同步再写一次目标**，确保镜像与目标内容一致（不依赖异步落盘时机）。
- * rename 不可用时退化为直接写目标；两种情况都会清理临时文件。
+ * 原子写 JSON：先写 <file>.tmp 再 rename 覆盖。
+ * - mkdir 父目录（递归）
+ * - 写失败/rename 失败时抛错由调用方捕获（与原有 writeFileSync 错误处理一致）
  */
 export function atomicWriteJson(filePath: string, value: unknown): void {
-  const data = JSON.stringify(value);
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
   const tmp = filePath + ".tmp";
-  try {
-    fs.writeFileSync(tmp, data, "utf8");
-    fs.renameSync(tmp, filePath);
-  } catch {
-    // rename 不可用：清掉临时文件，直接写目标
-    try { fs.unlinkSync(tmp); } catch { /* 临时文件可能不存在 */ }
-  }
-  // 同步再写一次目标（内存镜像即时生效），随后**立即落盘**：
-  // 便携层的常规落盘是 800ms 防抖，索引重建/状态保存不能等 —— 进程在窗口内退出会丢。
-  fs.writeFileSync(filePath, data, "utf8");
-  fs.flushMirrorSoon();
-}
-
-/**
- * 修复「临时写残留」：`<file>.tmp` 与 `<file>` 同时存在时，若目标为空或非法，
- * 而临时文件是合法 JSON 且信息量更大，则用临时文件替换目标（只增不减，§三十一）。
- *
- * 返回修复的文件数。用于启动时的状态完整性巡检。
- */
-export function repairStaleTempFiles(filePaths: string[], measure: (raw: string) => number): number {
-  let fixed = 0;
-  for (const target of filePaths) {
-    const tmp = target + ".tmp";
-    try {
-      if (!fs.existsSync(tmp)) continue;
-      const tmpRaw = fs.readFileSync(tmp, "utf8");
-      let tmpWeight = 0;
-      try { tmpWeight = measure(tmpRaw); } catch { continue; }
-      if (tmpWeight <= 0) continue;
-      let targetWeight = 0;
-      if (fs.existsSync(target)) {
-        try { targetWeight = measure(fs.readFileSync(target, "utf8")); } catch { targetWeight = 0; }
-      }
-      if (targetWeight >= tmpWeight) continue; // 目标已够好 → 只清理临时文件
-      fs.writeFileSync(target, tmpRaw, "utf8");
-      fixed++;
-    } catch { /* 单个文件失败不影响其它文件 */ }
-  }
-  return fixed;
+  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
+  fs.renameSync(tmp, filePath);
 }
 
 /**

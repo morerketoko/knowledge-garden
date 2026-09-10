@@ -1,6 +1,6 @@
 /** Query History：cache/query-history.json（§五十五）。只存 query/时间/范围/缓存键/标题（§五十四）。 */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import { atomicWriteJson, FORMAT_VERSION, isolateCorruptFile } from "./migrations";
 import type { QueryHistoryEntry } from "./types";
 

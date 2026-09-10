@@ -1,6 +1,6 @@
 import { App, TFile, TFolder, normalizePath, Notice } from "obsidian";
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import type { KnowledgeArea } from "./types";
 

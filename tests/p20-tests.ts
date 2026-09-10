@@ -3,7 +3,6 @@
  * 不能实测 Obsidian 运行时的部分（§101-105/142-168 的 UI/AI 类）在最终报告标 NOT TESTED。
  * 本文件只依赖 Node 可跑的纯模块（spacedReview / reviewCenter / reviewAnswer / activity / migrations / ts-fsrs）。
  */
-import { mkdtemp, stateExists, readStateText, seedStateText, stateList } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -39,7 +38,7 @@ function eqSet(a: string[], b: string[]): boolean {
 }
 
 function tmpRoot(tag: string): string {
-  return mkdtemp(path.join(os.tmpdir(), "kg-p20-" + tag + "-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "kg-p20-" + tag + "-"));
 }
 
 const DAY = 86400000;
@@ -283,7 +282,7 @@ function makeGraduated(s: FsrsScheduler, start: number): SpacedReviewCard {
   const cardA = makeGraduated(s, NOW - 40 * DAY);
   cardA.path = "A.md";
   spaced.commitReview("A.md", cardA, { timestamp: NOW, rating: "good", previousDue: NOW - DAY, nextDue: NOW + DAY, intervalDays: 1, stability: 10, difficulty: 5, retrievability: 0.9 });
-  const fileBefore = readStateText(path.join(dir, "cache", "spaced-review.json"));
+  const fileBefore = fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8");
 
   const q: ReviewQueue = {
     periodKey: "daily:2026-01-15", createdAt: NOW,
@@ -293,13 +292,13 @@ function makeGraduated(s: FsrsScheduler, start: number): SpacedReviewCard {
   const freshQueue = (): ReviewQueue => JSON.parse(JSON.stringify(q)) as ReviewQueue;
   // Skip：只改 queue（markSkipped），spaced 文件不变（P20-21/24）
   rc.setQueue(markSkipped(freshQueue(), "A.md"));
-  test("P20-21", readStateText(path.join(dir, "cache", "spaced-review.json")) === fileBefore
+  test("P20-21", fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8") === fileBefore
     && spaced.count() === 1 && spaced.get("A.md")?.fsrsState.due === cardA.fsrsState.due,
     "Skip：不调用 FSRS、不改 stability/difficulty/due（§10/21）");
   test("P20-24", activity.get("A.md")?.reviewCount === undefined, "Skip：reviewCount 不变（§24）");
   // Snooze：只改 queue（markSnoozed），spaced 文件不变（P20-22）
   rc.setQueue(markSnoozed(freshQueue(), "A.md", NOW + 3 * DAY));
-  test("P20-22", readStateText(path.join(dir, "cache", "spaced-review.json")) === fileBefore
+  test("P20-22", fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8") === fileBefore
     && (rc.getQueue()?.items.find((i) => i.path === "A.md")?.snoozedUntil as number) > NOW,
     "Snooze：不调用 FSRS，只改 session/queue（§11/22）");
   // Rating（FSRS）→ 只有真正评分才更新 FSRS + Activity.reviewCount+1（P20-23）
@@ -316,10 +315,10 @@ function makeGraduated(s: FsrsScheduler, start: number): SpacedReviewCard {
   test("P20-23", spaced.get("A.md")?.reviewCount === 4 && activity.get("A.md")?.reviewCount === 1,
     "FSRS rating → FSRS 卡 reviewCount+1 且 activity.reviewCount+1（§23）");
   // Refresh（重算队列）= 只写 review-queue；spaced 文件与 activity 不变（P20-25）
-  const fileAfterRating = readStateText(path.join(dir, "cache", "spaced-review.json"));
+  const fileAfterRating = fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8");
   const activityAfter = activity.get("A.md")?.reviewCount;
   rc.setQueue(freshQueue());
-  test("P20-25", readStateText(path.join(dir, "cache", "spaced-review.json")) === fileAfterRating
+  test("P20-25", fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8") === fileAfterRating
     && activity.get("A.md")?.reviewCount === activityAfter && spaced.logsAll().length === 2,
     "Refresh：不改 FSRS、不加 review log、不改 reviewCount（§25/35）");
   fs.rmSync(dir, { recursive: true, force: true });
@@ -383,7 +382,8 @@ function makeGraduated(s: FsrsScheduler, start: number): SpacedReviewCard {
 /* ============ P20-35：旧 cache（legacy review-queue.json）加载 ============ */
 {
   const dir = tmpRoot("legacy");
-  seedStateText(path.join(dir, "cache", "review-queue.json"), JSON.stringify({
+  fs.mkdirSync(path.join(dir, "cache"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "cache", "review-queue.json"), JSON.stringify({
     queue: {
       periodKey: "daily:2026-01-15", createdAt: NOW,
       items: [
@@ -405,17 +405,17 @@ function makeGraduated(s: FsrsScheduler, start: number): SpacedReviewCard {
 /* ============ P20-36/37：损坏隔离 + 原子写 ============ */
 {
   const dir = tmpRoot("corrupt");
-  seedStateText(path.join(dir, "cache", "spaced-review.json"), "{ not json !!");
+  fs.mkdirSync(path.join(dir, "cache"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "cache", "spaced-review.json"), "{ not json !!", "utf8");
   const spaced = new SpacedReviewStore(dir);
   const isolated = spaced.load();
-  // Phase 24 §十二：损坏隔离不再是 *.corrupt-* 文件，而是 cache/.corrupt/ 目录里的副本
-  const corruptFiles = (stateList(path.join(dir, "cache", ".corrupt")));
+  const corruptFiles = fs.readdirSync(path.join(dir, "cache")).filter((f) => f.includes(".corrupt-"));
   test("P20-36", isolated && corruptFiles.length === 1 && spaced.count() === 0 && spaced.logsAll().length === 0,
-    "损坏文件隔离到 cache/.corrupt/（保留副本），恢复空状态（§12/§36）");
+    "损坏文件隔离为 *.corrupt-*，恢复空状态（§36）");
   const s = sched();
   const card = makeGraduated(s, NOW);
   spaced.commitReview("A.md", { ...card, path: "A.md" }, { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 10, difficulty: 5, retrievability: 0.9 });
-  const files = stateList(path.join(dir, "cache"));
+  const files = fs.readdirSync(path.join(dir, "cache"));
   test("P20-37", files.includes("spaced-review.json") && !files.some((f) => f.endsWith(".tmp")),
     "原子写：无 .tmp 残留（§37）");
   const reload = new SpacedReviewStore(dir);

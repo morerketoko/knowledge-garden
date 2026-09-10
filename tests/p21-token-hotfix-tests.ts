@@ -3,7 +3,6 @@
  * 覆盖：题数联动 token 预算（examGenerationMaxTokens）、finish_reason=length 截断识别（truncationError）、
  * service/provider 接线（结构断言）。
  */
-import "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { examGenerationMaxTokens } from "../src/prompts";

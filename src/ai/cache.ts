@@ -1,14 +1,13 @@
+import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 import type { AICacheEntry, AICacheType } from "../types";
 import { atomicWriteJson, isolateCorruptFile } from "../migrations";
-import { sha256Hex } from "../portable/hash";
-import * as fs from "../portable/fsPortable";
-import { joinVaultPath } from "../portable/paths";
 
 /** ---------- 纯函数：指纹与周期键（无 Obsidian 依赖，便于验证） ---------- */
 
 export function sha256(text: string): string {
-  // Phase 24 §十四/十五：browser-safe 同步 SHA-256（替代 crypto.createHash）
-  return sha256Hex(text);
+  return crypto.createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 /** 稳定 key：按给定部件组合后 sha256 */
@@ -71,7 +70,7 @@ export class AICache {
   private entries = new Map<string, AICacheEntry>();
 
   constructor(pluginDir: string) {
-    this.file = joinVaultPath(pluginDir, "cache", "ai-cache.json");
+    this.file = path.join(pluginDir, "cache", "ai-cache.json");
   }
 
   /** 启动时恢复（离线可读）。损坏/结构非法 → 隔离 *.corrupt-* 后重建空缓存（§九/§十），返回是否执行了隔离 */

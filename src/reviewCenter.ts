@@ -2,8 +2,8 @@
  * - 纯函数 + 本地 JSON 存储，绝无 Obsidian / AI 依赖：队列是「本地可执行状态」，AI 只是增强问题的增强层（§十一/六十四）。
  * - 系统建议 ≠ 用户完成：只有用户点「✓ 已复习」才 markReviewed（§三/六十九/七十）。
  * - file-open / AI 复习问题绝不写 lastReviewedAt（§六十七/六十八/六十九）。 */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import type { NoteMetadata } from "./noteIndex";
 import type {

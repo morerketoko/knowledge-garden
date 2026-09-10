@@ -5,7 +5,6 @@
  * Retrievability(§101)、MC 卡序列化(§102)、Exam Hub 数据层(§103)、Exam↔Card(§105)、
  * FSRS 共用(§106)、Source(§107)、Cache 独立(§109)、Migration(§110)、Queue(§70/71)。
  */
-import { mkdtemp, stateExists, readStateText, seedStateText, stateList } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -27,7 +26,7 @@ function test(id: string, pass: boolean, detail: string): void {
   results.push({ id, pass, detail });
   console.log((pass ? "PASS" : "FAIL") + " " + id + " :: " + detail);
 }
-function tmpRoot(tag: string): string { return mkdtemp(path.join(os.tmpdir(), "kg-p21-" + tag + "-")); }
+function tmpRoot(tag: string): string { return fs.mkdtempSync(path.join(os.tmpdir(), "kg-p21-" + tag + "-")); }
 function eqSet(a: string[], b: string[]): boolean { return a.length === b.length && a.every((x) => b.includes(x)); }
 
 const DAY = 86400000;
@@ -277,7 +276,7 @@ function sampleCards(): SavedReviewCard[] {
 /* ============ P21-50..52：Cache 独立（§109） ============ */
 {
   const dir = tmpRoot("cache");
-  
+  fs.mkdirSync(path.join(dir, "cache"), { recursive: true });
   const spaced = new SpacedReviewStore(dir);
   spaced.load();
   spaced.scCommitReview("c1", savedState("c1", NOW + DAY, 5, 70), { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 5, difficulty: 5, retrievability: 1 });
@@ -285,7 +284,7 @@ function sampleCards(): SavedReviewCard[] {
   cardStore.load();
   cardStore.add({ id: "c1", sourcePath: "a.md", sourceVersion: "v1", question: "题", answer: "答", questionType: "recall", createdAt: NOW, updatedAt: NOW });
   // 模拟 AI Cache 文件被清（独立文件）
-  seedStateText(path.join(dir, "cache", "ai-cache.json"), JSON.stringify({ entries: [] }), "utf8");
+  fs.writeFileSync(path.join(dir, "cache", "ai-cache.json"), JSON.stringify({ entries: [] }), "utf8");
   fs.rmSync(path.join(dir, "cache", "ai-cache.json"), { force: true });
   const spaced2 = new SpacedReviewStore(dir);
   spaced2.load();
@@ -300,9 +299,9 @@ function sampleCards(): SavedReviewCard[] {
 /* ============ P21-53..56：Migration（§110/38/55） ============ */
 {
   const dir = tmpRoot("mig");
-  
-  seedStateText(path.join(dir, "cache", "cards.json"), JSON.stringify({ formatVersion: 1, entries: [{ id: "old1", sourcePath: "a.md", sourceVersion: "v1", question: "旧卡", answer: "旧答案", questionType: "recall", createdAt: NOW, updatedAt: NOW }] }), "utf8");
-  seedStateText(path.join(dir, "cache", "card-reviews.json"), JSON.stringify({ formatVersion: 1, records: [{ cardId: "old1", reviewedAt: NOW, rating: "good" }] }), "utf8");
+  fs.mkdirSync(path.join(dir, "cache"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "cache", "cards.json"), JSON.stringify({ formatVersion: 1, entries: [{ id: "old1", sourcePath: "a.md", sourceVersion: "v1", question: "旧卡", answer: "旧答案", questionType: "recall", createdAt: NOW, updatedAt: NOW }] }), "utf8");
+  fs.writeFileSync(path.join(dir, "cache", "card-reviews.json"), JSON.stringify({ formatVersion: 1, records: [{ cardId: "old1", reviewedAt: NOW, rating: "good" }] }), "utf8");
   const cs = new ReviewCardStore(dir);
   test("P21-53", cs.load() === false && cs.count() === 1 && cs.get("old1")?.question === "旧卡", "旧 cards.json 加载（§53）");
   const cr = new CardReviewStore(dir);
@@ -316,7 +315,7 @@ function sampleCards(): SavedReviewCard[] {
   test("P21-55b", first.next.due > NOW && spaced.scGet("old1") === undefined,
     "首次评分 createEmptyCard 语义可用（状态创建由 main.rateSavedCard 负责，§38）");
   // P21-56：corrupt spaced 隔离
-  seedStateText(path.join(dir, "cache", "spaced-review.json"), "{broken", "utf8");
+  fs.writeFileSync(path.join(dir, "cache", "spaced-review.json"), "{broken", "utf8");
   const corrupt = new SpacedReviewStore(dir);
   test("P21-56", corrupt.load() === true && corrupt.scCount() === 0 && corrupt.count() === 0,
     "corrupt spaced-review.json 隔离为空（§56/36）");
@@ -329,14 +328,14 @@ function sampleCards(): SavedReviewCard[] {
   const spaced = new SpacedReviewStore(dir);
   spaced.load();
   spaced.scCommitReview("c1", savedState("c1", NOW + DAY, 5, 70), { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 5, difficulty: 5, retrievability: 1 });
-  const raw = JSON.parse(readStateText(path.join(dir, "cache", "spaced-review.json"))) as Record<string, unknown>;
+  const raw = JSON.parse(fs.readFileSync(path.join(dir, "cache", "spaced-review.json"), "utf8")) as Record<string, unknown>;
   test("P21-60a", raw.formatVersion === 2 && typeof raw.savedCards === "object" && Array.isArray(raw.savedCardReviewLogs),
     "同文件 formatVersion=2：savedCards + savedCardReviewLogs（§6/123，不新建第二文件）");
   const log = (raw.savedCardReviewLogs as SavedCardReviewLogEntry[])[0];
   const keys = ["cardId", "timestamp", "rating", "previousDue", "nextDue", "intervalDays", "stability", "difficulty", "retrievability"];
   test("P21-60b", keys.every((k) => k in log) && !("prompt" in log) && !("content" in log), "Saved Card Review Log 字段白名单（§7）");
   // v1 文件容错
-  seedStateText(path.join(dir, "cache", "spaced-review.json"), JSON.stringify({ formatVersion: 1, cards: {}, reviewLogs: [] }), "utf8");
+  fs.writeFileSync(path.join(dir, "cache", "spaced-review.json"), JSON.stringify({ formatVersion: 1, cards: {}, reviewLogs: [] }), "utf8");
   const v1 = new SpacedReviewStore(dir);
   v1.load();
   test("P21-60c", v1.scCount() === 0 && v1.count() === 0, "v1 文件容错加载（savedCards 缺失 → 空，§6/38）");

@@ -205,99 +205,10 @@ AI 把几篇笔记连成一条**有解释的路径**——「为什么这几篇�
 | 捕获 / 候选 / 已确认知识 | `Knowledge Garden/`（Inbox / Processing / Knowledge / Archive） | 都是 Markdown 文件 |
 | 已确认知识关系 | `Relationships/` | Markdown 落盘，可随 Vault 恢复 |
 | 收藏链路 | `Saved/` | Markdown 落盘 |
-| 程序状态（索引 / Activity / AI 缓存 / FSRS / 考试 / 复习卡 / Workbench 会话 / Prompt / 项目） | `Knowledge Garden/.state/` | 桌面与移动共用同一位置；可随时清空，不影响你的知识 |
+| AI 缓存与程序状态 | 插件目录 `cache/` 等 | 可随时清空，不影响你的知识 |
 | 设置与 AI Key | 插件目录 `data.json` | **仅本地**，`.gitignore` 已排除，不会上传 |
 
-**为什么状态目录变了？** 从 Phase 24 起，插件状态从 `.obsidian/plugins/knowledge-garden/cache/` 迁到 `Knowledge Garden/.state/`，因为 `.obsidian` 在 Obsidian 移动端（iOS / Android）无法可靠读写。旧文件会在首次启动时自动复制到新位置，**旧文件不会被删除**；若仓库无法写入（只读 / 同步冲突），插件会自动改用 Obsidian Plugin Data 存储并在启动时提示。
-
-**自愈机制**：损坏的缓存会被自动隔离到 `Knowledge Garden/.state/cache/.corrupt/`（保留可恢复副本，不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
-
-**v1.1.4 索引完整性守衞（Phase 24.2）**：找到了「复习卡/考试消失」最根本的那一步 —— **启动顺序**。
-
-旧顺序（v1.1.0~v1.1.3）：
-
-```
-NoteIndex.load  →  activity.prune  →  spaced.prune  →  …  →  void ensureIndexesAgainstAssets()
-```
-
-当 `index.json` 只剩 37 条时，`activity.prune` / `spaced.prune` 会拿这 37 条当依据，判定其余 4300 篇笔记「已删除」，从而**永久删除** Activity 与 FSRS 卡片；而资产索引修复排在最后、还是 fire-and-forget。
-
-v1.1.4 的新顺序：
-
-```
-NoteIndex.load → **IndexIntegrityCheck**（不健康就全量重扫）→ 只有健康才允许 prune
-              → Activity.load → FSRS.load → ExamStore.load → CardStore.load
-              → **await 资产索引重建（cards/exams）** → 只写索引、绝不改 Markdown
-              → 写恢复标记 → rerenderDashboard
-```
-
-新增能力：
-
-- `isIndexHealthy()`：`healthy = indexed >= max(1, floor(vaultNotes × 0.95))`，vault 笔记数**排除** `.obsidian/` 与插件资产目录（Review Cards / Exams 等）。
-- 索引不健康 → `console.warn("[KnowledgeGarden][Integrity] index suspicious; skip prune")`，**跳过全部破坏性 prune**（Activity / FSRS / Review Queue / Discovery）。
-- `repairIndexFromAssets()`：从 Markdown **确定性**重建索引（递归含子目录），逐文件报告 `broken`，损坏文件**不删除**、其余卡片保留。
-- 恢复后立即校验「内存 == 磁盘」，并 `flushMirrorSoon()` 强制落盘（只写内存不算恢复）。
-- Diagnostics 新增：Index Health / Activity Coverage / Knowledge State / Created Age / 资产索引恢复结果 / Recovery Marker。
-- 恢复标记 `portableRecoveryVersion = 4`，记录 `cardsRestored / examsRestored / cardsBroken / activityEntries / fsrsPresent / indexHealthy`。
-
-**关于 Dashboard「全部 new」的结论**（v1.1.4 已可诊断）：`deriveState()` 的第一条规则是
-`created ≤ newDays → new`。因此「全部 new」只有两种可能，Diagnostics 现在会直接给出归因：
-
-- `created` 时间集中在最近 7 天（Obsidian `stat.ctime` 在重建索引/首次同步后可能重置）→ 归因 **created_time**；
-- `created` 正常但 Activity 覆盖极低 → 归因 **activity_missing**（例如本机 Activity 只有 2 / 4339 = 0.046%）。
-
-插件**不会**为了让画面好看去改 `created` 或放宽状态阈值（那会污染知识状态语义）。
-
-**v1.1.2 数据恢复 Hotfix（重要）**：v1.1.0/v1.1.1 期间出现的「状态看起来消失」由**两个独立缺陷**造成：
-
-| # | 缺陷 | 症状 |
-| --- | --- | --- |
-| 1 | `VaultRoot` 路径拼接重复加前缀（含 `mkdirp` 逐段拼接） | 状态被写到嵌套目录，读取永远为空 → 复习卡/考试消失 |
-| 2 | `atomicWriteJson` 只更新内存镜像，目标文件常留**旧字节** | `index.json` 只有 1 条笔记、`.tmp` 里有 37 条 → Dashboard 几乎全部显示「新知识」 |
-
-v1.1.2 的处置（**先备份，只复制，绝不静默覆盖**）：
-
-1. **启动即诊断**：列出每个状态文件在 `legacy / correct / wrong / nested / plugin-data` 五个来源的存在性与条目数。
-2. **备份先于修复**：全部来源只读复制到 vault 根 `.state-recovery/<时间戳>/`，**不删除任何原文件**。
-3. **按信息量恢复**：正确位置为空/无效时，取 legacy → 错误目录 → 嵌套层 → Plugin Data 镜像中**条目最多**的合法版本；正确位置已有非空数据时**绝不覆盖**，冲突只记录。
-4. **临时写残留修复**：`.tmp` 比目标更完整时提升为目标（只增不减）。
-5. **索引自愈**：`cards / exams / relationships / saved-explorations` 索引为空而 Markdown 资产仍在时，从 Markdown 重建（0 AI），重建前把旧索引备份为 `*.before-reindex`。
-6. **幂等**：迁移/恢复标记写在 `Knowledge Garden/.state/.recovery-status.json`（`portableRecoveryVersion = 2`），二次启动不再重复搬移。
-
-> **你的复习卡与考试不会丢**：它们的 Markdown 原文一直在 `Knowledge Garden/Review Cards/`、`Knowledge Garden/Exams/`（Markdown 是唯一知识源），索引会自动从这些文件重建。
->
-> ⚠️ 唯一**无法**从 Markdown 还原的是 **FSRS 调度状态**（`cache/spaced-review.json`：每张卡的 stability / difficulty / 下次复习时间 / 复习日志）。它只存在于该 JSON 文件里；若这个文件在所有来源都丢失，卡片内容仍在，但间隔重复进度需要重新累积。同理，`activity.json`（打开/复习次数）也无法从文件时间推定。
-
----
-
-## 七之二、移动端支持（iOS / Android）
-
-**当前状态：Mobile compatibility in testing（代码审计 + 桌面移动端模拟通过；真机验证待完成）。**
-
-已完成（Phase 24 Mobile Compatibility Refactor）：
-
-- `manifest.json` → `isDesktopOnly: false`，可安装到 Obsidian Mobile。
-- **移除全部 Node 依赖**：源码不再 import `fs` / `path` / `crypto` / `electron` / `child_process`；构建产物 `main.js` 中 `require("fs"|"path"|"crypto")` 计数为 0。
-- **存储层改为平台无关**：统一 `PortableStorage`（Obsidian Vault API 优先，Plugin Data API 兜底），同步读靠启动时预热的内存镜像，写入按后端能力选择原子策略。
-- **哈希改为 browser-safe 同步 SHA-256**（保持同步 API，不引入 Promise 级联改动）。
-- **AI 请求改走 `requestUrl`**；流式输出用移动端 WebView 可用的流式读取，环境不支持时自动回退非流式（功能不降级，仅少逐字效果）。
-- **剪贴板**改用 `navigator.clipboard` + 降级方案，读不到时提供手动粘贴入口。
-- **响应式与触摸**：phone / tablet 断点、单列布局、44px 触摸目标、`env(safe-area-inset-*)`、底部常驻操作区、知识图双指缩放与 tap 信息面板、长文本与长 URL 换行规则。
-
-各功能在移动端的预期可用性（**PASS/FAIL 均为代码审计与模拟结论，非真机**）：
-
-| 功能 | 移动端预期 | 平台差异 |
-| --- | --- | --- |
-| Dashboard（首屏 / 今日状态 / 卡片） | 可用 | 手机为单列；Hero 高度 200–280px；知识漫游图仅在进入该区块时初始化 |
-| Review / FSRS | 可用 | 四个评分按钮 ≥44px；上一张/下一张为底部常驻条 |
-| 我的复习卡 / 考试 | 可用 | 搜索 `type=search`；选择题手机单列、平板可 2×2；编辑弹窗限高可滚动 |
-| AI / Workbench（Ask / Research / Project / 追问 / 保存 / 来源） | 可用 | 底部常驻输入区；流式失败自动回退非流式；**离线时明确提示**，不静默失败 |
-| 知识图 / 探索 | 可用 | 支持 tap / drag / pinch zoom；hover 提示在触摸端改为底部信息面板 |
-| Capture / Processing | 可用 | 剪贴板不可读时自动打开手动捕获表单 |
-| Hero / 音乐播放器 | 可用 | 遵守 iOS 音频手势限制：**默认不自动播放**，必须用户点按 |
-| 移动端存储 | 可用 | 状态写入 `Knowledge Garden/.state/`；Vault 不可写时降级 Plugin Data |
-
-**尚未验证（NOT TESTED）**：iOS / Android 真机安装与长时间使用、真机软键盘与返回手势、真机剪贴板权限、1000/5000/10000 笔记规模下的移动端启动与首屏性能。因此本文档**不声明「完全支持移动端」**。
+**自愈机制**：损坏的缓存会被自动隔离（不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
 
 ---
 
@@ -328,19 +239,10 @@ v1.1.2 的处置（**先备份，只复制，绝不静默覆盖**）：
 ```bash
 cd knowledge-garden
 npm install
-npm run build   # tsc 类型检查 + esbuild 产出 main.js
+npm run build   # 产出 main.js
 ```
 
 构建产物 `main.js` + `manifest.json` + `styles.css` 就是可直接放入 `Vault/.obsidian/plugins/` 的插件本体。若构建报错，把 `node_modules` 删除后重新 `npm install` 再试。
-
-**自动测试**（Node，无需 Obsidian）：
-
-```bash
-node tests/build-tests.mjs      # 编译 tests/*.ts → tests/*.cjs
-node tests/p24-tests.cjs        # Phase 24 移动兼容（100 项）
-node tests/p23-tests.cjs        # Phase 23 回归
-# …其余 tests/*.cjs 同理
-```
 
 > 📁 本仓库的 `.gitignore` 已排除 `data.json`（含本地 API Key）、`node_modules` 与 `cache/`，推送 / 克隆到 GitHub 不会包含任何密钥。
 

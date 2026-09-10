@@ -27,7 +27,7 @@ export class DashboardView extends ItemView {
   getDisplayText(): string { return this.plugin.settings.dashboardName; }
   getIcon(): string { return "flower-2"; }
 
-  private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private renderTimer: number | null = null;
   /** Discovery Scope：当前设置的探索范围标签（奇想/漫游各自独立，§六/四十九） */
   private discoveryScopeOf(feature: "curiosity" | "roaming"): string {
     return discoveryScopeLabel(this.plugin.settings.discovery?.[feature]?.scope, this.plugin.settings.knowledgeAreas);
@@ -80,8 +80,7 @@ export class DashboardView extends ItemView {
 
   scheduleRender(): void {
     if (this.renderTimer !== null) return;
-    // 用全局 setTimeout（而非 window.setTimeout）：桌面 / 移动 / Node 测试环境都可用
-    this.renderTimer = setTimeout(() => {
+    this.renderTimer = window.setTimeout(() => {
       this.renderTimer = null;
       if (this.closed || !this.containerEl.isConnected) return;
       this.render();
@@ -642,7 +641,7 @@ export class DashboardView extends ItemView {
     const bar = section.createDiv({ cls: "kg-query-bar" });
     const input = bar.createEl("input", {
       cls: "kg-query-input",
-      attr: { type: "search", enterkeyhint: "search", placeholder: "输入一个问题或关键词，例如：为什么好的系统需要清晰的边界？", maxlength: String(QUERY_MAX_LENGTH), "aria-label": "探索问题" },
+      attr: { type: "text", placeholder: "输入一个问题或关键词，例如：为什么好的系统需要清晰的边界？", maxlength: String(QUERY_MAX_LENGTH), "aria-label": "探索问题" },
     });
     input.value = st.rawQuery || "";
     const scopeSel = bar.createEl("select", { cls: "kg-select", attr: { "aria-label": "探索范围" } });

@@ -485,7 +485,7 @@ export class CardsView extends ItemView {
 
     // Phase 22 §30/31/73：🔎 搜索（只搜当前 scope；输入后局部重渲染并保持焦点）
     const searchRow = inner.createDiv({ cls: "kg-row kg-sort-row" });
-    const search = searchRow.createEl("input", { cls: "kg-input kg-search", attr: { type: "search", enterkeyhint: "search", placeholder: "🔎 搜索题目、答案、来源、概念、考试……（只在当前范围，0 AI）" } });
+    const search = searchRow.createEl("input", { cls: "kg-input kg-search", attr: { placeholder: "🔎 搜索题目、答案、来源、概念、考试……（只在当前范围，0 AI）" } });
     search.value = this.searchQuery;
     const refocus = (): void => {
       const neo = inner.querySelector(".kg-search") as HTMLInputElement | null;
@@ -608,7 +608,7 @@ export class CardsView extends ItemView {
       toggleBtn.addEventListener("click", () => this.applyTag(this.cardScope.tag ?? "", childMode === "include-children" ? "exact" : "include-children"));
       const sortBtn = box.createEl("button", { cls: "kg-btn", text: this.tagSortByName ? "按名称排序" : "按使用次数排序" });
       sortBtn.addEventListener("click", () => { this.tagSortByName = !this.tagSortByName; this.renderList(); });
-      const tagSearch = box.createEl("input", { cls: "kg-input", attr: { type: "search", enterkeyhint: "search", placeholder: "🔎 过滤标签（中文/英文，0 AI）" } });
+      const tagSearch = box.createEl("input", { cls: "kg-input", attr: { placeholder: "🔎 过滤标签（中文/英文，0 AI）" } });
       tagSearch.value = this.tagQuery;
       tagSearch.addEventListener("input", () => { this.tagQuery = tagSearch.value; this.renderList(); });
       if (filtered.length === 0) {

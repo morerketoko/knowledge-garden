@@ -2,7 +2,6 @@
  * Phase 21 Hotfix 自动测试（P-HOTFIX-01..20）：「我的复习卡」显示答案 DOM 生命周期修复。
  * 纯逻辑层由 src/reviewCardAnswer.ts 提供（无 Obsidian 依赖）；真实 DOM 点击流在最终报告标 NOT TESTED。
  */
-import "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {

@@ -6,8 +6,8 @@
  * - 编辑 = update（id 不变，§十二）；Prompt 内容改变 → promptFingerprint 变化 → Cache Miss（§十三，绝不 clearType("*")）。
  * - 收藏/搜索/编辑/删除/应用：一律 0 AI（§一百三十八）；应用 = activate（填回输入框，不自动发送，§十/一百四十一）。
  */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import { sha256 } from "./ai/cache";
 

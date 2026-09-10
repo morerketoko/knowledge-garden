@@ -5,8 +5,8 @@
  * - Phase 17 §37/§一百四十四：只存高层 Trace 摘要，绝不存 hidden reasoning / 原始 CoT（§五十五/§一百七十二）。
  * - 存储：cache/workbench-sessions.json 只存消息摘要与来源快照，不存 Prompt/笔记全文/Web 全文/API Key。
  */
-import * as fs2 from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs2 from "fs";
+import * as path from "path";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import { sha256 } from "./ai/cache";
 import type { AIAnswerSource, ArtifactRef, WorkbenchTraceEvent } from "./types";

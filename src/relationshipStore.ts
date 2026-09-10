@@ -5,9 +5,9 @@
  * - 所有 add/confirm/dismiss/load 都是 AI request = 0（§六十七/七十七）。
  * - 纯函数（无 Obsidian DOM 依赖），便于 Node 自动测试（§七十四）。
  */
-import * as fs from './portable/fsPortable';
-import { joinVaultPath } from './portable/paths';
-import { sha256Hex } from './portable/hash';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import type { KnowledgeRelationship, RelationshipDirection, RelationshipEvidence, SuggestedRelationship } from './types';
 import { atomicWriteJson, isolateCorruptFile } from './migrations';
 
@@ -39,8 +39,7 @@ export function relNormRelation(s: string): string {
 /** §十六：Relationship ID = sha256(归一化 from+to+relation)。bidirectional → 无向键（§十八）。 */
 export function relationshipId(from: string, to: string, relation: string, direction: RelationshipDirection): string {
   const key = direction === 'bidirectional' ? relUndirectedKey(from, to) : relNormPath(from) + '--' + relNormPath(to);
-  // Phase 24 §十四：browser-safe 同步 SHA-256（替代 crypto.createHash）
-  return sha256Hex(key + '\u0000' + relation.trim());
+  return crypto.createHash('sha256').update(key + '\u0000' + relation.trim(), 'utf8').digest('hex');
 }
 
 /** 判重：无向键相同 且 关系文案归一化相同 → 同一条关系（§五：不重复） */

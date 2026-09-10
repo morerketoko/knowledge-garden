@@ -14,8 +14,8 @@
  * - 本文件不依赖 Obsidian API（便于 Node 自动测试）；持久化独立于 AI Cache（cache/spaced-review.json，§七）。
  * - 绝不记录 API Key / Prompt / 笔记全文（§八）。
  */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import {
   createEmptyCard,
   fsrs,

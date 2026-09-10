@@ -5,8 +5,8 @@
  * - 损坏隔离：isolateCorruptFile → *.corrupt-*（保留原件），重建空结构（与 discovery.ts 一致）。
  * - 恢复（§二百七十）：Research Task 恢复为 paused 可继续；Project 从 Markdown 目录重建索引（0 AI，§二百七十一）。
  */
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import { atomicWriteJson, FORMAT_VERSION, isolateCorruptFile } from "./migrations";
 import { sha256 } from "./ai/cache";
 import type { KnowledgeProject, ResearchTask } from "./types";

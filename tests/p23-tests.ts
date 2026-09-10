@@ -2,7 +2,6 @@
  * Phase 23 自动测试（P23-*）：Exam Generation 2.0 —— 历史去重 / 内容策略 / 分批 / 合并 / 精确题数 / 缓存键 / parser / provider。
  * UI 与真实网络（Modal 下拉、进度条、重试请求）在最终报告标 NOT TESTED。
  */
-import "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {

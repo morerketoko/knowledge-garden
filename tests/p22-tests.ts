@@ -3,7 +3,6 @@
  * Tag Scope + 子标签 + Tag Exam Preview 数据层 + 关键词搜索 + 卡片编辑器纯逻辑/持久化隔离。
  * UI（选择器点击、Modal 表单、实时刷新）在最终报告标 NOT TESTED。
  */
-import { mkdtemp } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -166,7 +165,7 @@ const tagsOf = (p: string): string[] => NOTES.find((n) => n.path === p)?.tags ??
 
 /* ============ P22-FSRS-01..05 / PERSIST / DELETE：Store+Markdown 层 ============ */
 {
-  const dir = mkdir(mkdtemp(path.join(os.tmpdir(), "kg-p22-")));
+  const dir = mkdir(fs.mkdtempSync(path.join(os.tmpdir(), "kg-p22-")));
   const cards = new ReviewCardStore(dir); cards.load();
   const spaced = new SpacedReviewStore(dir); spaced.load();
   const cr = new CardReviewStore(dir); cr.load();

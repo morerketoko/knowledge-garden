@@ -1,5 +1,5 @@
-import * as fs from "./portable/fsPortable";
-import * as path from "./portable/pathShim";
+import * as fs from "fs";
+import * as path from "path";
 import type { ActivityEntry } from "./types";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 
@@ -12,7 +12,7 @@ import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 export class ActivityStore {
   private data = new Map<string, ActivityEntry>();
   private file: string;
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushTimer: number | null = null;
   private dirty = false;
 
   constructor(pluginDir: string) {
@@ -80,8 +80,7 @@ export class ActivityStore {
   private markDirty(): void {
     this.dirty = true;
     if (this.flushTimer !== null) return;
-    // 用全局 setTimeout（而非 window.setTimeout）：桌面 / 移动 / Node 测试环境都可用
-    this.flushTimer = setTimeout(() => {
+    this.flushTimer = window.setTimeout(() => {
       this.flushTimer = null;
       this.flush();
     }, 800);
@@ -101,9 +100,6 @@ export class ActivityStore {
 
   /** 诊断用：条目总数（§四十一） */
   count(): number { return this.data.size; }
-
-  /** 诊断用（Phase 24.2 §十七）：全部条目快照，只读 */
-  all(): ActivityEntry[] { return Array.from(this.data.values()); }
   recent(limit: number): { path: string; entry: ActivityEntry }[] {
     return Array.from(this.data.entries())
       .filter(([, e]) => typeof e.lastAccessedAt === "number")
