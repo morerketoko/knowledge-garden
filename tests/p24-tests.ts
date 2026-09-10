@@ -23,7 +23,7 @@ import {
   isUnsafeRelativePath, isReservedStoragePath, toVaultRelative,
 } from "../src/portable/paths";
 import * as pathsMod from "../src/portable/paths";
-import { MemoryRoot } from "../src/portable/root";
+import { MemoryRoot, VaultRoot } from "../src/portable/root";
 import { PortableStorage, PortableJsonStore } from "../src/storage";
 import { PortableStorageHost, STATE_DIR_NAME } from "../src/portable/host";
 import { isolateCorrupt } from "../src/portable/corruption";
@@ -644,6 +644,63 @@ void (async () => {
     test("P24-127c", /autoplay:\s*false/.test(srcText("src/types.ts")), "音乐 autoplay 默认值为 false（§三十八 / §一百零六）");
     test("P24-106", /s\.dashboard\.showMusic\s*&&\s*this\.music\)\s*this\.music\.render\(\)/.test(stripComments(srcText("src/dashboard.ts"))),
       "音乐仅在其启用时才渲染（懒初始化，§一百零六）");
+  }
+
+  /* ---- P24-29 VaultRoot 写入路径幂等（v1.1.0 重复嵌套 bug 回归） ---- */
+  {
+    const probe = mkdtemp("kg-p24-vaultpath-");
+    const abs = path.join(ROOT, probe);
+    fs.mkdirSync(abs, { recursive: true });
+    const disk = (p: string) => path.join(abs, p.replace(/\//g, path.sep));
+    const listFiles = (): string[] => {
+      const out: string[] = [];
+      const walk = (dir: string, prefix: string): void => {
+        if (!fs.existsSync(dir)) return;
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const rel = prefix ? prefix + "/" + e.name : e.name;
+          if (e.isDirectory()) walk(path.join(dir, e.name), rel); else out.push(rel);
+        }
+      };
+      walk(abs, "");
+      return out;
+    };
+    const fake = {
+      getAbstractFileByPath(p: string) {
+        if (fs.existsSync(disk(p)) && fs.statSync(disk(p)).isFile()) return { path: p };
+        const hasChild = listFiles().some((f) => f.startsWith(p + "/"));
+        return fs.existsSync(disk(p)) || hasChild ? { path: p, children: [] } : null;
+      },
+      async read(f: { path: string }) { return fs.readFileSync(disk(f.path), "utf8"); },
+      async cachedRead(f: { path: string }) { return fs.readFileSync(disk(f.path), "utf8"); },
+      async create(p: string, data: string) { fs.mkdirSync(path.dirname(disk(p)), { recursive: true }); fs.writeFileSync(disk(p), data, "utf8"); return { path: p }; },
+      async createFolder(p: string) { fs.mkdirSync(disk(p), { recursive: true }); return { path: p }; },
+      async modify(f: { path: string }, data: string) { fs.mkdirSync(path.dirname(disk(f.path)), { recursive: true }); fs.writeFileSync(disk(f.path), data, "utf8"); },
+      async delete(f: { path: string }) { try { fs.unlinkSync(disk(f.path)); } catch { /* noop */ } },
+      async trash(f: { path: string }) { try { fs.unlinkSync(disk(f.path)); } catch { /* noop */ } },
+      async rename(f: { path: string }, to: string) { fs.mkdirSync(path.dirname(disk(to)), { recursive: true }); fs.renameSync(disk(f.path), disk(to)); },
+      getFiles() { return listFiles().map((p) => ({ path: p })); },
+      getMarkdownFiles() { return []; },
+    };
+    const root = new VaultRoot(fake as never, "Knowledge Garden/.state");
+    // 关键回归：已经是「完整 vault 路径」时不得再加一次 basePath 前缀
+    await root.write("Knowledge Garden/.state/cache/cards.json", "{\"entries\":[{\"id\":\"keep\"}]}");
+    const correct = path.join(abs, "Knowledge Garden/.state/cache/cards.json");
+    const nestedPath = path.join(abs, "Knowledge Garden/.state/Knowledge Garden/.state/cache/cards.json");
+    test("P24-29", fs.existsSync(correct) && !fs.existsSync(nestedPath),
+      "VaultRoot.full() 幂等：写入完整 vault 路径不产生重复嵌套目录（v1.1.0 复习卡消失 bug 回归）");
+    await root.write("cache/exams.json", "{}");
+    test("P24-29b", fs.existsSync(path.join(abs, "Knowledge Garden/.state/cache/exams.json")), "相对路径写法落到同一位置");
+    // 存储层 end-to-end：PortableStorageHost + VaultRoot，store 风格路径必须落在 stateRoot 下
+    const host2 = new PortableStorageHost({
+      stateRoot: "Knowledge Garden/.state", pluginData: new MemoryRoot(),
+      vault: new VaultRoot(fake as never, "Knowledge Garden/.state"), useVault: true,
+      reason: "test", stripPrefixes: ["Knowledge Garden/.state"],
+    });
+    host2.baseDir = ".obsidian/plugins/knowledge-garden";
+    await host2.write(".obsidian/plugins/knowledge-garden/cache/schedule.json", "{}", { nativeAtomic: true });
+    test("P24-29c", fs.existsSync(path.join(abs, "Knowledge Garden/.state/cache/schedule.json")),
+      "store 风格路径（baseDir + cache/x.json）写入后落在 .state/cache/ 下");
+    fs.rmSync(abs, { recursive: true, force: true });
   }
 
   /* ---- 汇总 ---- */

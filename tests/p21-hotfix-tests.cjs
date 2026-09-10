@@ -233,6 +233,15 @@ var PortableStorage = class {
   async isFile(path2) {
     return this.root.isFile(normalizeVaultPath(path2));
   }
+  /**
+   * 列出后端内的全部文件（若后端支持文件树）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件清单，不含目录），
+   * 目录驱动遍历不可靠，所以修复必须按文件路径处理。
+   */
+  listAllFiles() {
+    const root = this.root;
+    return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
+  }
 };
 
 // src/portable/host.ts
@@ -242,6 +251,8 @@ var PortableStorageHost = class {
     this.opts = opts;
     /** 历史插件目录（旧 manifest.dir / getBasePath）；用于把旧路径映射到新根 */
     this.baseDir = "";
+    /** 布局修复轨迹（诊断用） */
+    this.repairTrace = [];
     this.stateRoot = normalizeVaultPath(opts.stateRoot);
     this.vaultMounts = (opts.vaultMounts ?? []).map((m) => normalizeVaultPath(m)).filter(Boolean);
     this.stripPrefixes = (opts.stripPrefixes ?? []).map((p) => normalizeVaultPath(p)).filter(Boolean);
@@ -405,6 +416,90 @@ var PortableStorageHost = class {
   /** 某个存储路径的父目录（创建文件前用） */
   dirOf(path2) {
     return dirnameVaultPath(this.resolve(path2));
+  }
+  static {
+    /* ---------------- 布局修复 ---------------- */
+    /** 需要巡检修复的目录名（状态目录 / 资产目录） */
+    this.REPAIR_DIRS = ["cache", "prompts", "projects", ".corrupt"];
+  }
+  /**
+   * v1.1.0 的 `full()` 重复加前缀，把状态写到了
+   * `<stateRoot>/<baseDir>/...`（还可能再套一层 `<stateRoot>`）。
+   *
+   * 修复方式是**文件驱动**的：遍历 vault 文件列表（Obsidian 的 getFiles 只含文件，
+   * 不含目录，所以不能靠 list 逐层下探），把嵌套层里每个文件按路径结构搬回正确位置：
+   * - `.../cache/<f>`            → `<stateRoot>/cache/<f>`
+   * - `.../Knowledge Garden/Prompts/.../<f>` → `<stateRoot>/prompts/.../<f>`
+   *
+   * 目标已存在则跳过（不覆盖较新数据）；空目录不处理；失败不抛错。
+   */
+  async repairDuplicatedLayout() {
+    this.repairTrace = [];
+    if (!this.vaultStorage || !this.baseDir) return 0;
+    const v = this.vaultStorage;
+    const nestedBase = joinVaultPath(this.stateRoot, this.baseDir);
+    const files = this.listAllFiles();
+    if (!files.length) return 0;
+    let moved = 0;
+    for (const rel of files) {
+      if (!rel.startsWith(nestedBase + "/")) continue;
+      const to = this.repairTargetFor(rel);
+      if (!to) continue;
+      if (await v.exists(to)) {
+        this.repairTrace.push("skip(dst\u5B58\u5728) " + to);
+        continue;
+      }
+      const raw = await v.readText(rel);
+      if (raw === null) {
+        this.repairTrace.push("skip(\u8BFB\u4E0D\u5230) " + rel);
+        continue;
+      }
+      const out = await v.writeText(to, raw, { nativeAtomic: true });
+      this.repairTrace.push("move " + rel + " \u2192 " + to + " ok=" + out.ok);
+      if (out.ok) {
+        await v.remove(rel);
+        moved++;
+      }
+    }
+    if (moved === 0) this.repairTrace.push("\u672A\u53D1\u73B0\u9700\u8981\u4FEE\u590D\u7684\u5D4C\u5957\u72B6\u6001\uFF08\u6B63\u5E38\uFF09");
+    return moved;
+  }
+  /**
+   * 把嵌套层的相对路径映射到正确位置 —— 依据是**目录名**而不是层级深度。
+   *
+   * 例：`…/Knowledge Garden/.state/Knowledge Garden/.state/cache/cards.json`
+   *   → 取最靠近文件的一个 `<stateRoot>/` 之后的 `cache/cards.json`
+   *   → `<stateRoot>/cache/cards.json`
+   * 资产例：`…/Knowledge Garden/Prompts/General/p.md`
+   *   → 标记 `Knowledge Garden/` 之后的 `Prompts/...` → `<stateRoot>/prompts/General/p.md`
+   *
+   * 不认识的结构返回 null（绝不动用户自己的文件）。
+   */
+  repairTargetFor(rel) {
+    const marker = this.stateRoot.replace(/^\/*/, "");
+    const i = rel.lastIndexOf("/" + marker + "/");
+    if (i >= 0) {
+      const after = rel.slice(i + marker.length + 2);
+      const first = after.split("/")[0];
+      if (first === "cache" || first === ".corrupt" || first === "prompts" || first === "projects") {
+        return joinVaultPath(this.stateRoot, after);
+      }
+    }
+    const kg = rel.lastIndexOf("Knowledge Garden/");
+    if (kg >= 0) {
+      const after = rel.slice(kg + "Knowledge Garden/".length);
+      for (const asset of ["Prompts", "Projects"]) {
+        if (after === asset || after.startsWith(asset + "/")) {
+          const rest = after.slice(asset.length).replace(/^\//, "");
+          return joinVaultPath(this.stateRoot, asset.toLowerCase(), rest);
+        }
+      }
+    }
+    return null;
+  }
+  /** 列出 vault 内全部文件（相对 vault 根） */
+  listAllFiles() {
+    return this.vaultStorage ? this.vaultStorage.listAllFiles() : [];
   }
 };
 

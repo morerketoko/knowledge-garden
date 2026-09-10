@@ -87,6 +87,7 @@ import { MemoryRoot, PluginDataRoot, VaultRoot } from "./portable/root";
 import {
   flushMirror, initSyncMirror, mirrorStats,
 } from "./portable/fsPortable";
+import * as fsPortable from "./portable/fsPortable";
 import { migrateLegacyState, describeMigration } from "./portable/legacyMigration";
 import { joinVaultPath } from "./portable/paths";
 import { copyText as copyToClipboard, readText as readClipboardText } from "./portable/clipboard";
@@ -497,6 +498,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
     void this.ensureRelationshipFolder().then(() => void this.scanRelationshipMarkdown());
     // Capture/Processing（本阶段）：确保目录可用 + 刷新计数（0 AI，§六十九/一百一十一）
     void this.ensureCaptureFolders();
+    // 空索引自愈（0 AI）：Markdown 资产仍在、索引却是空的 → 自动重建，避免「复习卡/考试消失」
+    // 放在存储与索引就绪之后，保证备份与写入都走便携存储
+    void this.ensureIndexesAgainstAssets();
   }
 
   onunload(): void {
@@ -586,6 +590,14 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.storageHost = host;
     this.storageBackendLabel = host.reason + " · " + (writable ? "vault" : "plugin-data");
     this.migrationSummary = migration;
+    // v1.1.0 布局修复：把曾经写到嵌套目录（<stateRoot>/<baseDir>/…）里的状态搬回正确位置
+    try {
+      const moved = await host.repairDuplicatedLayout();
+      if (moved > 0) {
+        this.migrationSummary += "；已修复重复嵌套目录，搬回 " + moved + " 个状态文件";
+        new Notice("知识花园：已修复状态目录重复嵌套问题，搬回 " + moved + " 个文件（原文件未删除）。", 10000);
+      }
+    } catch { /* 修复失败不阻塞启动 */ }
     return legacyDir;
   }
 
@@ -3584,6 +3596,48 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const reg = this.settings.skillRegistry ?? [];
     const enabled = reg.filter((s) => s.enabled).map((s) => s.id);
     return Array.from(new Set([...wsSkills, ...enabled]));
+  }
+
+  /**
+   * 空索引自愈（0 AI）：Markdown 资产还在、索引却是空的 → 自动从 Markdown 重建。
+   *
+   * 触发场景（都是「数据看起来消失」的真实来源）：
+   * - 索引文件被清空 / 写入路径曾算错（v1.1.0 重复嵌套 bug）；
+   * - 用户手动删了 cache 但保留了 Review Cards/*.md、Exams/*.md。
+   *
+   * 刻意只在「索引为空」时动作：非空索引绝不覆盖，避免误伤用户后续操作。
+   */
+  private async ensureIndexesAgainstAssets(): Promise<void> {
+    const cardFiles = this.mdFilesInFolder(cardsDirPath());
+    if (this.cards.count() === 0 && cardFiles.length > 0) {
+      await this.backupStateFile("cache/cards.json");
+      await this.reindexCards();
+      new Notice("知识花园：复习卡索引为空，已从 Review Cards/ 的 " + cardFiles.length + " 个文件重建（0 AI）。", 8000);
+    }
+    const examFiles = this.mdFilesInFolder(examDirPath());
+    if (this.examStore.all().length === 0 && examFiles.length > 0) {
+      await this.backupStateFile("cache/exams.json");
+      await this.reindexExams();
+      new Notice("知识花园：考试索引为空，已从 Exams/ 的 " + examFiles.length + " 个文件重建（0 AI）。", 8000);
+    }
+  }
+
+  /** 重建索引前备份被替换的索引文件（便携存储内，不删除任何数据） */
+  private async backupStateFile(rel: string): Promise<void> {
+    try {
+      const host = this.storageHost;
+      if (!host) return;
+      const prev = await host.read(rel);
+      if (prev === null) return;
+      await host.write(rel + ".before-reindex", prev, { nativeAtomic: true });
+    } catch { /* 备份失败不阻塞重建 */ }
+  }
+
+  /** 列出 Vault 目录下的 Markdown 文件（走 Vault API，不扫描全库） */
+  private mdFilesInFolder(folderPath: string): TFile[] {
+    const dir = this.app.vault.getAbstractFileByPath(normalizePath(folderPath));
+    if (!(dir instanceof TFolder)) return [];
+    return dir.children.filter((f): f is TFile => f instanceof TFile && f.extension === "md");
   }
 
   /** reindex：exams.json 损坏 → 从 Exams/*.md 恢复（§一百九十六/二百零四；0 AI） */

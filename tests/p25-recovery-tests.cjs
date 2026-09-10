@@ -152,6 +152,187 @@ var MemoryRoot = class {
     return true;
   }
 };
+var VaultRoot = class {
+  constructor(vault, basePath) {
+    this.vault = vault;
+    this.basePath = basePath;
+    this.kind = "vault";
+    this.persistent = true;
+    this.fileCache = /* @__PURE__ */ new Map();
+    /** 上层可注入需要预热的相对路径（启动时已知的固定文件） */
+    this.warmup = [];
+  }
+  get location() {
+    return this.basePath + "/";
+  }
+  /**
+   * 合并 basePath 后交给 Obsidian（Obsidian 只接受 vault 相对路径）。
+   *
+   * **幂等**：如果传入路径已经是「带 basePath 前缀的完整 vault 路径」，直接返回，
+   * 绝不再加一次前缀。历史上这里是无条件拼接，导致
+   * `.state/Knowledge Garden/.state/cache/...` 这种重复嵌套目录 —— 存储写到了
+   * 嵌套位置，而读取走的是 `.state/cache/...`，于是所有状态都「看起来消失了」。
+   */
+  full(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return "";
+    if (!this.basePath) return p;
+    if (p === this.basePath || p.startsWith(this.basePath + "/")) return p;
+    return this.basePath + "/" + p;
+  }
+  abstractFile(path2) {
+    const f = this.full(path2);
+    if (!f) return null;
+    try {
+      return this.vault.getAbstractFileByPath(f);
+    } catch {
+      return null;
+    }
+  }
+  async exists(path2) {
+    return this.abstractFile(path2) !== null;
+  }
+  async isFile(path2) {
+    const f = this.abstractFile(path2);
+    return !!f && f.children === void 0;
+  }
+  async isDirectory(path2) {
+    const f = this.abstractFile(path2);
+    return !!f && Array.isArray(f.children);
+  }
+  async read(path2) {
+    const p = normalizeVaultPath(path2);
+    const cached = this.fileCache.get(p);
+    if (cached !== void 0) return cached;
+    const f = this.abstractFile(p);
+    if (!f) return null;
+    try {
+      const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
+      this.fileCache.set(p, text);
+      return text;
+    } catch {
+      return null;
+    }
+  }
+  async write(path2, data) {
+    const p = normalizeVaultPath(path2);
+    const dir = dirnameVaultPath(p);
+    if (dir) await this.mkdirp(dir);
+    const existing = this.abstractFile(p);
+    if (existing && existing.children !== void 0) {
+      throw new Error("vault root: \u76EE\u6807\u662F\u76EE\u5F55\uFF0C\u65E0\u6CD5\u5199\u5165\uFF1A" + p);
+    }
+    if (existing) {
+      await this.vault.modify(existing, data);
+    } else {
+      try {
+        await this.vault.create(this.full(p), data);
+      } catch (e) {
+        const msg = String(e?.message ?? e);
+        if (/exist/i.test(msg)) {
+          const f = this.abstractFile(p);
+          if (f) await this.vault.modify(f, data);
+          else throw e;
+        } else {
+          if (dir) {
+            try {
+              await this.vault.createFolder(this.full(dir));
+            } catch {
+            }
+          }
+          const again = this.abstractFile(p);
+          if (again) await this.vault.modify(again, data);
+          else await this.vault.create(this.full(p), data);
+        }
+      }
+    }
+    this.fileCache.set(p, data);
+  }
+  async remove(path2) {
+    const p = normalizeVaultPath(path2);
+    const f = this.abstractFile(p);
+    this.fileCache.delete(p);
+    if (!f) {
+      const children = await this.list(p);
+      if (!children.length) return false;
+      for (const c of children) await this.remove(c.path);
+      return true;
+    }
+    try {
+      await this.vault.delete(f, true);
+      return true;
+    } catch {
+      try {
+        await this.vault.trash(f, false);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+  async rename(from, to) {
+    const f = this.abstractFile(from);
+    if (!f) return false;
+    const t = normalizeVaultPath(to);
+    const dir = dirnameVaultPath(t);
+    if (dir) await this.mkdirp(dir);
+    try {
+      await this.vault.rename(f, this.full(t));
+      const c = this.fileCache.get(normalizeVaultPath(from));
+      this.fileCache.delete(normalizeVaultPath(from));
+      if (c !== void 0) this.fileCache.set(t, c);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async mkdirp(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return;
+    const segments = p.split("/");
+    let acc = "";
+    for (const seg of segments) {
+      acc = acc ? acc + "/" + seg : seg;
+      if (this.abstractFile(acc)) continue;
+      try {
+        await this.vault.createFolder(this.full(acc));
+      } catch {
+      }
+    }
+  }
+  async list(path2) {
+    const p = normalizeVaultPath(path2);
+    const prefix = this.full(p);
+    const prefixSlash = prefix ? prefix + "/" : "";
+    const out = [];
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    for (const f of all) {
+      if (prefixSlash && !f.path.startsWith(prefixSlash)) continue;
+      const rest = f.path.slice(prefixSlash.length);
+      if (!rest || rest.includes("/")) continue;
+      out.push({ path: rest, name: rest, size: f.stat?.size ?? 0, mtime: f.stat?.mtime ?? 0 });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /**
+   * 同步列出 vault 内全部文件（相对 vault 根）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件列表，不含目录），
+   * 因此修复必须文件驱动，而不是逐层 list 目录。
+   */
+  listAllFilesSync() {
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    return all.map((f) => f.path);
+  }
+  async prefetch() {
+    for (const rel of this.warmup) {
+      void this.read(rel);
+    }
+  }
+  /** 释放读缓存（写后由自身维护，测试/降级时可手动清空） */
+  clearCache() {
+    this.fileCache.clear();
+  }
+};
 
 // src/storage.ts
 var PortableStorage = class {
@@ -664,81 +845,9 @@ function initTestStorage() {
 }
 initTestStorage();
 
-// tests/p21-mc-hotfix-tests.ts
+// tests/p25-recovery-tests.ts
 var fs = __toESM(require("node:fs"));
-var os = __toESM(require("node:os"));
 var path = __toESM(require("node:path"));
-
-// src/savedCardHydration.ts
-function needsSavedCardHydration(card) {
-  if (card.questionType !== "multiple_choice") return false;
-  const optionsOk = Array.isArray(card.options) && card.options.length >= 2;
-  return !optionsOk || !card.correctAnswer;
-}
-function questionMatchesText(a, b) {
-  return (a || "").trim() === (b || "").trim();
-}
-function hydrateSavedReviewCardWith(card, getExam2, examsBySource) {
-  if (card.questionType !== "multiple_choice") return { card, repaired: false, source: "existing" };
-  const optionsOk = Array.isArray(card.options) && card.options.length >= 2;
-  const needCorrect = !card.correctAnswer;
-  if (optionsOk && !needCorrect) return { card, repaired: false, source: "existing" };
-  if (!card.examId) return { card, repaired: false, source: "unavailable" };
-  const exam = getExam2(card.examId);
-  if (!exam) return { card, repaired: false, source: "unavailable" };
-  let matched = null;
-  const pick = (list, qid) => {
-    if (qid) {
-      const q2 = list.find((x) => x.id === qid);
-      if (q2) return { q: q2, source: "exam" };
-    }
-    const exact = list.filter((x) => questionMatchesText(x.question, card.question));
-    if (exact.length === 1) return { q: exact[0], source: "question-match" };
-    return null;
-  };
-  matched = pick(exam.questions, card.examQuestionId);
-  if (!matched) {
-    const across = [];
-    for (const e of examsBySource(card.sourcePath)) {
-      if (e.questions) across.push(...e.questions);
-    }
-    const textMatches = across.filter((x) => questionMatchesText(x.question, card.question));
-    if (textMatches.length === 1) {
-      const q2 = textMatches[0];
-      if (q2.type === "multiple_choice") matched = { q: q2, source: "question-match" };
-    }
-  }
-  if (!matched || matched.q.type !== "multiple_choice") return { card, repaired: false, source: "unavailable" };
-  const q = matched.q;
-  const nextOptions = !optionsOk && Array.isArray(q.options) && q.options.length > 0 ? [...q.options] : card.options;
-  const nextCorrect = needCorrect ? q.correctAnswer || card.correctAnswer : card.correctAnswer;
-  const changed = (optionsOk ? false : JSON.stringify(nextOptions ?? null) !== JSON.stringify(card.options ?? null)) || (needCorrect ? nextCorrect !== card.correctAnswer : false);
-  if (!changed) return { card, repaired: false, source: matched.source };
-  return {
-    card: { ...card, options: nextOptions, correctAnswer: nextCorrect },
-    repaired: true,
-    source: matched.source
-  };
-}
-function hydrateSavedCardBatch(cards, examIndex, examsBySource) {
-  const out = [];
-  let repairedCount = 0;
-  let unavailableCount = 0;
-  for (const c of cards) {
-    if (!needsSavedCardHydration(c)) {
-      out.push(c);
-      continue;
-    }
-    const res = hydrateSavedReviewCardWith(c, (id) => examIndex.get(id), examsBySource);
-    if (res.repaired) repairedCount++;
-    else if (res.source === "unavailable") unavailableCount++;
-    out.push(res.card);
-  }
-  return { cards: out, repairedCount, unavailableCount };
-}
-function legacyMcCandidates(cards) {
-  return cards.filter(needsSavedCardHydration);
-}
 
 // src/migrations.ts
 function pad2(n) {
@@ -856,47 +965,143 @@ var K = new Uint32Array([
 ]);
 
 // src/examStore.ts
-function escYaml(s) {
-  return '"' + (s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
-}
 function unescYaml(s) {
   const m = /^"(.*)"$/.exec(s);
   return m ? m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : s;
 }
-function cardMarkdown(c) {
-  const dateStr = new Date(c.createdAt).toISOString().slice(0, 10);
-  const wiki = (p) => "[[" + (p.split("/").pop() ?? p).replace(/\.md$/i, "") + "]]";
-  return [
-    "---",
-    "type: review-card",
-    'cardId: "' + c.id + '"',
-    'sourcePath: "' + c.sourcePath + '"',
-    'sourceVersion: "' + c.sourceVersion + '"',
-    ...c.examId ? ['examId: "' + c.examId + '"'] : [],
-    ...c.examQuestionId ? ['examQuestionId: "' + c.examQuestionId + '"'] : [],
-    'questionType: "' + c.questionType + '"',
-    ...c.options && c.options.length ? ["options: [" + c.options.map(escYaml).join(", ") + "]"] : [],
-    ...c.correctAnswer ? ["correctAnswer: " + escYaml(c.correctAnswer)] : [],
-    ...c.concept ? ['concept: "' + c.concept + '"'] : [],
-    ...c.tags && c.tags.length ? ["tags: [" + c.tags.map(escYaml).join(", ") + "]"] : [],
-    "createdAt: " + c.createdAt,
-    "---",
-    "",
-    "# " + c.question,
-    "",
-    "## \u7B54\u6848",
-    "",
-    c.answer,
-    "",
-    ...c.explanation ? ["## \u89E3\u91CA", "", c.explanation, ""] : [],
-    ...c.sourceEvidence && c.sourceEvidence.length ? ["## \u539F\u6587\u4F9D\u636E", "", ...c.sourceEvidence.map((s) => "- " + s), ""] : [],
-    "",
-    "## \u6765\u6E90",
-    "",
-    wiki(c.sourcePath),
-    "",
-    "<!-- " + dateStr + " -->"
-  ].join("\n");
+function parseExamMarkdown(md) {
+  const fm = parseExamFrontmatter(md);
+  if (!fm) return { exam: null, questions: [] };
+  try {
+    const exam = {
+      id: fm.examId,
+      sourcePath: fm.sourcePath,
+      sourceVersion: fm.sourceVersion,
+      title: fm.title,
+      mode: fm.mode === "custom" ? "custom" : "holistic",
+      topic: fm.topic,
+      questionCount: fm.questionCount,
+      difficulty: fm.difficulty === "easy" || fm.difficulty === "hard" ? fm.difficulty : fm.difficulty === "medium" ? "medium" : void 0,
+      answerMode: fm.answerMode === "source_only" || fm.answerMode === "web_allowed" ? fm.answerMode : "source_preferred",
+      questions: fm.questions,
+      contentStrategy: fm.contentStrategy ?? "broad_coverage",
+      // Phase 23 §64：旧缺省 broad_coverage
+      repeatPolicy: fm.repeatPolicy ?? "allow",
+      examVersion: fm.examVersion ?? 1,
+      coverageTopics: fm.coverageTopics,
+      createdAt: fm.createdAt ?? Date.now(),
+      updatedAt: fm.createdAt ?? Date.now()
+    };
+    return { exam, questions: fm.questions };
+  } catch {
+    return { exam: null, questions: [] };
+  }
+}
+function parseExamFrontmatter(md) {
+  if (!md.startsWith("---")) return null;
+  const end = md.indexOf("\n---", 3);
+  if (end < 0) return null;
+  const block = md.slice(3, end);
+  const lines = block.split("\n");
+  const kv = /* @__PURE__ */ new Map();
+  const questionItems = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const top = /^([A-Za-z]+): ?(.*)$/.exec(line);
+    if (!top) {
+      i++;
+      continue;
+    }
+    const k = top[1];
+    const v = top[2].trim();
+    if (k === "questions" && v === "") {
+      let cur = null;
+      let j = i + 1;
+      while (j < lines.length) {
+        const l = lines[j];
+        if (/^[A-Za-z]+:/.test(l)) break;
+        const dash = /^  - (.+)$/.exec(l);
+        if (dash) {
+          cur = {};
+          questionItems.push(cur);
+          const first = /^([A-Za-z]+): ?(.*)$/.exec(dash[1]);
+          if (first) cur[first[1]] = unescYaml(first[2].trim());
+          j++;
+          continue;
+        }
+        const sub = /^    ([A-Za-z]+): ?(.*)$/.exec(l);
+        if (sub && cur) {
+          cur[sub[1]] = unescYaml(sub[2].trim());
+          j++;
+          continue;
+        }
+        if (!l.trim()) {
+          j++;
+          continue;
+        }
+        break;
+      }
+      i = j;
+      continue;
+    }
+    kv.set(k, v);
+    i++;
+  }
+  const examId = unescYaml(kv.get("examId") ?? "");
+  if (!examId) return null;
+  const inlineArr = (v) => {
+    if (!v) return void 0;
+    const t = v.trim();
+    if (t.startsWith("[") && t.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean);
+      } catch {
+      }
+      return t.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    }
+    return void 0;
+  };
+  const questions = [];
+  const TYPES = ["recall", "explanation", "comparison", "application", "true_false", "multiple_choice", "counterexample"];
+  for (const item of questionItems) {
+    const qid = item["id"] ?? "";
+    const qq = item["question"] ?? "";
+    if (!qid || !qq) continue;
+    const qtype = item["type"] ?? "recall";
+    questions.push({
+      sourcePath: unescYaml(kv.get("sourcePath") ?? ""),
+      id: qid,
+      type: TYPES.includes(qtype) ? qtype : "recall",
+      question: qq,
+      options: inlineArr(item["options"]),
+      correctAnswer: item["correctAnswer"] || void 0,
+      referenceAnswer: item["referenceAnswer"] ?? "",
+      explanation: item["explanation"] || void 0,
+      sourceEvidence: inlineArr(item["sourceEvidence"]),
+      concept: item["concept"] || void 0,
+      difficulty: item["difficulty"] === "easy" || item["difficulty"] === "hard" ? item["difficulty"] : item["difficulty"] === "medium" ? "medium" : void 0
+    });
+  }
+  return {
+    examId,
+    sourcePath: unescYaml(kv.get("sourcePath") ?? ""),
+    sourceVersion: unescYaml(kv.get("sourceVersion") ?? ""),
+    title: unescYaml(kv.get("title") ?? "") || examId,
+    mode: kv.get("mode") ?? "holistic",
+    topic: unescYaml(kv.get("topic") ?? ""),
+    questionCount: parseInt(kv.get("questionCount") ?? "0", 10) || 0,
+    difficulty: kv.get("difficulty"),
+    answerMode: kv.get("answerMode") ?? "source_preferred",
+    examVersion: parseInt(kv.get("examVersion") ?? "1", 10) || 1,
+    coverageTopics: inlineArr(kv.get("coverageTopics")),
+    contentStrategy: ["new_content", "new_angle", "broad_coverage", "custom"].includes(kv.get("contentStrategy") ?? "") ? kv.get("contentStrategy") : void 0,
+    repeatPolicy: ["strict", "balanced", "allow"].includes(kv.get("repeatPolicy") ?? "") ? kv.get("repeatPolicy") : void 0,
+    previousExamCount: parseInt(kv.get("previousExamCount") ?? "", 10) || void 0,
+    createdAt: parseInt(kv.get("createdAt") ?? "", 10) || void 0,
+    questions
+  };
 }
 function parseCardMarkdown(md) {
   if (!md.startsWith("---")) return { card: null };
@@ -1036,253 +1241,198 @@ var ReviewCardStore = class {
   }
 };
 
-// tests/p21-mc-hotfix-tests.ts
+// tests/p25-recovery-tests.ts
+var ROOT = path.join(__dirname, "..");
+var VAULT_CARDS = path.join("E:", "ob", "Knowledge Garden", "Review Cards");
+var VAULT_EXAMS = path.join("E:", "ob", "Knowledge Garden", "Exams");
 var results = [];
 function test(id, pass, detail) {
   results.push({ id, pass, detail });
   console.log((pass ? "PASS" : "FAIL") + " " + id + " :: " + detail);
 }
-function mkExam(id, qs) {
-  return { id, sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md", sourceVersion: "v1", title: "\u6D4B\u8BD5\u8003\u8BD5 " + id, mode: "holistic", questionCount: qs.length, answerMode: "source_only", questions: qs, examVersion: 1, createdAt: 1, updatedAt: 1 };
+function skip(id, detail) {
+  console.log("SKIP " + id + " :: " + detail);
 }
-function baseCard(over) {
+function mkFakeVault(base) {
+  const disk = (p) => path.join(base, p.replace(/\//g, path.sep));
+  const listFiles = () => {
+    const out = [];
+    const walk = (dir, prefix) => {
+      if (!fs.existsSync(dir)) return;
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? prefix + "/" + e.name : e.name;
+        if (e.isDirectory()) walk(path.join(dir, e.name), rel);
+        else out.push(rel);
+      }
+    };
+    walk(base, "");
+    return out;
+  };
   return {
-    id: "card1",
-    sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md",
-    sourceVersion: "v1",
-    examId: "e1",
-    question: "\u54EA\u4E00\u9879\u6700\u80FD\u89E3\u91CA\u6A21\u5757\u5316\uFF1F",
-    answer: "\u6A21\u5757\u5316\u901A\u8FC7\u9694\u79BB\u53D8\u5316\u964D\u4F4E\u8026\u5408\u3002",
-    questionType: "multiple_choice",
-    createdAt: 10,
-    updatedAt: 10,
-    reviewCount: 3,
-    mastery: "good",
-    masteryScore: 75,
-    lastReviewedAt: 9,
-    ...over
+    getAbstractFileByPath(p) {
+      const exists = fs.existsSync(disk(p));
+      if (exists && fs.statSync(disk(p)).isFile()) return { path: p };
+      const hasChild = listFiles().some((f) => f.startsWith(p + "/"));
+      return exists || hasChild ? { path: p, children: [] } : null;
+    },
+    async read(f) {
+      return fs.readFileSync(disk(f.path), "utf8");
+    },
+    async cachedRead(f) {
+      return fs.readFileSync(disk(f.path), "utf8");
+    },
+    async create(p, data) {
+      fs.mkdirSync(path.dirname(disk(p)), { recursive: true });
+      fs.writeFileSync(disk(p), data, "utf8");
+      return { path: p };
+    },
+    async createFolder(p) {
+      fs.mkdirSync(disk(p), { recursive: true });
+      return { path: p };
+    },
+    async modify(f, data) {
+      fs.mkdirSync(path.dirname(disk(f.path)), { recursive: true });
+      fs.writeFileSync(disk(f.path), data, "utf8");
+    },
+    async delete(f) {
+      try {
+        fs.unlinkSync(disk(f.path));
+      } catch {
+      }
+    },
+    async trash(f) {
+      try {
+        fs.unlinkSync(disk(f.path));
+      } catch {
+      }
+    },
+    async rename(f, to) {
+      fs.mkdirSync(path.dirname(disk(to)), { recursive: true });
+      fs.renameSync(disk(f.path), disk(to));
+    },
+    getFiles() {
+      return listFiles().map((p) => ({ path: p }));
+    },
+    getMarkdownFiles() {
+      return [];
+    }
   };
 }
-var lookup = /* @__PURE__ */ new Map();
-function getExam(id) {
-  return lookup.get(id);
-}
-function bySource() {
-  return Array.from(lookup.values());
-}
-{
-  const q = { id: "q1", type: "multiple_choice", question: "\u54EA\u4E00\u9879\u6700\u80FD\u89E3\u91CA\u6A21\u5757\u5316\uFF1F", referenceAnswer: "A", options: ["\u964D\u4F4E\u8026\u5408", "\u589E\u52A0\u4EE3\u7801\u91CF", "\u6D88\u9664\u6240\u6709\u590D\u6742\u5EA6", "\u4E0D\u9700\u8981\u7EF4\u62A4"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" };
-  const fresh = baseCard({ examQuestionId: "q1", options: [...q.options ?? []], correctAnswer: "A" });
-  const parsed = parseCardMarkdown(cardMarkdown(fresh));
-  test(
-    "P-HF-MC-01",
-    parsed.card?.options?.length === 4 && parsed.card?.correctAnswer === "A" && parsed.card?.options?.[0] === "\u964D\u4F4E\u8026\u5408",
-    "\u65B0\u6536\u85CF MC \u5361\uFF1AMarkdown \u5F80\u8FD4\u4FDD\u7559 4 \u4E2A\u9009\u9879 + \u6B63\u786E\u7B54\u6848\uFF08\u6570\u636E\u5C42\uFF1BUI \u6E32\u67D3\u8FD0\u884C\u65F6\u9A8C\u8BC1\uFF09"
-  );
-  test("P-HF-MC-01b", needsSavedCardHydration(fresh) === false, "\u5B8C\u6574 MC \u5361\u65E0\u9700 hydration\uFF08\u4E0D\u5199\u76D8\uFF0C\xA712\uFF09");
-  const h = hydrateSavedReviewCardWith(fresh, getExam, bySource);
-  test(
-    "P-HF-MC-01c",
-    h.repaired === false && h.source === "existing" && h.card === fresh,
-    "\u5B8C\u6574\u5361 hydration \u76F4\u63A5\u8FD4\u56DE\u4E14\u4E0D\u514B\u9686\uFF08\u96F6\u5F00\u9500\uFF09"
-  );
-}
-{
-  lookup.clear();
-  lookup.set("e1", mkExam("e1", [
-    { id: "qA", type: "multiple_choice", question: "\u6A21\u5757\u8FB9\u754C\u7684\u4F5C\u7528\uFF1F", referenceAnswer: "B", options: ["\u9694\u79BB\u53D8\u5316", "\u6D88\u9664\u590D\u6742\u5EA6", "\u9690\u85CF\u6D4B\u8BD5", "\u589E\u52A0\u8026\u5408"], correctAnswer: "B", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" },
-    { id: "qB", type: "multiple_choice", question: "\u6A21\u5757\u8FB9\u754C\u7684\u4F5C\u7528\uFF08\u53E6\u4E00\u95EE\uFF09\uFF1F", referenceAnswer: "C", options: ["\u95191", "\u95192", "\u6B63\u786EC", "\u95194"], correctAnswer: "C", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }
-  ]));
-  const legacy = baseCard({ examQuestionId: "qA", options: void 0, correctAnswer: void 0 });
-  const res = hydrateSavedReviewCardWith(legacy, getExam, bySource);
-  test(
-    "P-HF-MC-02",
-    res.repaired === true && res.source === "exam" && res.card.options?.length === 4 && res.card.correctAnswer === "B",
-    "\u65E7\u5361\u7F3A options\uFF1AexamId+examQuestionId \u81EA\u52A8\u6062\u590D\uFF08\xA74/7/40\uFF09"
-  );
-  test(
-    "P-HF-MC-46",
-    res.card.options?.[1] === "\u6D88\u9664\u590D\u6742\u5EA6",
-    "\u9898\u5E72\u76F8\u4F3C\u7684\u4E24\u9898\uFF1AexamQuestionId \u6B63\u786E \u2192 \u6062\u590D\u6B63\u786E\u9009\u9879\uFF08\xA746\uFF09"
-  );
-  const snapshotSame = legacy.question === res.card.question && legacy.answer === res.card.answer && legacy.sourceEvidence === res.card.sourceEvidence && legacy.createdAt === res.card.createdAt && legacy.id === res.card.id && legacy.examId === res.card.examId && legacy.examQuestionId === res.card.examQuestionId && legacy.reviewCount === res.card.reviewCount && legacy.masteryScore === res.card.masteryScore && legacy.lastReviewedAt === res.card.lastReviewedAt;
-  test("P-HF-MC-02b", snapshotSame, "\u6062\u590D\u53EA\u8865 options/correctAnswer\uFF0C\u5FEB\u7167\u5176\u4F59\u5B57\u6BB5\u4E0E FSRS/mastery/reviewCount \u4E0D\u53D8\uFF08\xA76/37/56~58\uFF09");
-}
-{
-  lookup.clear();
-  lookup.set("e1", mkExam("e1", [
-    { id: "q0", type: "multiple_choice", question: "\u7A7A\u9009\u9879\u6D4B\u8BD5", referenceAnswer: "A", options: ["\u7532", "\u4E59", "\u4E19", "\u4E01"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }
-  ]));
-  const empty = baseCard({ examQuestionId: "q0", options: [] });
-  const one = baseCard({ examQuestionId: "q0", options: ["\u7532"] });
-  test(
-    "P-HF-MC-52",
-    needsSavedCardHydration(empty) === true && hydrateSavedReviewCardWith(empty, getExam, bySource).repaired === true,
-    "options=[] \u4E0D\u8BEF\u8BA4\u4E3A\u6709\u6548 \u2192 \u89E6\u53D1 hydration\uFF08\xA752\uFF09"
-  );
-  test(
-    "P-HF-MC-53",
-    needsSavedCardHydration(one) === true && hydrateSavedReviewCardWith(one, getExam, bySource).repaired === true,
-    "options=[1 \u9879] \u89C6\u4E3A\u5F02\u5E38 \u2192 \u4F18\u5148\u4ECE Exam \u4FEE\u590D\uFF08\xA753\uFF09"
-  );
-  const many = baseCard({ examQuestionId: "q0", options: ["\u4E00", "\u4E8C", "\u4E09", "\u56DB"], correctAnswer: "A" });
-  test(
-    "P-HF-MC-54",
-    needsSavedCardHydration(many) === false && many.options?.length === 4,
-    "options > 2 \u2192 \u5168\u90E8\u4FDD\u7559\u4E0D\u8986\u76D6\uFF08\xA754/17/18\uFF09"
-  );
-}
-{
-  lookup.clear();
-  const noExam = baseCard({ examId: void 0 });
-  const res1 = hydrateSavedReviewCardWith(noExam, getExam, bySource);
-  test("P-HF-MC-42", res1.repaired === false && res1.source === "unavailable", "\u65E0 examId\uFF1A\u4E0D\u731C\u9898\uFF0Cunavailable\uFF08\xA79/42\uFF09");
-  lookup.set("e1", mkExam("e1", [{ id: "qX", type: "multiple_choice", question: "\u9898", referenceAnswer: "A", options: ["a", "b", "c", "d"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }]));
-  lookup.delete("e1");
-  const goneExam = baseCard({ examQuestionId: "qX" });
-  const res2 = hydrateSavedReviewCardWith(goneExam, getExam, bySource);
-  test("P-HF-MC-43", res2.repaired === false && res2.source === "unavailable", "Exam \u5DF2\u5220\u9664\uFF1Aunavailable\uFF0C\u4E0D\u5D29\uFF08\xA78/43/70\uFF09");
-}
-{
-  lookup.clear();
-  lookup.set("e1", mkExam("e1", [
-    { id: "u1", type: "multiple_choice", question: "\u552F\u4E00\u9898\u9762", referenceAnswer: "B", options: ["x", "B", "y", "z"], correctAnswer: "B", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }
-  ]));
-  const noQid = baseCard({ examQuestionId: void 0, question: "\u552F\u4E00\u9898\u9762" });
-  const resU = hydrateSavedReviewCardWith(noQid, getExam, bySource);
-  test(
-    "P-HF-MC-44",
-    resU.repaired === true && resU.source === "question-match" && resU.card.options?.length === 4 && resU.card.correctAnswer === "B",
-    "\u65E0 examQuestionId\uFF1AexamId \u5185\u9898\u5E72\u552F\u4E00\u7CBE\u786E\u5339\u914D \u2192 \u6062\u590D\uFF08\xA744\uFF09"
-  );
-  lookup.clear();
-  lookup.set("e1", mkExam("e1", [
-    { id: "a", type: "multiple_choice", question: "\u76F8\u540C\u9898\u5E72", referenceAnswer: "A", options: ["A1", "A2", "A3", "A4"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" },
-    { id: "b", type: "multiple_choice", question: "\u76F8\u540C\u9898\u5E72", referenceAnswer: "B", options: ["B1", "B2", "B3", "B4"], correctAnswer: "B", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }
-  ]));
-  const amb = baseCard({ examQuestionId: void 0, question: "\u76F8\u540C\u9898\u5E72" });
-  const resA = hydrateSavedReviewCardWith(amb, getExam, bySource);
-  test(
-    "P-HF-MC-45",
-    resA.repaired === false && resA.source === "unavailable",
-    "\u9898\u5E72\u6B67\u4E49\uFF08\u4E24\u9898\u76F8\u540C\u3001\u65E0 examQuestionId\uFF09\uFF1A\u4E0D\u80FD\u731C\uFF0C\u4E0D\u81EA\u52A8\u6062\u590D\uFF08\xA745\uFF09"
-  );
-  lookup.clear();
-  lookup.set("eA", mkExam("eA", [{ id: "s1", type: "multiple_choice", question: "\u5168\u5C40\u552F\u4E00\uFF1F", referenceAnswer: "C", options: ["p", "q", "C", "r"], correctAnswer: "C", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }]));
-  lookup.set("eB", mkExam("eB", [{ id: "t1", type: "multiple_choice", question: "\u53E6\u4E00\u9898", referenceAnswer: "A", options: ["1", "2", "3", "4"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u7CFB\u7EDF\u8FB9\u754C.md" }]));
-  const srcOnly = baseCard({ examId: "eA", examQuestionId: void 0, question: "\u5168\u5C40\u552F\u4E00\uFF1F" });
-  const resS = hydrateSavedReviewCardWith(srcOnly, getExam, bySource);
-  test(
-    "P-HF-MC-44b",
-    resS.repaired === true && resS.source === "question-match" && resS.card.correctAnswer === "C",
-    "question \u6587\u672C\u552F\u4E00\u5339\u914D\uFF08\u8003\u8BD5\u5185\uFF09\u6062\u590D\u6210\u529F"
-  );
-}
-{
-  lookup.clear();
-  lookup.set("e1", mkExam("e1", [{ id: "q1", type: "multiple_choice", question: "\u54EA\u4E00\u9879\u6700\u80FD\u89E3\u91CA\u6A21\u5757\u5316\uFF1F", referenceAnswer: "A", options: ["\u65B0\u7248A", "\u65B0\u7248B", "\u65B0\u7248C", "\u65B0\u7248D"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }]));
-  const kept = baseCard({ examQuestionId: "q1", options: ["\u65E7\u72481", "\u65E7\u72482", "\u65E7\u72483", "\u65E7\u72484"], correctAnswer: "X" });
-  const resK = hydrateSavedReviewCardWith(kept, getExam, bySource);
-  test(
-    "P-HF-MC-47",
-    resK.repaired === false && resK.card.options?.join("|") === "\u65E7\u72481|\u65E7\u72482|\u65E7\u72483|\u65E7\u72484" && resK.card.correctAnswer === "X",
-    "\u5DF2\u5B58\u5728 options/correctAnswer\uFF1A\u4FDD\u7559 card \u5FEB\u7167\uFF0C\u4E0D\u88AB Exam \u65B0\u7248\u8986\u76D6\uFF08\xA717~19/47\uFF09"
-  );
-  const noCorrect = baseCard({ examQuestionId: "q1", options: ["\u65E7\u72481", "\u65E7\u72482", "\u65E7\u72483", "\u65E7\u72484"], correctAnswer: void 0 });
-  const resC = hydrateSavedReviewCardWith(noCorrect, getExam, bySource);
-  test(
-    "P-HF-MC-48",
-    resC.repaired === true && resC.card.correctAnswer === "A" && resC.card.options?.length === 4,
-    "\u5DF2\u6709 options \u4F46 correctAnswer \u7F3A\u5931 \u2192 \u53EA\u8865 correctAnswer\uFF08\xA748\uFF09"
-  );
-}
-{
-  const examIndex = /* @__PURE__ */ new Map();
-  examIndex.set("e1", mkExam("e1", [{ id: "b1", type: "multiple_choice", question: "\u6279\u91CF\u9898", referenceAnswer: "A", options: ["1", "2", "3", "4"], correctAnswer: "A", sourcePath: "01 \u76D2\u5B50/\u6E38\u620F/\u6E38\u620F\u6846\u67B6.md" }]));
-  const cards = [
-    baseCard({ id: "ok", examQuestionId: "b1", options: ["1", "2", "3", "4"], correctAnswer: "A" }),
-    baseCard({ id: "fix", examQuestionId: "b1" }),
-    baseCard({ id: "nope", examId: void 0 }),
-    baseCard({ id: "txt", questionType: "recall" })
-  ];
-  const batch = hydrateSavedCardBatch(cards, examIndex, () => Array.from(examIndex.values()));
-  test(
-    "P-HF-MC-02c",
-    batch.cards.length === 4 && batch.repairedCount === 1 && batch.cards.find((c) => c.id === "fix")?.options?.length === 4,
-    "\u6279\u91CF hydration\uFF1A\u53EA\u4FEE\u590D\u9700\u8981\u4FEE\u590D\u7684\u5361\uFF08\u5176\u4F59\u539F\u6837\uFF09\uFF0Cexam \u6309 Map \u7F13\u5B58\uFF08\xA762~64\uFF09"
-  );
-  test("P-HF-MC-02d", legacyMcCandidates(cards).length === 2, "legacy \u5019\u9009\u7EDF\u8BA1\uFF08MC \u4E14\u7F3A options/\u65E0 examId\uFF09");
-}
-{
-  const withComma = baseCard({ examQuestionId: "q1", options: ["A, \u7B2C\u4E00\u79CD\u60C5\u51B5", "B, \u7B2C\u4E8C\u79CD\u60C5\u51B5", "C", "D"], correctAnswer: "A" });
-  const p1 = parseCardMarkdown(cardMarkdown(withComma));
-  test(
-    "P-HF-MC-20",
-    p1.card?.options?.length === 4 && p1.card?.options?.[0] === "A, \u7B2C\u4E00\u79CD\u60C5\u51B5" && p1.card?.options?.[1] === "B, \u7B2C\u4E8C\u79CD\u60C5\u51B5",
-    "\u5E26\u9017\u53F7\u9009\u9879\uFF1AJSON \u4F18\u5148\u89E3\u6790 \u2192 \u4ECD 4 \u9879\uFF08\xA722\uFF0C\u65E7 split \u4F1A\u4E22\uFF09"
-  );
-  const withQuote = baseCard({ examQuestionId: "q1", options: ['\u4ED6\u8BF4"\u5BF9"', "\u666E\u901AB", "\u666E\u901AC", "\u666E\u901AD"], correctAnswer: "A" });
-  const p2 = parseCardMarkdown(cardMarkdown(withQuote));
-  test(
-    "P-HF-MC-20b",
-    p2.card?.options?.[0] === '\u4ED6\u8BF4"\u5BF9"' && p2.card?.options?.length === 4,
-    "\u5E26\u5F15\u53F7\u9009\u9879\uFF1AJSON encoding/decoding \u6B63\u5E38\uFF08\xA723\uFF09"
-  );
-  const uni = baseCard({ examQuestionId: "q1", options: ["\uFF21\uFF0E\u4E2D\u6587\u9009\u9879", "\uFF22\uFF0E\u4EBA\u5DE5\u667A\u80FD", "\uFF23\uFF0E\u6E38\u620F\u8BBE\u8BA1", "\uFF24\uFF0E\u77E5\u8BC6\u7BA1\u7406"], correctAnswer: "\uFF21" });
-  const p3 = parseCardMarkdown(cardMarkdown(uni));
-  test(
-    "P-HF-MC-24",
-    p3.card?.options?.join("|") === "\uFF21\uFF0E\u4E2D\u6587\u9009\u9879|\uFF22\uFF0E\u4EBA\u5DE5\u667A\u80FD|\uFF23\uFF0E\u6E38\u620F\u8BBE\u8BA1|\uFF24\uFF0E\u77E5\u8BC6\u7BA1\u7406",
-    "Unicode/\u5168\u89D2\u9009\u9879\u5B8C\u6574\u4FDD\u7559\uFF08\xA724/50\uFF09"
-  );
-  const emoji = baseCard({ examQuestionId: "q1", options: ["\u{1F600} \u8BB0\u5F97\u4F4F", "\u{1F3AE} \u6E38\u620F", "\u{1F9E0} \u8BB0\u5FC6", "\u2705 \u638C\u63E1"], correctAnswer: "D" });
-  const p4 = parseCardMarkdown(cardMarkdown(emoji));
-  test(
-    "P-HF-MC-51",
-    p4.card?.options?.includes("\u{1F600} \u8BB0\u5F97\u4F4F") && p4.card?.options?.includes("\u{1F3AE} \u6E38\u620F") && p4.card?.options?.length === 4,
-    "emoji \u9009\u9879\u4E0D\u4E22\u5931\uFF08\xA751\uFF09"
-  );
-  const rt = parseCardMarkdown(cardMarkdown(withComma));
-  test(
-    "P-HF-MC-49",
-    JSON.stringify(rt.card?.options) === JSON.stringify(withComma.options) && rt.card?.correctAnswer === withComma.correctAnswer,
-    "cardMarkdown \u2192 parseCardMarkdown roundtrip\uFF1Aoptions/correctAnswer \u5B8C\u5168\u4E00\u81F4\uFF08\xA749\uFF09"
-  );
-}
-{
-  const dir = mkdtemp(path.join(os.tmpdir(), "kg-mc-"));
-  const store = new ReviewCardStore(dir);
-  store.load();
-  const legacy = baseCard({ id: "p1", examQuestionId: "q1" });
-  store.add(legacy);
-  store.update("p1", { options: ["\u964D\u4F4E\u8026\u5408", "\u589E\u52A0\u4EE3\u7801", "\u6D88\u9664\u590D\u6742\u5EA6", "\u514D\u7EF4\u62A4"], correctAnswer: "A" });
-  const reloaded = new ReviewCardStore(dir);
-  reloaded.load();
-  const c = reloaded.get("p1");
-  test(
-    "P-HF-MC-41",
-    c?.options?.length === 4 && c?.correctAnswer === "A",
-    "\u6062\u590D\u540E\u91CD\u65B0\u8BFB\u53D6 cards.json\uFF1Aoptions \u5B58\u5728\uFF08Review Card Markdown \u540C\u6B65\u7531 writeSavedCardMarkdown \u8D1F\u8D23\uFF0C\u8FD0\u884C\u5C42\uFF09"
-  );
-  const mdHas = cardMarkdown(reloaded.get("p1")).includes('options: ["\u964D\u4F4E\u8026\u5408", "\u589E\u52A0\u4EE3\u7801", "\u6D88\u9664\u590D\u6742\u5EA6", "\u514D\u7EF4\u62A4"]');
-  test("P-HF-MC-41b", mdHas, "\u6062\u590D\u540E\u91CD\u65B0\u751F\u6210 Review Card Markdown\uFF1Aoptions \u5B58\u5728\uFF08\xA738/41\uFF09");
-  fs.rmSync(dir, { recursive: true, force: true });
-}
-{
-  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  const srcPath = path.join(__dirname, "..", "src", "savedCardHydration.ts");
-  const src = stripComments(fs.readFileSync(srcPath, "utf8"));
-  test(
-    "P-HF-MC-55",
-    !/\bAI\b|prompt|apiKey|generate|https?:/.test(src) && !/activity|markReviewed/.test(src),
-    "hydration/repair/parse \u5168\u7A0B 0 AI\uFF0C\u4E14\u4E0D\u89E6\u53D1 Activity/markReviewed\uFF08\xA755/59/60\uFF09"
-  );
-}
-setTimeout(() => {
+(async () => {
+  const STATE_ROOT = "Knowledge Garden/.state";
+  const BASE_DIR = ".obsidian/plugins/knowledge-garden";
+  {
+    const dir = mkdtemp("kg-p25-path-");
+    const abs = path.join(ROOT, dir);
+    fs.mkdirSync(abs, { recursive: true });
+    const root = new VaultRoot(mkFakeVault(abs), STATE_ROOT);
+    await root.write(STATE_ROOT + "/cache/cards.json", JSON.stringify({ formatVersion: 1, entries: [{ id: "keep" }] }));
+    const correct = path.join(abs, STATE_ROOT, "cache", "cards.json");
+    const nested = path.join(abs, STATE_ROOT, "Knowledge Garden", ".state", "cache", "cards.json");
+    test(
+      "P25-01",
+      fs.existsSync(correct) && !fs.existsSync(nested),
+      "VaultRoot \u5199\u5165\u5B8C\u6574 vault \u8DEF\u5F84\u5E42\u7B49\uFF1A\u4E0D\u4EA7\u751F <stateRoot>/<stateRoot> \u5D4C\u5957\uFF08\u4E8B\u6545\u56DE\u5F52\uFF09"
+    );
+    test(
+      "P25-02",
+      fs.existsSync(correct) && JSON.parse(fs.readFileSync(correct, "utf8")).entries[0].id === "keep",
+      "\u5199\u5165\u5185\u5BB9\u5B8C\u6574\uFF08\u672A\u88AB\u7A7A\u7D22\u5F15\u8986\u76D6\uFF09"
+    );
+    const host3 = new PortableStorageHost({
+      stateRoot: STATE_ROOT,
+      pluginData: new MemoryRoot(),
+      vault: new VaultRoot(mkFakeVault(abs), STATE_ROOT),
+      useVault: true,
+      reason: "test",
+      stripPrefixes: [STATE_ROOT]
+    });
+    host3.baseDir = BASE_DIR;
+    await host3.write(BASE_DIR + "/cache/schedule.json", '{"records":[]}', { nativeAtomic: true });
+    test(
+      "P25-03",
+      fs.existsSync(path.join(abs, STATE_ROOT, "cache", "schedule.json")),
+      "store \u98CE\u683C\u8DEF\u5F84\uFF08baseDir+cache\uFF09\u4E0E\u76F4\u63A5 vault \u8DEF\u5F84\u843D\u5728\u540C\u4E00\u76EE\u5F55"
+    );
+    fs.rmSync(abs, { recursive: true, force: true });
+  }
+  {
+    const dir = mkdtemp("kg-p25-repair-");
+    const abs = path.join(ROOT, dir);
+    const nestedState = path.join(abs, STATE_ROOT, BASE_DIR, "Knowledge Garden", ".state");
+    fs.mkdirSync(path.join(nestedState, "cache"), { recursive: true });
+    fs.writeFileSync(path.join(nestedState, "cache", "cards.json"), JSON.stringify({ formatVersion: 1, entries: [{ id: "recover-me" }] }), "utf8");
+    fs.mkdirSync(path.join(nestedState, "Knowledge Garden", "Prompts", "General"), { recursive: true });
+    fs.writeFileSync(path.join(nestedState, "Knowledge Garden", "Prompts", "General", "p.md"), "# P", "utf8");
+    const host3 = new PortableStorageHost({
+      stateRoot: STATE_ROOT,
+      pluginData: new MemoryRoot(),
+      vault: new VaultRoot(mkFakeVault(abs), STATE_ROOT),
+      useVault: true,
+      reason: "test",
+      stripPrefixes: [STATE_ROOT]
+    });
+    host3.baseDir = BASE_DIR;
+    const moved = await host3.repairDuplicatedLayout();
+    const recovered = path.join(abs, STATE_ROOT, "cache", "cards.json");
+    const promptAt = path.join(abs, STATE_ROOT, "prompts", "General", "p.md");
+    test(
+      "P25-04",
+      moved >= 1 && fs.existsSync(recovered) && JSON.parse(fs.readFileSync(recovered, "utf8")).entries[0].id === "recover-me",
+      "\u5D4C\u5957\u5C42\u91CC\u7684\u72B6\u6001\u6587\u4EF6\u88AB\u642C\u56DE\u6B63\u786E\u4F4D\u7F6E\u4E14\u5185\u5BB9\u4E0D\u53D8\uFF08moved=" + moved + "\uFF09"
+    );
+    test(
+      "P25-05",
+      fs.existsSync(promptAt) && fs.readFileSync(promptAt, "utf8") === "# P",
+      "\u5D4C\u5957\u5C42\u91CC\u7684 Markdown \u8D44\u4EA7\u4E5F\u642C\u56DE .state/prompts/\uFF08\u5185\u5BB9\u4E0D\u53D8\uFF09"
+    );
+    fs.rmSync(abs, { recursive: true, force: true });
+  }
+  {
+    const dir = mkdtemp("kg-p25-guard-");
+    const store = new ReviewCardStore(dir);
+    store.load();
+    const emptyBefore = store.count() === 0;
+    const hasVaultAssets = fs.existsSync(VAULT_CARDS) && fs.readdirSync(VAULT_CARDS).some((f) => f.endsWith(".md"));
+    test("P25-06", emptyBefore, "\u7A7A cards.json \u52A0\u8F7D\u540E\u7D22\u5F15\u4E3A 0\uFF08\u5B88\u536B\u6761\u4EF6\u6210\u7ACB\uFF0C\u4F1A\u89E6\u53D1\u81EA\u52A8\u91CD\u5EFA\uFF09");
+    if (!hasVaultAssets) {
+      skip("P25-07", "\u672A\u627E\u5230\u771F\u5B9E Vault \u7684 Review Cards/Exams\uFF0C\u8DF3\u8FC7\u771F\u5B9E\u8D44\u4EA7\u89E3\u6790\u9A8C\u8BC1\uFF08\u6D4B\u8BD5\u53EF\u5728\u5176\u4ED6\u673A\u5668\u8FD0\u884C\uFF09");
+    } else {
+      const cardFiles = fs.readdirSync(VAULT_CARDS).filter((f) => f.endsWith(".md"));
+      let okCards = 0;
+      const failed = [];
+      for (const f of cardFiles) {
+        try {
+          if (parseCardMarkdown(fs.readFileSync(path.join(VAULT_CARDS, f), "utf8")).card) okCards++;
+          else failed.push(f);
+        } catch {
+          failed.push(f);
+        }
+      }
+      test(
+        "P25-07a",
+        okCards === cardFiles.length && cardFiles.length > 0,
+        "Review Cards/*.md \u5168\u90E8\u53EF\u89E3\u6790\u4E3A\u590D\u4E60\u5361\uFF08" + okCards + "/" + cardFiles.length + "\uFF0C\u5931\u8D25 " + failed.length + "\uFF09"
+      );
+      const examFiles = fs.existsSync(VAULT_EXAMS) ? fs.readdirSync(VAULT_EXAMS).filter((f) => f.endsWith(".md")) : [];
+      let okExams = 0;
+      for (const f of examFiles) {
+        try {
+          if (parseExamMarkdown(fs.readFileSync(path.join(VAULT_EXAMS, f), "utf8")).exam) okExams++;
+        } catch {
+        }
+      }
+      test(
+        "P25-07b",
+        examFiles.length === 0 || okExams === examFiles.length,
+        "Exams/*.md \u5168\u90E8\u53EF\u89E3\u6790\u4E3A\u8003\u8BD5\uFF08" + okExams + "/" + examFiles.length + "\uFF09"
+      );
+    }
+  }
+  console.log("\n==== SUMMARY ====");
   const pass = results.filter((r) => r.pass).length;
-  const fail = results.filter((r) => !r.pass).length;
-  console.log("==== SUMMARY ====");
-  console.log("TOTAL=" + results.length + " PASS=" + pass + " FAIL=" + fail);
+  const fail = results.length - pass;
   for (const r of results.filter((x) => !x.pass)) console.log("FAILED: " + r.id + " :: " + r.detail);
-  process.exit(fail > 0 ? 1 : 0);
-}, 100);
+  console.log("TOTAL=" + results.length + " PASS=" + pass + " FAIL=" + fail);
+  if (fail > 0) process.exitCode = 1;
+})();

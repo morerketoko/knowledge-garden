@@ -212,6 +212,17 @@ AI 把几篇笔记连成一条**有解释的路径**——「为什么这几篇�
 
 **自愈机制**：损坏的缓存会被自动隔离到 `Knowledge Garden/.state/cache/.corrupt/`（保留可恢复副本，不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
 
+**v1.1.1 修复（重要）**：v1.1.0 存在一个状态路径缺陷 —— 写盘时对已是完整路径的输入重复拼接了状态目录前缀，导致状态被写到 `Knowledge Garden/.state/Knowledge Garden/.state/cache/...` 这种嵌套目录里，而读取走的是 `Knowledge Garden/.state/cache/...`，于是**索引被读成空、又被空写回**，表现为「复习卡 / 考试消失」。
+
+v1.1.1 的处理：
+
+1. **修根因**：写入路径改为幂等，不再产生重复嵌套目录。
+2. **修数据**：启动时自动扫描并**搬回**嵌套目录里的状态文件与 Prompt 资产（目标已存在则跳过，不覆盖较新数据；不认识的路径绝不动）。
+3. **加自愈**：若索引为空但 `Review Cards/`、`Exams/` 里仍有 Markdown，启动时自动从 Markdown 重建（0 AI），重建前把旧索引备份为 `*.before-reindex`。
+4. **加回归测试**：`tests/p25-recovery-tests.ts` 锁定写入路径幂等、布局修复、以及 310 张复习卡 / 27 份考试的 Markdown 可完整解析。
+
+> 你的复习卡与考试**没有丢**：它们的 Markdown 原文一直在 `Knowledge Garden/Review Cards/`、`Knowledge Garden/Exams/` 里，索引会从这些文件重建（Markdown 是唯一知识源）。
+
 ---
 
 ## 七之二、移动端支持（iOS / Android）

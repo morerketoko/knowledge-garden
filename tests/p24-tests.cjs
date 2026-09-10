@@ -193,6 +193,187 @@ var MemoryRoot = class {
     return true;
   }
 };
+var VaultRoot = class {
+  constructor(vault, basePath) {
+    this.vault = vault;
+    this.basePath = basePath;
+    this.kind = "vault";
+    this.persistent = true;
+    this.fileCache = /* @__PURE__ */ new Map();
+    /** 上层可注入需要预热的相对路径（启动时已知的固定文件） */
+    this.warmup = [];
+  }
+  get location() {
+    return this.basePath + "/";
+  }
+  /**
+   * 合并 basePath 后交给 Obsidian（Obsidian 只接受 vault 相对路径）。
+   *
+   * **幂等**：如果传入路径已经是「带 basePath 前缀的完整 vault 路径」，直接返回，
+   * 绝不再加一次前缀。历史上这里是无条件拼接，导致
+   * `.state/Knowledge Garden/.state/cache/...` 这种重复嵌套目录 —— 存储写到了
+   * 嵌套位置，而读取走的是 `.state/cache/...`，于是所有状态都「看起来消失了」。
+   */
+  full(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return "";
+    if (!this.basePath) return p;
+    if (p === this.basePath || p.startsWith(this.basePath + "/")) return p;
+    return this.basePath + "/" + p;
+  }
+  abstractFile(path2) {
+    const f = this.full(path2);
+    if (!f) return null;
+    try {
+      return this.vault.getAbstractFileByPath(f);
+    } catch {
+      return null;
+    }
+  }
+  async exists(path2) {
+    return this.abstractFile(path2) !== null;
+  }
+  async isFile(path2) {
+    const f = this.abstractFile(path2);
+    return !!f && f.children === void 0;
+  }
+  async isDirectory(path2) {
+    const f = this.abstractFile(path2);
+    return !!f && Array.isArray(f.children);
+  }
+  async read(path2) {
+    const p = normalizeVaultPath(path2);
+    const cached = this.fileCache.get(p);
+    if (cached !== void 0) return cached;
+    const f = this.abstractFile(p);
+    if (!f) return null;
+    try {
+      const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
+      this.fileCache.set(p, text);
+      return text;
+    } catch {
+      return null;
+    }
+  }
+  async write(path2, data) {
+    const p = normalizeVaultPath(path2);
+    const dir = dirnameVaultPath(p);
+    if (dir) await this.mkdirp(dir);
+    const existing = this.abstractFile(p);
+    if (existing && existing.children !== void 0) {
+      throw new Error("vault root: \u76EE\u6807\u662F\u76EE\u5F55\uFF0C\u65E0\u6CD5\u5199\u5165\uFF1A" + p);
+    }
+    if (existing) {
+      await this.vault.modify(existing, data);
+    } else {
+      try {
+        await this.vault.create(this.full(p), data);
+      } catch (e) {
+        const msg = String(e?.message ?? e);
+        if (/exist/i.test(msg)) {
+          const f = this.abstractFile(p);
+          if (f) await this.vault.modify(f, data);
+          else throw e;
+        } else {
+          if (dir) {
+            try {
+              await this.vault.createFolder(this.full(dir));
+            } catch {
+            }
+          }
+          const again = this.abstractFile(p);
+          if (again) await this.vault.modify(again, data);
+          else await this.vault.create(this.full(p), data);
+        }
+      }
+    }
+    this.fileCache.set(p, data);
+  }
+  async remove(path2) {
+    const p = normalizeVaultPath(path2);
+    const f = this.abstractFile(p);
+    this.fileCache.delete(p);
+    if (!f) {
+      const children = await this.list(p);
+      if (!children.length) return false;
+      for (const c of children) await this.remove(c.path);
+      return true;
+    }
+    try {
+      await this.vault.delete(f, true);
+      return true;
+    } catch {
+      try {
+        await this.vault.trash(f, false);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+  async rename(from, to) {
+    const f = this.abstractFile(from);
+    if (!f) return false;
+    const t = normalizeVaultPath(to);
+    const dir = dirnameVaultPath(t);
+    if (dir) await this.mkdirp(dir);
+    try {
+      await this.vault.rename(f, this.full(t));
+      const c = this.fileCache.get(normalizeVaultPath(from));
+      this.fileCache.delete(normalizeVaultPath(from));
+      if (c !== void 0) this.fileCache.set(t, c);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async mkdirp(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return;
+    const segments = p.split("/");
+    let acc = "";
+    for (const seg of segments) {
+      acc = acc ? acc + "/" + seg : seg;
+      if (this.abstractFile(acc)) continue;
+      try {
+        await this.vault.createFolder(this.full(acc));
+      } catch {
+      }
+    }
+  }
+  async list(path2) {
+    const p = normalizeVaultPath(path2);
+    const prefix = this.full(p);
+    const prefixSlash = prefix ? prefix + "/" : "";
+    const out = [];
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    for (const f of all) {
+      if (prefixSlash && !f.path.startsWith(prefixSlash)) continue;
+      const rest = f.path.slice(prefixSlash.length);
+      if (!rest || rest.includes("/")) continue;
+      out.push({ path: rest, name: rest, size: f.stat?.size ?? 0, mtime: f.stat?.mtime ?? 0 });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /**
+   * 同步列出 vault 内全部文件（相对 vault 根）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件列表，不含目录），
+   * 因此修复必须文件驱动，而不是逐层 list 目录。
+   */
+  listAllFilesSync() {
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    return all.map((f) => f.path);
+  }
+  async prefetch() {
+    for (const rel of this.warmup) {
+      void this.read(rel);
+    }
+  }
+  /** 释放读缓存（写后由自身维护，测试/降级时可手动清空） */
+  clearCache() {
+    this.fileCache.clear();
+  }
+};
 
 // src/storage.ts
 var PortableStorage = class {
@@ -274,6 +455,15 @@ var PortableStorage = class {
   async isFile(path2) {
     return this.root.isFile(normalizeVaultPath(path2));
   }
+  /**
+   * 列出后端内的全部文件（若后端支持文件树）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件清单，不含目录），
+   * 目录驱动遍历不可靠，所以修复必须按文件路径处理。
+   */
+  listAllFiles() {
+    const root = this.root;
+    return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
+  }
 };
 var PortableJsonStore = class {
   constructor(storage, path2, opts) {
@@ -316,6 +506,8 @@ var PortableStorageHost = class {
     this.opts = opts;
     /** 历史插件目录（旧 manifest.dir / getBasePath）；用于把旧路径映射到新根 */
     this.baseDir = "";
+    /** 布局修复轨迹（诊断用） */
+    this.repairTrace = [];
     this.stateRoot = normalizeVaultPath(opts.stateRoot);
     this.vaultMounts = (opts.vaultMounts ?? []).map((m) => normalizeVaultPath(m)).filter(Boolean);
     this.stripPrefixes = (opts.stripPrefixes ?? []).map((p) => normalizeVaultPath(p)).filter(Boolean);
@@ -479,6 +671,90 @@ var PortableStorageHost = class {
   /** 某个存储路径的父目录（创建文件前用） */
   dirOf(path2) {
     return dirnameVaultPath(this.resolve(path2));
+  }
+  static {
+    /* ---------------- 布局修复 ---------------- */
+    /** 需要巡检修复的目录名（状态目录 / 资产目录） */
+    this.REPAIR_DIRS = ["cache", "prompts", "projects", ".corrupt"];
+  }
+  /**
+   * v1.1.0 的 `full()` 重复加前缀，把状态写到了
+   * `<stateRoot>/<baseDir>/...`（还可能再套一层 `<stateRoot>`）。
+   *
+   * 修复方式是**文件驱动**的：遍历 vault 文件列表（Obsidian 的 getFiles 只含文件，
+   * 不含目录，所以不能靠 list 逐层下探），把嵌套层里每个文件按路径结构搬回正确位置：
+   * - `.../cache/<f>`            → `<stateRoot>/cache/<f>`
+   * - `.../Knowledge Garden/Prompts/.../<f>` → `<stateRoot>/prompts/.../<f>`
+   *
+   * 目标已存在则跳过（不覆盖较新数据）；空目录不处理；失败不抛错。
+   */
+  async repairDuplicatedLayout() {
+    this.repairTrace = [];
+    if (!this.vaultStorage || !this.baseDir) return 0;
+    const v = this.vaultStorage;
+    const nestedBase = joinVaultPath(this.stateRoot, this.baseDir);
+    const files = this.listAllFiles();
+    if (!files.length) return 0;
+    let moved = 0;
+    for (const rel of files) {
+      if (!rel.startsWith(nestedBase + "/")) continue;
+      const to = this.repairTargetFor(rel);
+      if (!to) continue;
+      if (await v.exists(to)) {
+        this.repairTrace.push("skip(dst\u5B58\u5728) " + to);
+        continue;
+      }
+      const raw = await v.readText(rel);
+      if (raw === null) {
+        this.repairTrace.push("skip(\u8BFB\u4E0D\u5230) " + rel);
+        continue;
+      }
+      const out = await v.writeText(to, raw, { nativeAtomic: true });
+      this.repairTrace.push("move " + rel + " \u2192 " + to + " ok=" + out.ok);
+      if (out.ok) {
+        await v.remove(rel);
+        moved++;
+      }
+    }
+    if (moved === 0) this.repairTrace.push("\u672A\u53D1\u73B0\u9700\u8981\u4FEE\u590D\u7684\u5D4C\u5957\u72B6\u6001\uFF08\u6B63\u5E38\uFF09");
+    return moved;
+  }
+  /**
+   * 把嵌套层的相对路径映射到正确位置 —— 依据是**目录名**而不是层级深度。
+   *
+   * 例：`…/Knowledge Garden/.state/Knowledge Garden/.state/cache/cards.json`
+   *   → 取最靠近文件的一个 `<stateRoot>/` 之后的 `cache/cards.json`
+   *   → `<stateRoot>/cache/cards.json`
+   * 资产例：`…/Knowledge Garden/Prompts/General/p.md`
+   *   → 标记 `Knowledge Garden/` 之后的 `Prompts/...` → `<stateRoot>/prompts/General/p.md`
+   *
+   * 不认识的结构返回 null（绝不动用户自己的文件）。
+   */
+  repairTargetFor(rel) {
+    const marker = this.stateRoot.replace(/^\/*/, "");
+    const i = rel.lastIndexOf("/" + marker + "/");
+    if (i >= 0) {
+      const after = rel.slice(i + marker.length + 2);
+      const first = after.split("/")[0];
+      if (first === "cache" || first === ".corrupt" || first === "prompts" || first === "projects") {
+        return joinVaultPath(this.stateRoot, after);
+      }
+    }
+    const kg = rel.lastIndexOf("Knowledge Garden/");
+    if (kg >= 0) {
+      const after = rel.slice(kg + "Knowledge Garden/".length);
+      for (const asset of ["Prompts", "Projects"]) {
+        if (after === asset || after.startsWith(asset + "/")) {
+          const rest = after.slice(asset.length).replace(/^\//, "");
+          return joinVaultPath(this.stateRoot, asset.toLowerCase(), rest);
+        }
+      }
+    }
+    return null;
+  }
+  /** 列出 vault 内全部文件（相对 vault 根） */
+  listAllFiles() {
+    return this.vaultStorage ? this.vaultStorage.listAllFiles() : [];
   }
 };
 
@@ -3476,6 +3752,100 @@ void (async () => {
       /s\.dashboard\.showMusic\s*&&\s*this\.music\)\s*this\.music\.render\(\)/.test(stripComments(srcText("src/dashboard.ts"))),
       "\u97F3\u4E50\u4EC5\u5728\u5176\u542F\u7528\u65F6\u624D\u6E32\u67D3\uFF08\u61D2\u521D\u59CB\u5316\uFF0C\xA7\u4E00\u767E\u96F6\u516D\uFF09"
     );
+  }
+  {
+    const probe = mkdtemp("kg-p24-vaultpath-");
+    const abs = path.join(ROOT, probe);
+    fs.mkdirSync(abs, { recursive: true });
+    const disk = (p) => path.join(abs, p.replace(/\//g, path.sep));
+    const listFiles = () => {
+      const out = [];
+      const walk = (dir, prefix) => {
+        if (!fs.existsSync(dir)) return;
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const rel = prefix ? prefix + "/" + e.name : e.name;
+          if (e.isDirectory()) walk(path.join(dir, e.name), rel);
+          else out.push(rel);
+        }
+      };
+      walk(abs, "");
+      return out;
+    };
+    const fake = {
+      getAbstractFileByPath(p) {
+        if (fs.existsSync(disk(p)) && fs.statSync(disk(p)).isFile()) return { path: p };
+        const hasChild = listFiles().some((f) => f.startsWith(p + "/"));
+        return fs.existsSync(disk(p)) || hasChild ? { path: p, children: [] } : null;
+      },
+      async read(f) {
+        return fs.readFileSync(disk(f.path), "utf8");
+      },
+      async cachedRead(f) {
+        return fs.readFileSync(disk(f.path), "utf8");
+      },
+      async create(p, data) {
+        fs.mkdirSync(path.dirname(disk(p)), { recursive: true });
+        fs.writeFileSync(disk(p), data, "utf8");
+        return { path: p };
+      },
+      async createFolder(p) {
+        fs.mkdirSync(disk(p), { recursive: true });
+        return { path: p };
+      },
+      async modify(f, data) {
+        fs.mkdirSync(path.dirname(disk(f.path)), { recursive: true });
+        fs.writeFileSync(disk(f.path), data, "utf8");
+      },
+      async delete(f) {
+        try {
+          fs.unlinkSync(disk(f.path));
+        } catch {
+        }
+      },
+      async trash(f) {
+        try {
+          fs.unlinkSync(disk(f.path));
+        } catch {
+        }
+      },
+      async rename(f, to) {
+        fs.mkdirSync(path.dirname(disk(to)), { recursive: true });
+        fs.renameSync(disk(f.path), disk(to));
+      },
+      getFiles() {
+        return listFiles().map((p) => ({ path: p }));
+      },
+      getMarkdownFiles() {
+        return [];
+      }
+    };
+    const root = new VaultRoot(fake, "Knowledge Garden/.state");
+    await root.write("Knowledge Garden/.state/cache/cards.json", '{"entries":[{"id":"keep"}]}');
+    const correct = path.join(abs, "Knowledge Garden/.state/cache/cards.json");
+    const nestedPath = path.join(abs, "Knowledge Garden/.state/Knowledge Garden/.state/cache/cards.json");
+    test(
+      "P24-29",
+      fs.existsSync(correct) && !fs.existsSync(nestedPath),
+      "VaultRoot.full() \u5E42\u7B49\uFF1A\u5199\u5165\u5B8C\u6574 vault \u8DEF\u5F84\u4E0D\u4EA7\u751F\u91CD\u590D\u5D4C\u5957\u76EE\u5F55\uFF08v1.1.0 \u590D\u4E60\u5361\u6D88\u5931 bug \u56DE\u5F52\uFF09"
+    );
+    await root.write("cache/exams.json", "{}");
+    test("P24-29b", fs.existsSync(path.join(abs, "Knowledge Garden/.state/cache/exams.json")), "\u76F8\u5BF9\u8DEF\u5F84\u5199\u6CD5\u843D\u5230\u540C\u4E00\u4F4D\u7F6E");
+    const host22 = new PortableStorageHost({
+      stateRoot: "Knowledge Garden/.state",
+      pluginData: new MemoryRoot(),
+      vault: new VaultRoot(fake, "Knowledge Garden/.state"),
+      useVault: true,
+      reason: "test",
+      stripPrefixes: ["Knowledge Garden/.state"]
+    });
+    host22.baseDir = ".obsidian/plugins/knowledge-garden";
+    await host22.write(".obsidian/plugins/knowledge-garden/cache/schedule.json", "{}", { nativeAtomic: true });
+    test(
+      "P24-29c",
+      fs.existsSync(path.join(abs, "Knowledge Garden/.state/cache/schedule.json")),
+      "store \u98CE\u683C\u8DEF\u5F84\uFF08baseDir + cache/x.json\uFF09\u5199\u5165\u540E\u843D\u5728 .state/cache/ \u4E0B"
+    );
+    fs.rmSync(abs, { recursive: true, force: true });
   }
   console.log("\n==== SUMMARY ====");
   const pass = results.filter((r) => r.pass).length;

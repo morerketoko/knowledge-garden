@@ -98,6 +98,16 @@ export class PortableStorage {
 
   async isDirectory(path: string): Promise<boolean> { return this.root.isDirectory(normalizeVaultPath(path)); }
   async isFile(path: string): Promise<boolean> { return this.root.isFile(normalizeVaultPath(path)); }
+
+  /**
+   * 列出后端内的全部文件（若后端支持文件树）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件清单，不含目录），
+   * 目录驱动遍历不可靠，所以修复必须按文件路径处理。
+   */
+  listAllFiles(): string[] {
+    const root = this.root as unknown as { listAllFilesSync?: () => string[] };
+    return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
+  }
 }
 
 /**

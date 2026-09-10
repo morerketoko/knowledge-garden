@@ -154,11 +154,20 @@ export class VaultRoot implements StorageRoot {
 
   get location(): string { return this.basePath + "/"; }
 
-  /** 合并 basePath 后交给 Obsidian（Obsidian 只接受 vault 相对路径） */
+  /**
+   * 合并 basePath 后交给 Obsidian（Obsidian 只接受 vault 相对路径）。
+   *
+   * **幂等**：如果传入路径已经是「带 basePath 前缀的完整 vault 路径」，直接返回，
+   * 绝不再加一次前缀。历史上这里是无条件拼接，导致
+   * `.state/Knowledge Garden/.state/cache/...` 这种重复嵌套目录 —— 存储写到了
+   * 嵌套位置，而读取走的是 `.state/cache/...`，于是所有状态都「看起来消失了」。
+   */
   private full(path: string): string {
     const p = normalizeVaultPath(path);
     if (!p) return "";
-    return this.basePath ? this.basePath + "/" + p : p;
+    if (!this.basePath) return p;
+    if (p === this.basePath || p.startsWith(this.basePath + "/")) return p;
+    return this.basePath + "/" + p;
   }
 
   private abstractFile(path: string): VaultLikeFile | null {
@@ -279,6 +288,16 @@ export class VaultRoot implements StorageRoot {
       out.push({ path: rest, name: rest, size: f.stat?.size ?? 0, mtime: f.stat?.mtime ?? 0 });
     }
     return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * 同步列出 vault 内全部文件（相对 vault 根）。
+   * 供布局修复使用：Obsidian 只有 getFiles()（文件列表，不含目录），
+   * 因此修复必须文件驱动，而不是逐层 list 目录。
+   */
+  listAllFilesSync(): string[] {
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    return all.map((f) => f.path);
   }
 
   async prefetch(): Promise<void> {
