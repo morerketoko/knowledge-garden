@@ -509,6 +509,7 @@ __export(fsPortable_exports, {
   appendFileSync: () => appendFileSync,
   existsSync: () => existsSync,
   flushMirror: () => flushMirror,
+  flushMirrorSoon: () => flushMirrorSoon,
   getStorageHost: () => getStorageHost,
   initSyncMirror: () => initSyncMirror,
   mirrorStats: () => mirrorStats,
@@ -571,6 +572,13 @@ function schedule() {
     flushTimer = null;
     void flushMirror();
   }, MIRROR_FLUSH_MS);
+}
+function flushMirrorSoon() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  void Promise.resolve().then(() => flushMirror());
 }
 async function flushMirror() {
   if (!host || flushing || dirty.size === 0) return;
@@ -1579,6 +1587,7 @@ function atomicWriteJson(filePath, value) {
     }
   }
   writeFileSync(filePath, data, "utf8");
+  flushMirrorSoon();
 }
 function repairStaleTempFiles(filePaths, measure) {
   let fixed = 0;

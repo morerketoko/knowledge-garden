@@ -92,9 +92,13 @@ import {
 /**
  * Portable Recovery / Migration 版本（§三十七：作为「已完成」标记，避免每次全量扫描）。
  * - 1：Phase 24 便携存储迁移（无恢复能力）
- * - 2：v1.1.1 Hotfix —— legacy 目标修正 + 错误目录/嵌套/PluginData 恢复 + 临时写残留修复
+ * - 2：v1.1.1 —— legacy 目标修正 + 错误目录/嵌套/PluginData 恢复 + 临时写残留修复
+ * - 3：v1.1.2 —— 备份目录移出状态根 + 恢复/迁移写入「立即落盘」（不再等 800ms 防抖）
+ *
+ * 每次提升版本都会在下次启动重新做一轮完整诊断 + 恢复（幂等且不覆盖非空数据），
+ * 这是「修好代码后让已经跑过旧逻辑的机器重新走一遍」的唯一可靠手段。
  */
-export const PORTABLE_RECOVERY_VERSION = 2;
+export const PORTABLE_RECOVERY_VERSION = 3;
 
 /** 便携恢复状态记录（写入状态根，随 Vault 一起同步到移动端） */
 interface RecoveryMarker {

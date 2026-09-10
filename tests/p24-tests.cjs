@@ -894,6 +894,13 @@ function schedule() {
     void flushMirror();
   }, MIRROR_FLUSH_MS);
 }
+function flushMirrorSoon() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  void Promise.resolve().then(() => flushMirror());
+}
 async function flushMirror() {
   if (!host || flushing || dirty.size === 0) return;
   flushing = true;
@@ -1694,6 +1701,7 @@ function atomicWriteJson(filePath, value) {
     }
   }
   writeFileSync(filePath, data, "utf8");
+  flushMirrorSoon();
 }
 
 // src/ai/cache.ts

@@ -77,6 +77,18 @@ function schedule(): void {
   flushTimer = setTimeout(() => { flushTimer = null; void flushMirror(); }, MIRROR_FLUSH_MS);
 }
 
+/**
+ * 立即（下一个微任务）落盘。
+ *
+ * 供 `atomicWriteJson` 这类「必须持久化」的写入使用：写入本身只改内存镜像，
+ * 真正落盘默认是 800ms 防抖；若进程在窗口内退出（插件卸载 / 关窗 / 崩溃），
+ * 磁盘上仍是旧字节 —— 这正是「索引重建后重启又变回空」的原因。
+ */
+export function flushMirrorSoon(): void {
+  if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }
+  void Promise.resolve().then(() => flushMirror());
+}
+
 /** 立即落盘（插件 onunload / 关键写入后手动调用） */
 export async function flushMirror(): Promise<void> {
   if (!host || flushing || dirty.size === 0) return;

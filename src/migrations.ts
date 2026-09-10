@@ -89,8 +89,10 @@ export function atomicWriteJson(filePath: string, value: unknown): void {
     // rename 不可用：清掉临时文件，直接写目标
     try { fs.unlinkSync(tmp); } catch { /* 临时文件可能不存在 */ }
   }
-  // 无论走哪条分支，都同步把目标写成最终内容（防止只改了镜像、磁盘留旧字节）
+  // 同步再写一次目标（内存镜像即时生效），随后**立即落盘**：
+  // 便携层的常规落盘是 800ms 防抖，索引重建/状态保存不能等 —— 进程在窗口内退出会丢。
   fs.writeFileSync(filePath, data, "utf8");
+  fs.flushMirrorSoon();
 }
 
 /**
