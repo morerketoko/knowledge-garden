@@ -212,6 +212,42 @@ AI 把几篇笔记连成一条**有解释的路径**——「为什么这几篇�
 
 **自愈机制**：损坏的缓存会被自动隔离到 `Knowledge Garden/.state/cache/.corrupt/`（保留可恢复副本，不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
 
+**v1.1.4 索引完整性守衞（Phase 24.2）**：找到了「复习卡/考试消失」最根本的那一步 —— **启动顺序**。
+
+旧顺序（v1.1.0~v1.1.3）：
+
+```
+NoteIndex.load  →  activity.prune  →  spaced.prune  →  …  →  void ensureIndexesAgainstAssets()
+```
+
+当 `index.json` 只剩 37 条时，`activity.prune` / `spaced.prune` 会拿这 37 条当依据，判定其余 4300 篇笔记「已删除」，从而**永久删除** Activity 与 FSRS 卡片；而资产索引修复排在最后、还是 fire-and-forget。
+
+v1.1.4 的新顺序：
+
+```
+NoteIndex.load → **IndexIntegrityCheck**（不健康就全量重扫）→ 只有健康才允许 prune
+              → Activity.load → FSRS.load → ExamStore.load → CardStore.load
+              → **await 资产索引重建（cards/exams）** → 只写索引、绝不改 Markdown
+              → 写恢复标记 → rerenderDashboard
+```
+
+新增能力：
+
+- `isIndexHealthy()`：`healthy = indexed >= max(1, floor(vaultNotes × 0.95))`，vault 笔记数**排除** `.obsidian/` 与插件资产目录（Review Cards / Exams 等）。
+- 索引不健康 → `console.warn("[KnowledgeGarden][Integrity] index suspicious; skip prune")`，**跳过全部破坏性 prune**（Activity / FSRS / Review Queue / Discovery）。
+- `repairIndexFromAssets()`：从 Markdown **确定性**重建索引（递归含子目录），逐文件报告 `broken`，损坏文件**不删除**、其余卡片保留。
+- 恢复后立即校验「内存 == 磁盘」，并 `flushMirrorSoon()` 强制落盘（只写内存不算恢复）。
+- Diagnostics 新增：Index Health / Activity Coverage / Knowledge State / Created Age / 资产索引恢复结果 / Recovery Marker。
+- 恢复标记 `portableRecoveryVersion = 4`，记录 `cardsRestored / examsRestored / cardsBroken / activityEntries / fsrsPresent / indexHealthy`。
+
+**关于 Dashboard「全部 new」的结论**（v1.1.4 已可诊断）：`deriveState()` 的第一条规则是
+`created ≤ newDays → new`。因此「全部 new」只有两种可能，Diagnostics 现在会直接给出归因：
+
+- `created` 时间集中在最近 7 天（Obsidian `stat.ctime` 在重建索引/首次同步后可能重置）→ 归因 **created_time**；
+- `created` 正常但 Activity 覆盖极低 → 归因 **activity_missing**（例如本机 Activity 只有 2 / 4339 = 0.046%）。
+
+插件**不会**为了让画面好看去改 `created` 或放宽状态阈值（那会污染知识状态语义）。
+
 **v1.1.2 数据恢复 Hotfix（重要）**：v1.1.0/v1.1.1 期间出现的「状态看起来消失」由**两个独立缺陷**造成：
 
 | # | 缺陷 | 症状 |

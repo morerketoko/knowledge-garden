@@ -88,6 +88,15 @@ import {
   type BackupResult, type FileDiagnosis, type RecoveryReport, type StateSourceOptions,
   STATE_FILES, backupSources, diagnoseStateSources, jsonWeight, recoverState,
 } from "./portable/recovery";
+import {
+  type IndexHealth, isIndexHealthy, knowledgeMarkdownCount, repairIndexFromAssets,
+  type AssetRepairOutcome, type AssetVault,
+} from "./portable/assetRecovery";
+import {
+  activityIntegrityReport, createdIntegrityReport, knowledgeStateDiagnostics,
+  type ActivityIntegrityReport, type CreatedIntegrityReport, type KnowledgeStateDiagnostics,
+} from "./portable/integrityDiagnostics";
+import { flushMirrorSoon } from "./portable/fsPortable";
 
 /**
  * Portable Recovery / Migration 版本（§三十七：作为「已完成」标记，避免每次全量扫描）。
@@ -98,7 +107,7 @@ import {
  * 每次提升版本都会在下次启动重新做一轮完整诊断 + 恢复（幂等且不覆盖非空数据），
  * 这是「修好代码后让已经跑过旧逻辑的机器重新走一遍」的唯一可靠手段。
  */
-export const PORTABLE_RECOVERY_VERSION = 3;
+export const PORTABLE_RECOVERY_VERSION = 4;
 
 /** 便携恢复状态记录（写入状态根，随 Vault 一起同步到移动端） */
 interface RecoveryMarker {
@@ -108,6 +117,16 @@ interface RecoveryMarker {
   restored: number;
   conflicts: number;
   missing: number;
+  // Phase 24.2 §三十：恢复/完整性事实
+  cardsRestored?: number;
+  examsRestored?: number;
+  cardsBroken?: number;
+  examsBroken?: number;
+  activityEntries?: number;
+  fsrsPresent?: boolean;
+  indexHealthy?: boolean;
+  indexCount?: number;
+  vaultMarkdownCount?: number;
 }
 
 const RECOVERY_STATUS_PATH = ".recovery-status.json";
@@ -280,6 +299,30 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const baseDir = legacyDir;
     this.index = new NoteIndex(this.app, baseDir);
     await this.index.load();
+
+    // ══ Phase 24.2 §十二/§十三/§十五：索引完整性守卫（必须是**破坏性操作之前**的第一道闸门）══
+    // 事故复盘：曾经的启动顺序是
+    //   NoteIndex.load → activity.prune → spaced.prune → … → （onload 末尾）void ensureIndexesAgainstAssets()
+    // 当 index.json 只剩 37 条时，prune 会按「37 条的索引」判定其余 4300 篇笔记已删除，
+    // 从而**永久删除** Activity 与 FSRS 卡片；而资产索引修复却排在最后且 fire-and-forget。
+    // 现在：先判定索引健康 → 不健康就全量重扫 → 重扫后重新判定 → 只有健康才允许 prune。
+    this.vaultMarkdownFiles = this.app.vault.getMarkdownFiles();
+    this.evaluateIndexHealth();
+    if (!this.indexHealth.healthy) {
+      console.warn("[KnowledgeGarden][Integrity] " + this.indexHealth.reason + " → 触发全量重扫");
+      try {
+        await this.index.rescanAll();
+      } catch (e) {
+        console.error("[KnowledgeGarden][Integrity] 索引全量重扫失败：", e);
+      }
+      this.evaluateIndexHealth();
+    }
+    const indexOk = this.indexHealth.healthy;
+    if (!indexOk) {
+      console.warn("[KnowledgeGarden][Integrity] index suspicious; skip prune");
+    }
+    this.indexedPaths = new Set(this.index.all().map((n) => n.path));
+
     this.searchIndex = new SearchIndex(this.app, (pathStr) => this.index.get(pathStr));
     this.queryHistory = new QueryHistoryStore(baseDir);
     const queryHistoryCorrupt = this.queryHistory.load();
@@ -289,7 +332,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const relCorrupt = this.relationships.load();
     this.activity = new ActivityStore(baseDir);
     const activityCorrupt = this.activity.load();
-    this.activity.prune(new Set(this.index.all().map((n) => n.path)));
+    // §十五：索引不健康时**禁止破坏性 prune**（否则会用残缺索引删掉真实数据）
+    if (indexOk) this.activity.prune(this.indexedPaths);
+    else console.warn("[KnowledgeGarden][Integrity] 跳过 activity.prune（索引不健康）");
     this.cache = new AICache(baseDir);
     const cacheCorrupt = this.cache.load();
     this.evolution = new EvolutionStore(baseDir);
@@ -298,8 +343,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.reviewCenter = new ReviewCenterStore(baseDir);
     this.spaced = new SpacedReviewStore(baseDir);
     const spacedCorrupt = this.spaced.load();
-    // Phase 20：FSRS 卡/session 指向不存在的笔记 → 与 Activity 一样随索引清理（保持 O(note count)）
-    this.spaced.prune(new Set(this.index.all().map((n) => n.path)));
+    // Phase 20：FSRS 卡/session 指向不存在的笔记 → 与 Activity 一样随索引清理
+    // §十五：但索引不健康时绝不 prune（FSRS 是 JSON-only 数据，删了就永久丢失）
+    if (indexOk) this.spaced.prune(this.indexedPaths);
+    else console.warn("[KnowledgeGarden][Integrity] 跳过 spaced.prune（索引不健康）");
     this.reviewScope = defaultReviewScope();
 
     this.examStore = new ExamStore(baseDir);
@@ -560,9 +607,39 @@ export default class KnowledgeGardenPlugin extends Plugin {
     void this.ensureRelationshipFolder().then(() => void this.scanRelationshipMarkdown());
     // Capture/Processing（本阶段）：确保目录可用 + 刷新计数（0 AI，§六十九/一百一十一）
     void this.ensureCaptureFolders();
-    // 空索引自愈（0 AI）：Markdown 资产仍在、索引却是空的 → 自动重建，避免「复习卡/考试消失」
-    // 放在存储与索引就绪之后，保证备份与写入都走便携存储
-    void this.ensureIndexesAgainstAssets();
+    // ══ Phase 24.2 §十/§三十九/§四十：确定性资产索引恢复 ══
+    // 必须 await（不再 fire-and-forget）且显式捕获：失败要 console.error + Notice，
+    // 绝不静默；成功要 rerenderDashboard()，不等下次重启（§三十八/§六十）。
+    await this.repairAssetIndexes();
+  }
+
+  /**
+   * §十/§三十九：确定性资产索引恢复（0 AI）。
+   * 顺序：备份 → 重建 cards → 重建 exams → 写恢复标记 → 重渲染 Dashboard。
+   * 任何异常都被捕获并显式报告（§十一/§四十），绝不影响插件其它功能。
+   */
+  private async repairAssetIndexes(): Promise<void> {
+    try {
+      // §三十二：先备份当前索引状态（只读复制；备份失败只影响标记，不阻塞索引重建）
+      await this.backupRecoveryInputs();
+      this.cardRepair = await this.repairReviewCardIndexFromAssets();
+      this.examRepair = await this.repairExamIndexFromAssets();
+      if (this.cardRepair) await this.verifyRepairPersisted("cards", this.cardRepair.persisted, this.cards.count());
+      if (this.examRepair) await this.verifyRepairPersisted("exams", this.examRepair.persisted, this.examStore.all().length);
+      this.recoveryError = null;
+    } catch (e) {
+      this.recoveryError = e instanceof Error ? e.message : String(e);
+      console.error("[KnowledgeGarden][Recovery] 资产索引恢复失败：", e);
+      new Notice(
+        "复习卡/考试索引自动恢复失败：" + this.recoveryError
+        + "。Markdown 资产仍然存在，索引未能重建，请打开 Diagnostics 查看详情。",
+        12000
+      );
+    }
+    // §三十：把恢复事实写进 marker（v4）
+    await this.writeMarkerWithAssets();
+    // §三十七/§六十：恢复完成后立即刷新 Dashboard
+    try { this.rerenderDashboard(); } catch { /* 视图未打开时忽略 */ }
   }
 
   onunload(): void {
@@ -707,6 +784,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
     await initSyncMirror(host);
     this.storageHost = host;
+    this.vaultRoot = vaultRoot;
     this.storageBackendLabel = host.reason + " · " + (writable ? "vault" : "plugin-data");
     this.migrationSummary = migration + (this.migrationSummary ? "；" + this.migrationSummary : "");
     // v1.1.0 布局修复：把曾经写到嵌套目录（<stateRoot>/<baseDir>/…）里的状态搬回正确位置
@@ -725,6 +803,44 @@ export default class KnowledgeGardenPlugin extends Plugin {
       this.recoveryMarker = recovery;
     } catch { /* 标记写入失败只影响下次是否重扫 */ }
     return legacyDir;
+  }
+
+  /** Phase 24.2 §三十：资产索引恢复完成后，把「恢复事实」补写进 marker
+   *  （卡片/考试恢复数、Activity 真实条目数、FSRS 是否存在、索引健康度）。 */
+  private async writeMarkerWithAssets(): Promise<void> {
+    const root = this.vaultRoot;
+    if (!root) return;
+    try {
+      const health = this.indexIntegrityReport();
+      const act = this.activityIntegrityReport();
+      const base: RecoveryMarker = this.recoveryMarker
+        ? { ...this.recoveryMarker }
+        : { version: PORTABLE_RECOVERY_VERSION, completedAt: Date.now(), backupDir: "", restored: 0, conflicts: 0, missing: 0 };
+      base.version = PORTABLE_RECOVERY_VERSION;
+      base.completedAt = Date.now();
+      base.cardsRestored = this.cardRepair ? this.cardRepair.persisted : this.cards.count();
+      base.examsRestored = this.examRepair ? this.examRepair.persisted : this.examStore.all().length;
+      base.cardsBroken = this.cardRepair ? this.cardRepair.broken.length : 0;
+      base.examsBroken = this.examRepair ? this.examRepair.broken.length : 0;
+      base.activityEntries = act.activityEntries;
+      base.fsrsPresent = this.spaced.count() > 0 || this.spaced.scAll().length > 0;
+      base.indexHealthy = health.healthy;
+      base.indexCount = health.indexedCount;
+      base.vaultMarkdownCount = health.vaultMarkdownCount;
+      await writeRecoveryMarker(root, base);
+      this.recoveryMarker = base;
+      console.log("[KnowledgeGarden][Recovery] marker → v" + base.version
+        + " cards=" + base.cardsRestored + " exams=" + base.examsRestored
+        + " activity=" + base.activityEntries + " fsrs=" + base.fsrsPresent
+        + " indexHealthy=" + base.indexHealthy);
+    } catch (e) {
+      console.error("[KnowledgeGarden][Recovery] marker 写入失败：", e);
+    }
+  }
+
+  /** Phase 24.2 §十七：Activity 完整性报告（事实，不伪造） */
+  activityIntegrityReport(): ActivityIntegrityReport {
+    return activityIntegrityReport(this.activity as never, this.index.all().length);
   }
 
   /** 从 data.json 取 kgMirror 快照（键 → 文本），用于 PluginData 恢复（§二十八） */
@@ -817,6 +933,19 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** 便携存储宿主（迁移 / 诊断 / 测试使用） */
   storageHost: PortableStorageHost | null = null;
+  /** Phase 24.2：VaultRoot（写恢复标记用） */
+  private vaultRoot: VaultRoot | null = null;
+  /** Phase 24.2 §十三：本次启动的 vault Markdown 清单（判定索引完整性用） */
+  private vaultMarkdownFiles: TFile[] = [];
+  /** Phase 24.2 §十三：索引健康度（prune 的唯一闸门） */
+  indexHealth: IndexHealth = { indexedCount: 0, vaultMarkdownCount: 0, ratio: 0, healthy: true, threshold: 1, reason: "未评估" };
+  /** Phase 24.2：健康索引下的笔记路径集合（复用于 prune，避免重复构造） */
+  private indexedPaths: Set<string> = new Set();
+  /** Phase 24.2 §十一/§四十：本次启动的恢复错误（Diagnostics 展示） */
+  recoveryError: string | null = null;
+  /** Phase 24.2：本次启动的资产索引重建结果 */
+  cardRepair: AssetRepairOutcome<SavedReviewCard> | null = null;
+  examRepair: AssetRepairOutcome<NoteExam> | null = null;
   /** 启动时的状态来源诊断（§五十：Diagnostics 展示） */
   stateDiagnosis: FileDiagnosis[] = [];
   /** 本次启动的恢复备份结果 */
@@ -2620,8 +2749,193 @@ export default class KnowledgeGardenPlugin extends Plugin {
     await leaf.setViewState({ type: VIEW_TYPE_REVIEW, active: true });
     this.app.workspace.revealLeaf(leaf);
   }
-  /** 行为数据随索引清理：删除/改名/重建后，移除已不存在笔记的活动条目，保持 O(note count) */
+  /** Phase 24.2 §十三/§十四：评估索引健康度（vault 笔记数排除 .obsidian 与插件资产目录） */
+  private evaluateIndexHealth(): void {
+    const indexed = this.index?.all().length ?? 0;
+    const vaultCount = this.vaultMarkdownFiles.length > 0
+      ? knowledgeMarkdownCount(this.vaultMarkdownFiles)
+      : 0;
+    this.indexHealth = isIndexHealthy(indexed, vaultCount);
+  }
+
+  /** Phase 24.2 §十三：供 Diagnostics 使用的最新索引健康报告 */
+  indexIntegrityReport(): IndexHealth {
+    this.evaluateIndexHealth();
+    return this.indexHealth;
+  }
+
+  /** Phase 24.2 §十六：只读完整性报告（对齐 §五十/§五十一） */
+  integrityReport(): {
+    index: IndexHealth;
+    activity: ActivityIntegrityReport;
+    knowledgeState: KnowledgeStateDiagnostics;
+    created: CreatedIntegrityReport;
+  } {
+    const notes = this.index.all();
+    const rules = {
+      newDays: this.settings.activity.newDays,
+      staleDays: this.settings.activity.staleDays,
+      forgottenDays: this.settings.activity.forgottenDays,
+    };
+    return {
+      index: this.indexIntegrityReport(),
+      activity: activityIntegrityReport(this.activity as never, notes.length),
+      knowledgeState: knowledgeStateDiagnostics(notes, (p) => this.activity.get(p), rules),
+      created: createdIntegrityReport(notes),
+    };
+  }
+
+  /**
+   * §三：确定性重建复习卡索引（Markdown = Source of Truth）。
+   * 只在 `cards.json` missing / invalid / entries=0 时动作（§七）；非空绝不覆盖。
+   */
+  async repairReviewCardIndexFromAssets(): Promise<AssetRepairOutcome<SavedReviewCard> | null> {
+    const before = await this.stateIndexStatus("cache/cards.json", this.cards.count());
+    if (!before.needsRepair) {
+      console.log("[KnowledgeGarden][Recovery] cards.json " + before.reason + " → 不覆盖（§七）");
+      return null;
+    }
+    console.log("[KnowledgeGarden][Recovery] cards.json " + before.reason + " → 从 Review Cards/*.md 确定性重建");
+    await this.backupStateFile("cache/cards.json");
+    const outcome = await repairIndexFromAssets<SavedReviewCard>(
+      "复习卡",
+      cardsDirPath(),
+      this.assetVault(),
+      (md) => parseCardMarkdown(md).card ?? null,
+      (entries) => { this.cards.replaceAll(entries); return this.cards.count(); }
+    );
+    console.log("[KnowledgeGarden][Recovery] 复习卡：扫描 " + outcome.scanned + "，解析 "
+      + outcome.parsed + "，失败 " + outcome.broken.length + "，写回 " + outcome.persisted);
+    if (outcome.broken.length) {
+      console.warn("[KnowledgeGarden][Recovery] 无法解析的复习卡文件（未删除）：",
+        outcome.broken.map((b) => b.path + " — " + b.reason));
+    }
+    new Notice("知识花园：复习卡索引已从 " + outcome.scanned + " 个 Markdown 重建"
+      + "（成功 " + outcome.parsed + "，失败 " + outcome.broken.length + "，0 AI）"
+      + (outcome.broken.length ? "。失败文件仍保留，详见 Diagnostics。" : "。"), 9000);
+    return outcome;
+  }
+
+  /** §九：确定性重建考试索引（Markdown = Source of Truth），同样只在空/非法时动作 */
+  async repairExamIndexFromAssets(): Promise<AssetRepairOutcome<NoteExam> | null> {
+    const before = await this.stateIndexStatus("cache/exams.json", this.examStore.all().length);
+    if (!before.needsRepair) {
+      console.log("[KnowledgeGarden][Recovery] exams.json " + before.reason + " → 不覆盖（§七）");
+      return null;
+    }
+    console.log("[KnowledgeGarden][Recovery] exams.json " + before.reason + " → 从 Exams/*.md 确定性重建");
+    await this.backupStateFile("cache/exams.json");
+    const outcome = await repairIndexFromAssets<NoteExam>(
+      "考试",
+      examDirPath(),
+      this.assetVault(),
+      (md) => parseExamMarkdown(md).exam ?? null,
+      (entries) => { this.examStore.replaceAll(entries); return this.examStore.all().length; }
+    );
+    console.log("[KnowledgeGarden][Recovery] 考试：扫描 " + outcome.scanned + "，解析 "
+      + outcome.parsed + "，失败 " + outcome.broken.length + "，写回 " + outcome.persisted);
+    if (outcome.broken.length) {
+      console.warn("[KnowledgeGarden][Recovery] 无法解析的考试文件（未删除）：",
+        outcome.broken.map((b) => b.path + " — " + b.reason));
+    }
+    new Notice("知识花园：考试索引已从 " + outcome.scanned + " 个 Markdown 重建"
+      + "（成功 " + outcome.parsed + "，失败 " + outcome.broken.length + "，0 AI）"
+      + (outcome.broken.length ? "。失败文件仍保留，详见 Diagnostics。" : "。"), 9000);
+    return outcome;
+  }
+
+  /** §七：判定某状态索引是否需要重建（missing / invalid / entries=0），并给出原因 */
+  private async stateIndexStatus(rel: string, inMemoryCount: number): Promise<{ needsRepair: boolean; count: number; reason: string }> {
+    const host = this.storageHost;
+    if (inMemoryCount > 0) return { needsRepair: false, count: inMemoryCount, reason: "已加载 " + inMemoryCount + " 条" };
+    if (!host) return { needsRepair: false, count: 0, reason: "存储未就绪（跳过以避免误判）" };
+    let raw: string | null = null;
+    try { raw = await host.read(rel); } catch { raw = null; }
+    if (raw === null) return { needsRepair: true, count: 0, reason: "文件缺失" };
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (jsonWeight(parsed) <= 0) return { needsRepair: true, count: 0, reason: "文件为空（entries=0）" };
+      return { needsRepair: false, count: 0, reason: "文件非空但内存为 0（不覆盖，避免误伤）" };
+    } catch {
+      return { needsRepair: true, count: 0, reason: "JSON 非法" };
+    }
+  }
+
+  /**
+   * §八：重建后立即验证「磁盘 == 内存」，并强制落盘。
+   * 只写内存不算恢复完成（v1.1.0~v1.1.2 的第二个根因）。
+   */
+  private async verifyRepairPersisted(kind: string, persisted: number, inMemory: number): Promise<void> {
+    flushMirrorSoon();
+    const host = this.storageHost;
+    if (!host) return;
+    const rel = "cache/" + (kind === "cards" ? "cards.json" : "exams.json");
+    try {
+      const written = await host.read(rel);
+      const onDisk = written ? jsonWeight(JSON.parse(written)) : 0;
+      if (onDisk !== inMemory || persisted !== inMemory) {
+        console.error("[KnowledgeGarden][Recovery] " + kind + " 重建后校验不一致：内存 "
+          + inMemory + "，写回报告 " + persisted + "，磁盘 " + onDisk);
+      } else {
+        console.log("[KnowledgeGarden][Recovery] " + kind + " 重建后校验一致：内存=磁盘=" + onDisk);
+      }
+    } catch (e) {
+      console.error("[KnowledgeGarden][Recovery] " + kind + " 重建后读回校验失败：", e);
+    }
+  }
+
+  /** §三十二：把本次恢复的输入（状态索引 + 资产数量）只读备份一份到 vault 根 `.state-recovery/` */
+  private async backupRecoveryInputs(): Promise<void> {
+    try {
+      const host = this.storageHost;
+      if (!host) return;
+      const dir = joinVaultPath(".state-recovery", recoveryStamp());
+      const files = ["cache/cards.json", "cache/exams.json", "cache/index.json", "cache/activity.json", "cache/spaced-review.json"];
+      for (const rel of files) {
+        let raw: string | null = null;
+        try { raw = await host.read(rel); } catch { raw = null; }
+        if (raw === null) continue;
+        await host.writeRaw(joinVaultPath(dir, rel.replace(/\//g, "__")), raw);
+      }
+      await host.writeRaw(joinVaultPath(dir, "manifest.json"), JSON.stringify({
+        at: Date.now(),
+        note: "Phase 24.2 恢复前备份（只读复制，未删除任何原文件）",
+        stateFiles: files,
+        reviewCardMarkdown: this.mdFilesInFolder(cardsDirPath()).length,
+        examMarkdown: this.mdFilesInFolder(examDirPath()).length,
+        indexHealth: this.indexHealth,
+      }, null, 2));
+      console.log("[KnowledgeGarden][Recovery] 恢复前备份 → " + dir);
+    } catch (e) {
+      // §三十三：备份失败不阻塞「只写索引」的资产重建，但必须显式记录
+      console.error("[KnowledgeGarden][Recovery] 恢复前备份失败：", e);
+    }
+  }
+
+  /** 适配 Obsidian Vault 为资产恢复的最小接口（§三：getMarkdownFiles 递归，支持子目录） */
+  private assetVault(): AssetVault {
+    return {
+      markdownFiles: () => (this.vaultMarkdownFiles.length ? this.vaultMarkdownFiles : this.app.vault.getMarkdownFiles()),
+      read: (f) => this.app.vault.cachedRead(f as TFile),
+    };
+  }
+
+  /** Phase 24.2 §二十一：created 完整性报告（Diagnostics） */
+  createdIntegrityReport(): CreatedIntegrityReport {
+    return createdIntegrityReport(this.index.all());
+  }
+
+  /**
+   * 行为数据随索引清理（删除/改名/重建后移除已不存在笔记的条目，保持 O(note count)）。
+   *
+   * §十五：**索引不健康时整段跳过**。这些 prune 都是破坏性操作，一旦拿残缺索引当依据
+   * 就会永久删除 Activity / FSRS / Review Queue / Discovery 里仍然有效的数据。
+   */
   private pruneActivity(): void {
+    if (!this.indexHealth.healthy) {
+      console.warn("[KnowledgeGarden][Integrity] index suspicious; skip prune (" + this.indexHealth.reason + ")");
+      return;
+    }
     const existing = new Set(this.index.all().map((n) => n.path));
     this.activity.prune(existing);
     this.reviewCenter.prunePaths(existing);

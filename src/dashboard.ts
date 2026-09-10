@@ -27,7 +27,7 @@ export class DashboardView extends ItemView {
   getDisplayText(): string { return this.plugin.settings.dashboardName; }
   getIcon(): string { return "flower-2"; }
 
-  private renderTimer: number | null = null;
+  private renderTimer: ReturnType<typeof setTimeout> | null = null;
   /** Discovery Scope：当前设置的探索范围标签（奇想/漫游各自独立，§六/四十九） */
   private discoveryScopeOf(feature: "curiosity" | "roaming"): string {
     return discoveryScopeLabel(this.plugin.settings.discovery?.[feature]?.scope, this.plugin.settings.knowledgeAreas);
@@ -80,7 +80,8 @@ export class DashboardView extends ItemView {
 
   scheduleRender(): void {
     if (this.renderTimer !== null) return;
-    this.renderTimer = window.setTimeout(() => {
+    // 用全局 setTimeout（而非 window.setTimeout）：桌面 / 移动 / Node 测试环境都可用
+    this.renderTimer = setTimeout(() => {
       this.renderTimer = null;
       if (this.closed || !this.containerEl.isConnected) return;
       this.render();

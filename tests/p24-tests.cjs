@@ -1784,7 +1784,7 @@ var ActivityStore = class {
   markDirty() {
     this.dirty = true;
     if (this.flushTimer !== null) return;
-    this.flushTimer = window.setTimeout(() => {
+    this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.flush();
     }, 800);
@@ -1803,6 +1803,10 @@ var ActivityStore = class {
   /** 诊断用：条目总数（§四十一） */
   count() {
     return this.data.size;
+  }
+  /** 诊断用（Phase 24.2 §十七）：全部条目快照，只读 */
+  all() {
+    return Array.from(this.data.values());
   }
   recent(limit) {
     return Array.from(this.data.entries()).filter(([, e]) => typeof e.lastAccessedAt === "number").sort((a, b) => (b[1].lastAccessedAt ?? 0) - (a[1].lastAccessedAt ?? 0)).slice(0, limit).map(([path2, entry]) => ({ path: path2, entry }));

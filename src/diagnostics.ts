@@ -164,7 +164,60 @@ export class DiagnosticsModal extends Modal {
       ["Web Requests（会话内真实抓取）", String(webFetchCount) + " 次（缓存命中不计）"],
 
     ];
+    // Phase 24.2 §十六~§二十二 / §三十七：索引完整性 + Activity 事实 + 状态分布（全部只读）
+    lines.push(...this.integrityLines());
     return lines;
+  }
+
+  /**
+   * Phase 24.2：完整性诊断（§十六/§十七/§十八/§二十一）。
+   * 只报告事实：**不伪造 Activity、不修改 created**（§二十二）。
+   */
+  private integrityLines(): [string, string][] {
+    const p = this.plugin;
+    const out: [string, string][] = [];
+    try {
+      const rep = p.integrityReport();
+      const h = rep.index;
+      out.push(["Index Health", (h.healthy ? "健康" : "不健康（已跳过 prune）")
+        + " · indexed " + h.indexedCount + " / vault " + h.vaultMarkdownCount
+        + "（" + (h.ratio * 100).toFixed(1) + "%，阈值 " + h.threshold + "）"]);
+      const a = rep.activity;
+      out.push(["Activity Coverage", a.activityEntries + " / " + a.indexedNotes
+        + "（" + (a.activityCoverage * 100).toFixed(3) + "%）· 有访问 " + a.accessedEntries
+        + " · 有复习 " + a.reviewedEntries + " —— 事实，不伪造"]);
+      const ks = rep.knowledgeState;
+      out.push(["Knowledge State", "new " + ks.stateCounts.new + " · growing " + ks.stateCounts.growing
+        + " · active " + ks.stateCounts.active + " · stale " + ks.stateCounts.stale
+        + " · forgotten " + ks.stateCounts.forgotten]);
+      const c = rep.created;
+      out.push(["Created Age", "<7d " + c.within7d + " · <30d " + c.within30d
+        + " · 未来时间 " + c.future + " · created>modified " + c.createdAfterModified]);
+      out.push(["“全部 new”归因", ks.note]);
+      if (c.warnConcentrated) out.push(["Created 告警", c.note]);
+      const cardOut = p.cardRepair;
+      const examOut = p.examRepair;
+      out.push(["资产索引恢复", "复习卡 " + (cardOut ? "扫描 " + cardOut.scanned + " / 成功 " + cardOut.parsed
+        + " / 失败 " + cardOut.broken.length + " / 写回 " + cardOut.persisted : "无需重建（索引非空）")
+        + " · 考试 " + (examOut ? "扫描 " + examOut.scanned + " / 成功 " + examOut.parsed
+        + " / 失败 " + examOut.broken.length + " / 写回 " + examOut.persisted : "无需重建（索引非空）")]);
+      if (cardOut && cardOut.broken.length) {
+        out.push(["无法解析的复习卡", cardOut.broken.slice(0, 5).map((b) => b.path).join(" · ") + (cardOut.broken.length > 5 ? " …（共 " + cardOut.broken.length + "）" : "")]);
+      }
+      if (examOut && examOut.broken.length) {
+        out.push(["无法解析的考试", examOut.broken.slice(0, 5).map((b) => b.path).join(" · ") + (examOut.broken.length > 5 ? " …（共 " + examOut.broken.length + "）" : "")]);
+      }
+      if (p.recoveryError) out.push(["恢复错误", p.recoveryError]);
+      const mk = p.recoveryMarker;
+      if (mk) {
+        out.push(["Recovery Marker", "v" + mk.version + " · cards " + (mk.cardsRestored ?? "—")
+          + " · exams " + (mk.examsRestored ?? "—") + " · activity " + (mk.activityEntries ?? "—")
+          + " · fsrs " + (mk.fsrsPresent ? "有" : "无") + " · backup " + (mk.backupDir || "—")]);
+      }
+    } catch (e) {
+      out.push(["完整性诊断", "读取失败：" + (e instanceof Error ? e.message : String(e))]);
+    }
+    return out;
   }
 
   /** AI Function Routing（§一百三十一）：功能 / Provider / Model / Web / Cache Type + 今日真实调用统计。
