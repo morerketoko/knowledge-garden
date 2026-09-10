@@ -1,5 +1,5 @@
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
+import * as path from "./portable/pathShim";
 import type { ActivityEntry } from "./types";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 

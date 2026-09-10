@@ -205,10 +205,43 @@ AI 把几篇笔记连成一条**有解释的路径**——「为什么这几篇�
 | 捕获 / 候选 / 已确认知识 | `Knowledge Garden/`（Inbox / Processing / Knowledge / Archive） | 都是 Markdown 文件 |
 | 已确认知识关系 | `Relationships/` | Markdown 落盘，可随 Vault 恢复 |
 | 收藏链路 | `Saved/` | Markdown 落盘 |
-| AI 缓存与程序状态 | 插件目录 `cache/` 等 | 可随时清空，不影响你的知识 |
+| 程序状态（索引 / Activity / AI 缓存 / FSRS / 考试 / 复习卡 / Workbench 会话 / Prompt / 项目） | `Knowledge Garden/.state/` | 桌面与移动共用同一位置；可随时清空，不影响你的知识 |
 | 设置与 AI Key | 插件目录 `data.json` | **仅本地**，`.gitignore` 已排除，不会上传 |
 
-**自愈机制**：损坏的缓存会被自动隔离（不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
+**为什么状态目录变了？** 从 Phase 24 起，插件状态从 `.obsidian/plugins/knowledge-garden/cache/` 迁到 `Knowledge Garden/.state/`，因为 `.obsidian` 在 Obsidian 移动端（iOS / Android）无法可靠读写。旧文件会在首次启动时自动复制到新位置，**旧文件不会被删除**；若仓库无法写入（只读 / 同步冲突），插件会自动改用 Obsidian Plugin Data 存储并在启动时提示。
+
+**自愈机制**：损坏的缓存会被自动隔离到 `Knowledge Garden/.state/cache/.corrupt/`（保留可恢复副本，不会让插件崩溃）；诊断面板提供重建索引 / 重建搜索索引 / 重建复习队列 / 清理过期缓存等修复操作。
+
+---
+
+## 七之二、移动端支持（iOS / Android）
+
+**当前状态：Mobile compatibility in testing（代码审计 + 桌面移动端模拟通过；真机验证待完成）。**
+
+已完成（Phase 24 Mobile Compatibility Refactor）：
+
+- `manifest.json` → `isDesktopOnly: false`，可安装到 Obsidian Mobile。
+- **移除全部 Node 依赖**：源码不再 import `fs` / `path` / `crypto` / `electron` / `child_process`；构建产物 `main.js` 中 `require("fs"|"path"|"crypto")` 计数为 0。
+- **存储层改为平台无关**：统一 `PortableStorage`（Obsidian Vault API 优先，Plugin Data API 兜底），同步读靠启动时预热的内存镜像，写入按后端能力选择原子策略。
+- **哈希改为 browser-safe 同步 SHA-256**（保持同步 API，不引入 Promise 级联改动）。
+- **AI 请求改走 `requestUrl`**；流式输出用移动端 WebView 可用的流式读取，环境不支持时自动回退非流式（功能不降级，仅少逐字效果）。
+- **剪贴板**改用 `navigator.clipboard` + 降级方案，读不到时提供手动粘贴入口。
+- **响应式与触摸**：phone / tablet 断点、单列布局、44px 触摸目标、`env(safe-area-inset-*)`、底部常驻操作区、知识图双指缩放与 tap 信息面板、长文本与长 URL 换行规则。
+
+各功能在移动端的预期可用性（**PASS/FAIL 均为代码审计与模拟结论，非真机**）：
+
+| 功能 | 移动端预期 | 平台差异 |
+| --- | --- | --- |
+| Dashboard（首屏 / 今日状态 / 卡片） | 可用 | 手机为单列；Hero 高度 200–280px；知识漫游图仅在进入该区块时初始化 |
+| Review / FSRS | 可用 | 四个评分按钮 ≥44px；上一张/下一张为底部常驻条 |
+| 我的复习卡 / 考试 | 可用 | 搜索 `type=search`；选择题手机单列、平板可 2×2；编辑弹窗限高可滚动 |
+| AI / Workbench（Ask / Research / Project / 追问 / 保存 / 来源） | 可用 | 底部常驻输入区；流式失败自动回退非流式；**离线时明确提示**，不静默失败 |
+| 知识图 / 探索 | 可用 | 支持 tap / drag / pinch zoom；hover 提示在触摸端改为底部信息面板 |
+| Capture / Processing | 可用 | 剪贴板不可读时自动打开手动捕获表单 |
+| Hero / 音乐播放器 | 可用 | 遵守 iOS 音频手势限制：**默认不自动播放**，必须用户点按 |
+| 移动端存储 | 可用 | 状态写入 `Knowledge Garden/.state/`；Vault 不可写时降级 Plugin Data |
+
+**尚未验证（NOT TESTED）**：iOS / Android 真机安装与长时间使用、真机软键盘与返回手势、真机剪贴板权限、1000/5000/10000 笔记规模下的移动端启动与首屏性能。因此本文档**不声明「完全支持移动端」**。
 
 ---
 
@@ -239,10 +272,19 @@ AI 把几篇笔记连成一条**有解释的路径**——「为什么这几篇�
 ```bash
 cd knowledge-garden
 npm install
-npm run build   # 产出 main.js
+npm run build   # tsc 类型检查 + esbuild 产出 main.js
 ```
 
 构建产物 `main.js` + `manifest.json` + `styles.css` 就是可直接放入 `Vault/.obsidian/plugins/` 的插件本体。若构建报错，把 `node_modules` 删除后重新 `npm install` 再试。
+
+**自动测试**（Node，无需 Obsidian）：
+
+```bash
+node tests/build-tests.mjs      # 编译 tests/*.ts → tests/*.cjs
+node tests/p24-tests.cjs        # Phase 24 移动兼容（100 项）
+node tests/p23-tests.cjs        # Phase 23 回归
+# …其余 tests/*.cjs 同理
+```
 
 > 📁 本仓库的 `.gitignore` 已排除 `data.json`（含本地 API Key）、`node_modules` 与 `cache/`，推送 / 克隆到 GitHub 不会包含任何密钥。
 

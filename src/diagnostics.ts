@@ -10,6 +10,7 @@ import type KnowledgeGardenPlugin from "./main";
 import type { AIFeature } from "./types";
 import { DEFAULT_PROFILE_ID, allFeatures, cacheTypeForFeature, featureLabel, resolveAIFunctionRoute } from "./aiRouting";
 import { webFetchCount } from "./webContext";
+import { copyText as copyToClipboard } from "./portable/clipboard";
 import { capabilitiesUnknown } from "./capabilities";
 import { AI_ACTION_CATEGORIES, effectivePermission } from "./permissions";
 import { taskStatusLabel } from "./taskEngine";
@@ -331,18 +332,9 @@ export class DiagnosticsModal extends Modal {
   }
   private async copySummary(): Promise<void> {
     const text = this.summaryText();
-    try {
-      await navigator.clipboard.writeText(text);
-      new Notice("诊断摘要已复制到剪贴板。");
-    } catch {
-      // 剪贴板 API 不可用时的降级
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      new Notice("诊断摘要已复制到剪贴板。");
-    }
+    // Phase 24 §六十六：便携剪贴板（含 execCommand 兜底），失败时给出明确替代方案
+    const out = await copyToClipboard(text);
+    if (out.ok) { new Notice("诊断摘要已复制到剪贴板。"); return; }
+    new Notice((out.reason ?? "复制失败") + " 可在下方手动选择文本复制。");
   }
 }

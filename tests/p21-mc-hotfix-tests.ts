@@ -3,6 +3,7 @@
  * 覆盖 hydration 优先级/歧义/不猜题、legacy 恢复、parser JSON 优先、中文/emoji/逗号/引号选项、
  * 快照不被覆盖、FSRS/mastery/reviewCount/Activity 不受影响；渲染与命令 UI 在报告标 NOT TESTED。
  */
+import { mkdtemp } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -179,7 +180,7 @@ function bySource(): NoteExam[] { return Array.from(lookup.values()); }
 
 /* ============ 持久化到 cards.json（P-HF-MC-41 数据层） ============ */
 {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-mc-"));
+  const dir = mkdtemp(path.join(os.tmpdir(), "kg-mc-"));
   const store = new ReviewCardStore(dir);
   store.load();
   const legacy = baseCard({ id: "p1", examQuestionId: "q1" });

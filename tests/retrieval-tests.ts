@@ -4,6 +4,7 @@
  * - 只测纯函数（tokenize / matchesDoc / rankSearchResults / fallbackSearch），不依赖 Obsidian 运行时。
  * - 禁止向量库 / embedding / 全库读入 AI（指令约束）。
  */
+import "./portable-bootstrap";
 import { tokenizeText, matchesDoc, type SearchDocument } from "../src/searchIndex";
 import { rankSearchResults } from "../src/queryExplorer";
 import type { NoteMetadata } from "../src/noteIndex";

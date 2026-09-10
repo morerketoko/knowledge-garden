@@ -1,9 +1,9 @@
 {
   "id": "knowledge-garden",
   "name": "Knowledge Garden (知识花园)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.0",
-  "description": "Obsidian 知识复盘控制台：知识区域统计、周期复盘、AI 知识连接（发现连接/提问/找冲突）。Markdown 是唯一知识源，AI 是分析层。",
+  "description": "Obsidian 知识复盘控制台：知识区域统计、周期复盘、AI 知识连接（发现连接/提问/找冲突）。Markdown 是唯一知识源，AI 是分析层。iOS / Android 移动端可用。",
   "author": "Knowledge Garden",
-  "isDesktopOnly": true
+  "isDesktopOnly": false
 }

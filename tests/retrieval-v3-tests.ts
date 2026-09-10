@@ -5,6 +5,7 @@
  * - 静态接线断言：vault.list_folder 工具、search folder 参数、Index Ready Guard、v3 cache key、Prompt 边界修正。
  * - 只测纯函数与源码接线，不依赖 Obsidian 运行时（实机行为在最终报告标 NOT TESTED）。
  */
+import "./portable-bootstrap";
 import {
   detectVaultLocationIntent,
   resolveFolderPaths,

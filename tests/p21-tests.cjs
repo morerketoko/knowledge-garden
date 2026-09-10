@@ -7,9 +7,9 @@ var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    for (let key2 of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key2) && key2 !== except)
+        __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
   }
   return to;
 };
@@ -22,14 +22,575 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
-// tests/p21-tests.ts
-var fs4 = __toESM(require("node:fs"));
-var os = __toESM(require("node:os"));
-var path3 = __toESM(require("node:path"));
+// src/portable/paths.ts
+function isUnsafeRelativePath(p) {
+  if (!p || typeof p !== "string") return true;
+  if (p.startsWith("/") || p.startsWith("\\")) return true;
+  if (/^[A-Za-z]:[\\/]/.test(p)) return true;
+  if (p.startsWith("\\\\") || p.startsWith("//")) return true;
+  const normalized = p.replace(/\\/g, "/");
+  const segments = normalized.split("/");
+  for (const seg of segments) {
+    const s = seg.trim();
+    if (s === "..") return true;
+    if (s.includes(":")) return true;
+  }
+  return false;
+}
+function isReservedStoragePath(p) {
+  const n = normalizeVaultPath(p);
+  if (!n) return true;
+  const lower = n.toLowerCase();
+  return lower === ".obsidian" || lower.startsWith(".obsidian/") || lower === ".trash" || lower.startsWith(".trash/") || lower.split("/").includes("node_modules");
+}
+function normalizeVaultPath(input) {
+  if (input === null || input === void 0) return "";
+  let p = String(input).replace(/\\/g, "/").trim();
+  if (!p) return "";
+  if (isUnsafeRelativePath(p)) return "";
+  const out = [];
+  for (const seg of p.split("/")) {
+    if (!seg || seg === ".") continue;
+    out.push(seg);
+  }
+  return out.join("/");
+}
+function joinVaultPath(...parts) {
+  const pieces = parts.filter((x) => typeof x === "string" && x.length > 0).map((x) => x.replace(/\\/g, "/")).join("/");
+  return normalizeVaultPath(pieces);
+}
+function dirnameVaultPath(p) {
+  const n = normalizeVaultPath(p);
+  const i = n.lastIndexOf("/");
+  return i < 0 ? "" : n.slice(0, i);
+}
 
-// src/spacedReview.ts
-var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
+// src/portable/root.ts
+var MemoryRoot = class {
+  constructor(seed) {
+    this.kind = "memory";
+    this.persistent = false;
+    this.location = "memory://";
+    this.files = /* @__PURE__ */ new Map();
+    /** 可注入故障：写失败次数（测试损坏/降级路径） */
+    this.failWrites = 0;
+    if (seed) for (const [k, v] of Object.entries(seed)) this.files.set(normalizeVaultPath(k), v);
+  }
+  async exists(path2) {
+    const p = normalizeVaultPath(path2);
+    if (this.files.has(p)) return true;
+    return this.hasChildren(p);
+  }
+  async isFile(path2) {
+    return this.files.has(normalizeVaultPath(path2));
+  }
+  async isDirectory(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return true;
+    return this.hasChildren(p);
+  }
+  hasChildren(p) {
+    const prefix = p + "/";
+    for (const k of this.files.keys()) if (k.startsWith(prefix)) return true;
+    return false;
+  }
+  async read(path2) {
+    const v = this.files.get(normalizeVaultPath(path2));
+    return v === void 0 ? null : v;
+  }
+  async write(path2, data) {
+    if (this.failWrites > 0) {
+      this.failWrites--;
+      throw new Error("memory root: injected write failure");
+    }
+    this.files.set(normalizeVaultPath(path2), data);
+  }
+  async remove(path2) {
+    const p = normalizeVaultPath(path2);
+    if (this.files.delete(p)) return true;
+    const prefix = p + "/";
+    let removed = false;
+    for (const k of Array.from(this.files.keys())) if (k.startsWith(prefix)) {
+      this.files.delete(k);
+      removed = true;
+    }
+    return removed;
+  }
+  async rename(from, to) {
+    const f = normalizeVaultPath(from);
+    const t = normalizeVaultPath(to);
+    const v = this.files.get(f);
+    if (v === void 0) return false;
+    this.files.delete(f);
+    this.files.set(t, v);
+    return true;
+  }
+  async mkdirp() {
+  }
+  async list(path2) {
+    const p = normalizeVaultPath(path2);
+    const prefix = p ? p + "/" : "";
+    const out = [];
+    for (const [k, v] of this.files) {
+      if (prefix && !k.startsWith(prefix)) continue;
+      const rest = k.slice(prefix.length);
+      if (!rest || rest.includes("/")) continue;
+      out.push({ path: k, name: rest, size: v.length, mtime: 0 });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async prefetch() {
+  }
+  /** 测试辅助：全部键 */
+  keys() {
+    return Array.from(this.files.keys());
+  }
+  /** 测试辅助：目录是否为空 */
+  isEmptyDir(path2) {
+    const prefix = (normalizeVaultPath(path2) || "") + "/";
+    for (const k of this.files.keys()) if (k.startsWith(prefix)) return false;
+    return true;
+  }
+};
+
+// src/storage.ts
+var PortableStorage = class {
+  constructor(root) {
+    this.root = root;
+  }
+  get backend() {
+    return this.root.kind;
+  }
+  get location() {
+    return this.root.location;
+  }
+  get persistent() {
+    return this.root.persistent;
+  }
+  /** 启动前调用：让 VaultRoot 的读缓存 / PluginDataRoot 的快照就绪 */
+  async init() {
+    await this.root.prefetch();
+  }
+  async exists(path2) {
+    return this.root.exists(normalizeVaultPath(path2));
+  }
+  async readText(path2) {
+    return this.root.read(normalizeVaultPath(path2));
+  }
+  async readJson(path2) {
+    const raw = await this.readText(path2);
+    if (raw === null) return null;
+    return JSON.parse(raw);
+  }
+  /**
+   * §十三：平台无关写入。
+   *
+   * `atomic` 的选择依据是**后端能力**，不是 `Platform.isMobile` 的猜测：
+   * - vault / plugin-data 后端：Obsidian 的 create+modify 本身不提供跨文件原子替换，
+   *   因此先写 `<file>.bak` 备份，再写目标；任一步失败都会保留备份（§十二）。
+   * - 桌面（调用方传入 nativeAtomic=true）：沿用 tmp + rename。
+   */
+  async writeText(path2, data, opts) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return { ok: false, atomic: false, backend: this.root.kind, error: "\u975E\u6CD5\u8DEF\u5F84" };
+    try {
+      const dir = dirnameVaultPath(p);
+      if (dir) await this.root.mkdirp(dir);
+      if (opts?.nativeAtomic) {
+        const tmp = p + ".tmp";
+        await this.root.write(tmp, data);
+        const renamed = await this.root.rename(tmp, p);
+        if (renamed) return { ok: true, atomic: true, backend: this.root.kind };
+        await this.root.write(p, data);
+        await this.root.remove(tmp);
+        return { ok: true, atomic: false, backend: this.root.kind };
+      }
+      const backup = p + ".bak";
+      const prev = await this.root.read(p);
+      if (prev !== null) await this.root.write(backup, prev);
+      await this.root.write(p, data);
+      return { ok: true, atomic: false, backend: this.root.kind };
+    } catch (e) {
+      return { ok: false, atomic: false, backend: this.root.kind, error: e?.message ?? String(e) };
+    }
+  }
+  async writeJson(path2, value, opts) {
+    return this.writeText(path2, JSON.stringify(value), opts);
+  }
+  async remove(path2) {
+    return this.root.remove(normalizeVaultPath(path2));
+  }
+  async rename(from, to) {
+    return this.root.rename(normalizeVaultPath(from), normalizeVaultPath(to));
+  }
+  /** 列出目录下的直接子项（相对 path 的名字） */
+  async list(path2) {
+    return this.root.list(normalizeVaultPath(path2));
+  }
+  async isDirectory(path2) {
+    return this.root.isDirectory(normalizeVaultPath(path2));
+  }
+  async isFile(path2) {
+    return this.root.isFile(normalizeVaultPath(path2));
+  }
+};
+
+// src/portable/host.ts
+var STATE_DIR_NAME = ".state";
+var PortableStorageHost = class {
+  constructor(opts) {
+    this.opts = opts;
+    /** 历史插件目录（旧 manifest.dir / getBasePath）；用于把旧路径映射到新根 */
+    this.baseDir = "";
+    this.stateRoot = normalizeVaultPath(opts.stateRoot);
+    this.vaultMounts = (opts.vaultMounts ?? []).map((m) => normalizeVaultPath(m)).filter(Boolean);
+    this.stripPrefixes = (opts.stripPrefixes ?? []).map((p) => normalizeVaultPath(p)).filter(Boolean);
+    this.dataStorage = new PortableStorage(opts.pluginData);
+    this.vaultStorage = opts.useVault && opts.vault ? new PortableStorage(opts.vault) : null;
+    this.reasonText = opts.reason;
+    this.baseDir = this.stateRoot;
+  }
+  /* ---------------- 后端状态 ---------------- */
+  get backendKind() {
+    return (this.vaultStorage ?? this.dataStorage).backend;
+  }
+  get vaultEnabled() {
+    return this.vaultStorage !== null;
+  }
+  get reason() {
+    return this.reasonText;
+  }
+  /** 诊断位置的展示名（永不返回绝对路径） */
+  get location() {
+    return this.vaultStorage ? this.stateRoot + "/" : "plugin-data://";
+  }
+  /** 能力探测后修正后端选择（只读仓库 / iCloud 只读 → 降级到 plugin-data） */
+  setVaultEnabled(enabled, reason) {
+    if (enabled === this.vaultEnabled) {
+      if (reason) this.reasonText = reason;
+      return;
+    }
+    this.vaultStorage = enabled && this.opts.vault ? new PortableStorage(this.opts.vault) : null;
+    if (reason) this.reasonText = reason;
+  }
+  /** 该相对路径对应的存储 */
+  backendFor(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return this.dataStorage;
+    if (!this.vaultStorage) return this.dataStorage;
+    return this.isVaultPath(p) ? this.vaultStorage : this.dataStorage;
+  }
+  isVaultPath(p) {
+    if (p === this.stateRoot || p.startsWith(this.stateRoot + "/")) return true;
+    for (const m of this.vaultMounts) {
+      if (p === m || p.startsWith(m + "/")) return true;
+    }
+    return false;
+  }
+  /* ---------------- 路径解析 ---------------- */
+  /**
+   * 归一化并解析插件相对路径。
+   *
+   * 业务存储类历史上拿到的是**插件目录**（manifest.dir / 旧 getBasePath）并在其上
+   * `join(baseDir, "cache", "x.json")`。重构后它们拿到的仍是同一个字符串，
+   * 因此这里要把「以历史基开头的路径」映射到 `.state/` 之下；
+   * 已经是 vault 挂载前缀或 `.state/` 的路径原样保留。
+   */
+  resolve(path2) {
+    const raw = String(path2 ?? "").replace(/\\/g, "/");
+    if (raw === "" || raw === this.baseDir) return this.stateRoot;
+    if (this.baseDir && raw.startsWith(this.baseDir + "/")) {
+      const rel = raw.slice(this.baseDir.length + 1);
+      return joinVaultPath(this.stateRoot, rel);
+    }
+    if (raw === this.stateRoot || raw.startsWith(this.stateRoot + "/")) return normalizeVaultPath(raw);
+    for (const m of this.vaultMounts) {
+      if (raw === m || raw.startsWith(m + "/")) return normalizeVaultPath(raw);
+    }
+    return normalizeVaultPath(raw);
+  }
+  /** plugin-data 后端的存储键（剥离冗长前缀，保持 data.json 可读） */
+  dataKey(target) {
+    for (const pre of this.stripPrefixes) {
+      if (target === pre) return "";
+      if (target.startsWith(pre + "/")) return target.slice(pre.length + 1);
+    }
+    return target;
+  }
+  /* ---------------- 读写 ---------------- */
+  async write(path2, data, opts) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    const key2 = backend === this.dataStorage ? this.dataKey(target) : target;
+    return backend.writeText(key2, data, opts);
+  }
+  async read(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.readText(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async exists(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.exists(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async remove(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.remove(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async rename(from, to) {
+    const f = this.resolve(from);
+    const t = this.resolve(to);
+    const bf = this.backendFor(f);
+    const bt = this.backendFor(t);
+    if (bf !== bt) {
+      const raw = await this.read(f);
+      if (raw === null) return false;
+      const w = await this.write(t, raw);
+      if (!w.ok) return false;
+      await this.remove(f);
+      return true;
+    }
+    const keyF = bf === this.dataStorage ? this.dataKey(f) : f;
+    const keyT = bf === this.dataStorage ? this.dataKey(t) : t;
+    return bf.rename(keyF, keyT);
+  }
+  async list(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.list(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async isDirectory(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.isDirectory(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  /* ---------------- 启动 ---------------- */
+  /** 初始化两个后端的读缓存（同步镜像的遍历由 fsPortable.initSyncMirror 负责） */
+  async init() {
+    if (this.vaultStorage) await this.vaultStorage.init();
+    await this.dataStorage.init();
+  }
+  /**
+   * 后端能力探测（§七 / §九 / §一百三十七）：
+   * 通过**真实写入一个探针文件**判断 Vault 是否可写，而不是猜平台 ——
+   * 只读仓库、iCloud 只读、沙盒权限不足都能被正确探测出来。
+   */
+  async probeWritable() {
+    const probe = joinVaultPath(this.stateRoot, ".kg-write-probe");
+    const wasEnabled = this.vaultEnabled;
+    if (!wasEnabled && this.opts.vault) this.vaultStorage = new PortableStorage(this.opts.vault);
+    try {
+      if (!this.vaultStorage) return false;
+      const out = await this.vaultStorage.writeText(probe, String(Date.now()), { nativeAtomic: true });
+      if (!out.ok) return false;
+      await this.vaultStorage.remove(probe);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (!wasEnabled) this.vaultStorage = null;
+    }
+  }
+  /** 校验任意相对路径是否安全（供 NoteIndex / 迁移使用，§十七） */
+  static isSafe(path2) {
+    const raw = String(path2 ?? "").replace(/\\/g, "/");
+    if (!raw) return false;
+    if (isUnsafeRelativePath(raw)) return false;
+    const n = normalizeVaultPath(raw);
+    if (!n.length) return false;
+    return !isReservedStoragePath(n);
+  }
+  /** 某个存储路径的父目录（创建文件前用） */
+  dirOf(path2) {
+    return dirnameVaultPath(this.resolve(path2));
+  }
+};
+
+// src/portable/fsPortable.ts
+var host = null;
+var mirror = /* @__PURE__ */ new Map();
+var dirty = /* @__PURE__ */ new Set();
+var pendingError = null;
+var flushTimer = null;
+var flushing = false;
+var initialized = false;
+var MIRROR_FLUSH_MS = 800;
+function setStorageHost(h) {
+  host = h;
+  mirror.clear();
+  dirty.clear();
+  pendingError = null;
+  initialized = false;
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+}
+async function initSyncMirror(h) {
+  setStorageHost(h);
+  try {
+    const walk = async (rel, depth) => {
+      if (depth > 4) return;
+      const items = await h.list(rel);
+      for (const it of items) {
+        const child = rel ? rel + "/" + it.name : it.name;
+        if (await h.isDirectory(child)) await walk(child, depth + 1);
+        else {
+          const raw = await h.read(child);
+          if (raw !== null) mirror.set(child, raw);
+        }
+      }
+    };
+    await walk(h.stateRoot, 0);
+    for (const it of await h.list("mirror")) {
+      const raw = await h.read("mirror/" + it.name);
+      if (raw !== null) mirror.set(it.name, raw);
+    }
+  } catch {
+  }
+  initialized = true;
+}
+function schedule() {
+  if (flushTimer !== null) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void flushMirror();
+  }, MIRROR_FLUSH_MS);
+}
+async function flushMirror() {
+  if (!host || flushing || dirty.size === 0) return;
+  flushing = true;
+  const paths = Array.from(dirty);
+  dirty.clear();
+  try {
+    for (const p of paths) {
+      const data = mirror.get(p);
+      if (data === void 0) {
+        await host.remove(p);
+        continue;
+      }
+      const out = await host.write(p, data, { nativeAtomic: host.backendFor(p).backend === "vault" });
+      if (!out.ok) pendingError = pendingError ?? new Error(out.error ?? "\u5199\u5165\u5931\u8D25\uFF1A" + p);
+    }
+  } catch (e) {
+    pendingError = pendingError ?? e;
+  } finally {
+    flushing = false;
+    if (dirty.size) schedule();
+  }
+}
+function bump() {
+  if (pendingError) {
+    const e = pendingError;
+    pendingError = null;
+    throw e;
+  }
+}
+function key(p) {
+  if (!host) return "";
+  return host.resolve(p);
+}
+function existsSync(p) {
+  if (!host || !p) return false;
+  const k = key(p);
+  if (!k) return false;
+  if (mirror.has(k)) return true;
+  const prefix = k + "/";
+  for (const m of mirror.keys()) if (m.startsWith(prefix)) return true;
+  return false;
+}
+function readFileSync(p, _enc) {
+  const k = key(p);
+  const v = k ? mirror.get(k) : void 0;
+  if (v === void 0) throw new Error("ENOENT: " + (k || p));
+  return v;
+}
+function writeFileSync(p, data, _enc) {
+  bump();
+  const k = key(p);
+  if (!k) {
+    pendingError = new Error("\u5B58\u50A8\u672A\u5C31\u7EEA\uFF0C\u5199\u5165\u88AB\u5FFD\u7565\uFF1A" + p);
+    return;
+  }
+  mirror.set(k, String(data ?? ""));
+  dirty.add(k);
+  schedule();
+}
+function renameSync(from, to) {
+  bump();
+  const f = key(from);
+  const t = key(to);
+  if (!f || !t) throw new Error("\u5B58\u50A8\u672A\u5C31\u7EEA\uFF0Crename \u5931\u8D25");
+  const v = mirror.get(f);
+  if (v === void 0) throw new Error("ENOENT: " + f);
+  mirror.delete(f);
+  mirror.set(t, v);
+  dirty.add(t);
+  schedule();
+}
+function unlinkSync(p) {
+  bump();
+  const k = key(p);
+  if (!k) return;
+  mirror.delete(k);
+  dirty.add(k);
+  schedule();
+}
+
+// tests/portable-bootstrap.ts
+var TEST_TMP_ROOT = ".kg-tests";
+var dirSeq = 0;
+function mkdtemp(prefix = "") {
+  dirSeq++;
+  const safe = String(prefix).replace(/[\\/]+$/, "").replace(/[^\w.-]+/g, "-") || "d";
+  return TEST_TMP_ROOT + "/" + safe + "-" + dirSeq;
+}
+var host2 = null;
+var ready = false;
+function initTestStorage() {
+  if (ready && host2) return host2;
+  const stateRoot = joinVaultPath("Knowledge Garden", STATE_DIR_NAME);
+  const h = new PortableStorageHost({
+    stateRoot,
+    pluginData: new MemoryRoot(),
+    vault: new MemoryRoot(),
+    useVault: true,
+    reason: "node-test(memory)",
+    stripPrefixes: [stateRoot]
+  });
+  h.baseDir = TEST_TMP_ROOT;
+  host2 = h;
+  void h.init();
+  void initSyncMirror(h);
+  ready = true;
+  return h;
+}
+function testHost() {
+  if (!host2) throw new Error("\u6D4B\u8BD5\u5B58\u50A8\u672A\u521D\u59CB\u5316\uFF1A\u8BF7\u5148\u8C03\u7528 initTestStorage()");
+  return host2;
+}
+initTestStorage();
+function stateKeyOf(relPath) {
+  return testHost().resolve(relPath);
+}
+function readStateText(rel) {
+  return readFileSync(stateKeyOf(rel), "utf8");
+}
+function seedStateText(rel, text) {
+  writeFileSync(stateKeyOf(rel), text);
+}
+
+// tests/p21-tests.ts
+var fs = __toESM(require("node:fs"));
+var os = __toESM(require("node:os"));
+var path = __toESM(require("node:path"));
+
+// src/portable/pathShim.ts
+function join(...parts) {
+  return joinVaultPath(...parts);
+}
 
 // node_modules/ts-fsrs/dist/index.mjs
 var FSRSError = class _FSRSError extends Error {
@@ -751,8 +1312,8 @@ var FSRSAlgorithm = class {
   }
   update_parameters(params) {
     const _params = this.prepare_parameters(params);
-    for (const key in _params) {
-      const paramKey = key;
+    for (const key2 in _params) {
+      const paramKey = key2;
       this.param[paramKey] = _params[paramKey];
     }
   }
@@ -1866,29 +2427,50 @@ var fsrs = (params) => {
 };
 
 // src/migrations.ts
-var fs = __toESM(require("fs"));
-var path = __toESM(require("path"));
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
 function corruptStamp(now = /* @__PURE__ */ new Date()) {
   return String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate()) + "-" + pad2(now.getHours()) + pad2(now.getMinutes()) + pad2(now.getSeconds());
 }
+function corruptTargetPath(filePath, now = /* @__PURE__ */ new Date()) {
+  const p = String(filePath).replace(/\\/g, "/");
+  const i = p.lastIndexOf("/");
+  const dir = i < 0 ? "" : p.slice(0, i);
+  const name = i < 0 ? p : p.slice(i + 1);
+  const stamp = name + "." + corruptStamp(now);
+  return dir ? dir + "/.corrupt/" + stamp : ".corrupt/" + stamp;
+}
 function isolateCorruptFile(filePath) {
   try {
-    if (!fs.existsSync(filePath)) return false;
-    fs.renameSync(filePath, filePath + ".corrupt-" + corruptStamp());
+    if (!existsSync(filePath)) return false;
+    renameSync(filePath, corruptTargetPath(filePath));
     return true;
   } catch {
-    return false;
+    try {
+      const raw = readFileSync(filePath, "utf8");
+      writeFileSync(corruptTargetPath(filePath), raw);
+      unlinkSync(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 function atomicWriteJson(filePath, value) {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
+  const data = JSON.stringify(value);
   const tmp = filePath + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
-  fs.renameSync(tmp, filePath);
+  try {
+    writeFileSync(tmp, data, "utf8");
+    renameSync(tmp, filePath);
+    return;
+  } catch {
+    try {
+      unlinkSync(tmp);
+    } catch {
+    }
+    writeFileSync(filePath, data, "utf8");
+  }
 }
 
 // src/spacedReview.ts
@@ -1949,20 +2531,20 @@ var DAY_MS = 864e5;
 function num(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function toTsCard(fs5) {
-  const lastReview = typeof fs5.lastReview === "number" ? new Date(fs5.lastReview) : void 0;
-  const dueMs = num(fs5.due, Date.now());
+function toTsCard(fs2) {
+  const lastReview = typeof fs2.lastReview === "number" ? new Date(fs2.lastReview) : void 0;
+  const dueMs = num(fs2.due, Date.now());
   const elapsedDays = lastReview ? Math.max(0, Math.round((dueMs - lastReview.getTime()) / DAY_MS)) : 0;
   return {
     due: new Date(dueMs),
-    stability: Math.max(1e-3, num(fs5.stability, 0)),
-    difficulty: Math.min(10, Math.max(1, num(fs5.difficulty, 5))),
+    stability: Math.max(1e-3, num(fs2.stability, 0)),
+    difficulty: Math.min(10, Math.max(1, num(fs2.difficulty, 5))),
     elapsed_days: elapsedDays,
     scheduled_days: Math.max(0, Math.floor((dueMs - (lastReview?.getTime() ?? dueMs)) / DAY_MS)),
-    learning_steps: Math.max(0, Math.floor(num(fs5.learningSteps, 0))),
-    reps: Math.max(0, Math.floor(num(fs5.reps, 0))),
-    lapses: Math.max(0, Math.floor(num(fs5.lapses, 0))),
-    state: fs5.state === State.Learning || fs5.state === State.Review || fs5.state === State.Relearning ? fs5.state : State.New,
+    learning_steps: Math.max(0, Math.floor(num(fs2.learningSteps, 0))),
+    reps: Math.max(0, Math.floor(num(fs2.reps, 0))),
+    lapses: Math.max(0, Math.floor(num(fs2.lapses, 0))),
+    state: fs2.state === State.Learning || fs2.state === State.Review || fs2.state === State.Relearning ? fs2.state : State.New,
     last_review: lastReview
   };
 }
@@ -2089,7 +2671,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
     this.logs = [];
     this.savedCards = /* @__PURE__ */ new Map();
     this.savedLogs = [];
-    this.file = path2.join(pluginDir, "cache", "spaced-review.json");
+    this.file = join(pluginDir, "cache", "spaced-review.json");
   }
   static {
     this.FORMAT_VERSION = 2;
@@ -2097,8 +2679,8 @@ var SpacedReviewStore = class _SpacedReviewStore {
   /** 启动恢复；损坏 → 隔离 *.corrupt-* 后置空（§36，不阻塞启动） */
   load() {
     try {
-      if (!fs2.existsSync(this.file)) return false;
-      const raw = JSON.parse(fs2.readFileSync(this.file, "utf8"));
+      if (!existsSync(this.file)) return false;
+      const raw = JSON.parse(readFileSync(this.file, "utf8"));
       if (!raw || typeof raw !== "object") throw new Error("invalid spaced-review structure");
       if (raw.cards && typeof raw.cards === "object") {
         for (const [p, c] of Object.entries(raw.cards)) {
@@ -2239,7 +2821,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
   /** 文件原文备份（§76：重排前备份，失败 rollback） */
   fileSnapshot() {
     try {
-      return fs2.existsSync(this.file) ? fs2.readFileSync(this.file, "utf8") : null;
+      return existsSync(this.file) ? readFileSync(this.file, "utf8") : null;
     } catch {
       return null;
     }
@@ -2255,7 +2837,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
         this.persist(this.cards, this.logs, this.savedCards, this.savedLogs);
         return true;
       }
-      fs2.writeFileSync(this.file, snapshot, "utf8");
+      writeFileSync(this.file, snapshot, "utf8");
       this.load();
       return true;
     } catch {
@@ -2342,7 +2924,21 @@ function savedCardInFolder(sourcePath, folderPath) {
   if (sourcePath === fp || sourcePath === fp + ".md") return true;
   return sourcePath.startsWith(fp + "/");
 }
-function filterSavedCardObjects(cards, scope) {
+function normalizeTag(tag) {
+  return (tag ?? "").replace(/^#+/, "").trim();
+}
+function tagMatchModeOf(scope) {
+  return scope?.tagMatchMode === "exact" ? "exact" : "include-children";
+}
+function sourceNoteHasTag(noteTags, tag, mode) {
+  const want = normalizeTag(tag);
+  if (!want) return false;
+  const normTags = (noteTags ?? []).map(normalizeTag).filter(Boolean);
+  if (mode === "exact") return normTags.includes(want);
+  const prefix = want + "/";
+  return normTags.some((t) => t === want || t.startsWith(prefix));
+}
+function filterSavedCardObjects(cards, scope, noteTagsOf) {
   if (!scope || scope.mode === "vault") return cards;
   const match = (c) => {
     switch (scope.mode) {
@@ -2354,6 +2950,10 @@ function filterSavedCardObjects(cards, scope) {
         return !!scope.folderPath && savedCardInFolder(c.sourcePath, scope.folderPath);
       case "exam":
         return !!scope.examId && c.examId === scope.examId;
+      case "tag": {
+        if (!noteTagsOf) return false;
+        return sourceNoteHasTag(noteTagsOf(c.sourcePath), scope.tag, tagMatchModeOf(scope));
+      }
       case "custom": {
         if (scope.folders && scope.folders.length) {
           if (!scope.folders.some((f) => savedCardInFolder(c.sourcePath, f))) return false;
@@ -2372,6 +2972,10 @@ function savedCardScopeFingerprint(scope) {
   if (scope?.folderPath) o["folderPath"] = scope.folderPath;
   if (scope?.areaId) o["areaId"] = scope.areaId;
   if (scope?.examId) o["examId"] = scope.examId;
+  if (scope?.tag) {
+    o["tag"] = normalizeTag(scope.tag);
+    o["tagMatchMode"] = tagMatchModeOf(scope);
+  }
   if (scope?.folders && scope.folders.length) o["folders"] = [...scope.folders].sort();
   const s = JSON.stringify(o);
   let h = 2166136261;
@@ -2395,6 +2999,8 @@ function savedCardScopeText(scope, examTitle) {
       return scope.areaId || "\uFF08\u672A\u9009\u533A\u57DF\uFF09";
     case "exam":
       return examTitle || scope.examId || "\uFF08\u672A\u9009\u8003\u8BD5\uFF09";
+    case "tag":
+      return scope.tag ? "#" + normalizeTag(scope.tag) : "\uFF08\u672A\u9009\u6807\u7B7E\uFF09";
     case "custom": {
       const folders = (scope.folders ?? []).slice(0, 2);
       const more = (scope.folders ?? []).length > 2 ? " \u7B49 " + (scope.folders?.length ?? 0) + " \u4E2A" : "";
@@ -2432,7 +3038,7 @@ function savedMasteryDistribution(states) {
   for (const s of states) if (typeof s.masteryPercent === "number") dist[reviewBandOf(s.masteryPercent)]++;
   return dist;
 }
-function savedCardOverview(states, logs, scheduler, now) {
+function savedCardOverview(states, logs, scheduler, now, newCount = 0) {
   const d = new Date(now);
   const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
   let due = 0, forgetting = 0, stable = 0;
@@ -2451,10 +3057,11 @@ function savedCardOverview(states, logs, scheduler, now) {
     }
   }
   return {
-    total: states.length,
+    total: states.length + Math.max(0, newCount),
     due,
     forgetting,
     stable,
+    newCount: Math.max(0, newCount),
     reviewsToday: logs.filter((l) => l.timestamp >= startOfDay).length,
     avgRetrievability: retr.length ? retr.reduce((a, b) => a + b, 0) / retr.length : null,
     avgMastery: mastery.length ? mastery.reduce((a, b) => a + b, 0) / mastery.length : null,
@@ -2462,17 +3069,164 @@ function savedCardOverview(states, logs, scheduler, now) {
   };
 }
 
+// src/portable/hash.ts
+var K = new Uint32Array([
+  1116352408,
+  1899447441,
+  3049323471,
+  3921009573,
+  961987163,
+  1508970993,
+  2453635748,
+  2870763221,
+  3624381080,
+  310598401,
+  607225278,
+  1426881987,
+  1925078388,
+  2162078206,
+  2614888103,
+  3248222580,
+  3835390401,
+  4022224774,
+  264347078,
+  604807628,
+  770255983,
+  1249150122,
+  1555081692,
+  1996064986,
+  2554220882,
+  2821834349,
+  2952996808,
+  3210313671,
+  3336571891,
+  3584528711,
+  113926993,
+  338241895,
+  666307205,
+  773529912,
+  1294757372,
+  1396182291,
+  1695183700,
+  1986661051,
+  2177026350,
+  2456956037,
+  2730485921,
+  2820302411,
+  3259730800,
+  3345764771,
+  3516065817,
+  3600352804,
+  4094571909,
+  275423344,
+  430227734,
+  506948616,
+  659060556,
+  883997877,
+  958139571,
+  1322822218,
+  1537002063,
+  1747873779,
+  1955562222,
+  2024104815,
+  2227730452,
+  2361852424,
+  2428436474,
+  2756734187,
+  3204031479,
+  3329325298
+]);
+function rotr(x, n) {
+  return x >>> n | x << 32 - n;
+}
+function utf8Bytes(text) {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text);
+  const out = [];
+  for (let i = 0; i < text.length; i++) {
+    let cp = text.charCodeAt(i);
+    if (cp >= 55296 && cp <= 56319 && i + 1 < text.length) {
+      const lo = text.charCodeAt(i + 1);
+      if (lo >= 56320 && lo <= 57343) {
+        cp = (cp - 55296) * 1024 + (lo - 56320) + 65536;
+        i++;
+      }
+    }
+    if (cp < 128) out.push(cp);
+    else if (cp < 2048) out.push(192 | cp >> 6, 128 | cp & 63);
+    else if (cp < 65536) out.push(224 | cp >> 12, 128 | cp >> 6 & 63, 128 | cp & 63);
+    else out.push(240 | cp >> 18, 128 | cp >> 12 & 63, 128 | cp >> 6 & 63, 128 | cp & 63);
+  }
+  return new Uint8Array(out);
+}
+function sha256Hex(text) {
+  const bytes = utf8Bytes(text);
+  const bitLen = bytes.length * 8;
+  const withPad = new Uint8Array((bytes.length + 8 >> 6) + 1 << 6);
+  withPad.set(bytes);
+  withPad[bytes.length] = 128;
+  const view = new DataView(withPad.buffer);
+  view.setUint32(withPad.length - 8, Math.floor(bitLen / 4294967296), false);
+  view.setUint32(withPad.length - 4, bitLen >>> 0, false);
+  const h = new Uint32Array([
+    1779033703,
+    3144134277,
+    1013904242,
+    2773480762,
+    1359893119,
+    2600822924,
+    528734635,
+    1541459225
+  ]);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < withPad.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15];
+      const y = w[i - 2];
+      const s0 = rotr(x, 7) ^ rotr(x, 18) ^ x >>> 3;
+      const s1 = rotr(y, 17) ^ rotr(y, 19) ^ y >>> 10;
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1 >>> 0;
+    }
+    let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = e & f ^ ~e & g;
+      const t1 = hh + S1 + ch + K[i] + w[i] >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = a & b ^ a & c ^ b & c;
+      const t2 = S0 + maj >>> 0;
+      hh = g;
+      g = f;
+      f = e;
+      e = d + t1 >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = t1 + t2 >>> 0;
+    }
+    h[0] = h[0] + a >>> 0;
+    h[1] = h[1] + b >>> 0;
+    h[2] = h[2] + c >>> 0;
+    h[3] = h[3] + d >>> 0;
+    h[4] = h[4] + e >>> 0;
+    h[5] = h[5] + f >>> 0;
+    h[6] = h[6] + g >>> 0;
+    h[7] = h[7] + hh >>> 0;
+  }
+  let out = "";
+  for (let i = 0; i < 8; i++) out += h[i].toString(16).padStart(8, "0");
+  return out;
+}
+
 // src/ai/cache.ts
-var crypto = __toESM(require("crypto"));
 function sha256(text) {
-  return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+  return sha256Hex(text);
 }
 function fingerprintKey(parts) {
   return sha256(parts.join("\0"));
 }
 
 // src/examStore.ts
-var fs3 = __toESM(require("fs"));
 function escYaml(s) {
   return '"' + (s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
@@ -2545,7 +3299,15 @@ function parseCardMarkdown(md) {
   }
   const inlineArr = (v) => {
     if (!v) return void 0;
-    if (v.startsWith("[") && v.endsWith("]")) return v.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    const t = v.trim();
+    if (t.startsWith("[") && t.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean);
+      } catch {
+      }
+      return t.slice(1, -1).split(",").map((s) => unescYaml(s.trim())).filter(Boolean);
+    }
     return void 0;
   };
   const id = unescYaml(kv.get("cardId") ?? "");
@@ -2585,7 +3347,7 @@ var ExamStore = class {
   }
   load() {
     try {
-      const raw = fs3.readFileSync(this.file(), "utf8");
+      const raw = readFileSync(this.file(), "utf8");
       const obj = JSON.parse(raw);
       this.entries = Array.isArray(obj.entries) ? obj.entries : [];
       this.dirty = false;
@@ -2666,7 +3428,7 @@ var ReviewCardStore = class {
   }
   load() {
     try {
-      const raw = fs3.readFileSync(this.file(), "utf8");
+      const raw = readFileSync(this.file(), "utf8");
       const obj = JSON.parse(raw);
       this.entries = Array.isArray(obj.entries) ? obj.entries : [];
       this.dirty = false;
@@ -2748,7 +3510,7 @@ var ExamSessionStore = class {
   }
   load() {
     try {
-      const raw = fs3.readFileSync(this.file(), "utf8");
+      const raw = readFileSync(this.file(), "utf8");
       const obj = JSON.parse(raw);
       this.sessions = Array.isArray(obj.sessions) ? obj.sessions : [];
       this.dirty = false;
@@ -2803,7 +3565,7 @@ var CardReviewStore = class {
   }
   load() {
     try {
-      const raw = fs3.readFileSync(this.file(), "utf8");
+      const raw = readFileSync(this.file(), "utf8");
       const obj = JSON.parse(raw);
       this.records = Array.isArray(obj.records) ? obj.records : [];
       this.dirty = false;
@@ -2874,7 +3636,7 @@ function test(id, pass, detail) {
   console.log((pass ? "PASS" : "FAIL") + " " + id + " :: " + detail);
 }
 function tmpRoot(tag) {
-  return fs4.mkdtempSync(path3.join(os.tmpdir(), "kg-p21-" + tag + "-"));
+  return mkdtemp(path.join(os.tmpdir(), "kg-p21-" + tag + "-"));
 }
 function eqSet(a, b) {
   return a.length === b.length && a.every((x) => b.includes(x));
@@ -2958,7 +3720,7 @@ function sampleCards() {
     reload.scGet("cardB") !== void 0 && reload.scGet("cardA") === void 0 && reload.scCount() === 1,
     "\u5220\u9664\u6301\u4E45\u5316\uFF1A\u91CD\u542F\u540E A \u4E0D\u590D\u6D3B\u3001B \u4ECD\u5728"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("sep");
@@ -2976,7 +3738,7 @@ function sampleCards() {
   );
   store.prune(/* @__PURE__ */ new Set());
   test("P21-41b", store.count() === 0 && store.scCount() === 1, "Source \u5220\u9664\u4E0D\u5220 Saved Card FSRS\uFF08\xA7141/142\uFF09");
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const cards = sampleCards();
@@ -3043,7 +3805,7 @@ function sampleCards() {
     q.items.length === 3 && q.items[0].cardId === "cardA" && q.items[2].cardId === "cardC",
     "\u6700\u53EF\u80FD\u5FD8\u8BB0\uFF08\u4FDD\u6301\u7387\u6700\u4F4E\uFF09\u4F18\u5148\uFF08" + q.items.map((i) => i.cardId).join(",") + "\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const mc = {
@@ -3107,7 +3869,7 @@ function sampleCards() {
     p.total === 10 && p.answered === 7 && examSessionFinished(sess, 10) === false,
     "Exam Hub \u8FDB\u5EA6 7/10 \u7531 ExamSessionStore \u89E3\u6790\uFF08\xA745/28\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("link");
@@ -3151,7 +3913,7 @@ function sampleCards() {
     linked?.examId === "exam1" && titleOf === void 0 && cardStore.get("cardQ1") !== void 0,
     "\u5361\u53EF\u67E5\u6765\u6E90\u8003\u8BD5\uFF1BExam \u5DF2\u5220\u65F6 title \u4F18\u96C5\u4E3A undefined\uFF08UI \u663E\u793A\u539F\u8003\u8BD5\u5DF2\u5220\u9664\uFF0C\xA740/37\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const f1 = schedulerConfigFingerprint(CFG);
@@ -3183,19 +3945,18 @@ function sampleCards() {
     spaced.scGet("c1")?.cardId === "c1" && spaced.scGet("c1").fsrsState.due === NOW + DAY,
     "FSRS \u4E3B\u952E cardId \u4E0D\u53D8\uFF08source rename \u53EA\u6539\u5361\u7247 sourcePath\uFF0C\xA785\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("cache");
-  fs4.mkdirSync(path3.join(dir, "cache"), { recursive: true });
   const spaced = new SpacedReviewStore(dir);
   spaced.load();
   spaced.scCommitReview("c1", savedState("c1", NOW + DAY, 5, 70), { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 5, difficulty: 5, retrievability: 1 });
   const cardStore = new ReviewCardStore(dir);
   cardStore.load();
   cardStore.add({ id: "c1", sourcePath: "a.md", sourceVersion: "v1", question: "\u9898", answer: "\u7B54", questionType: "recall", createdAt: NOW, updatedAt: NOW });
-  fs4.writeFileSync(path3.join(dir, "cache", "ai-cache.json"), JSON.stringify({ entries: [] }), "utf8");
-  fs4.rmSync(path3.join(dir, "cache", "ai-cache.json"), { force: true });
+  seedStateText(path.join(dir, "cache", "ai-cache.json"), JSON.stringify({ entries: [] }), "utf8");
+  fs.rmSync(path.join(dir, "cache", "ai-cache.json"), { force: true });
   const spaced2 = new SpacedReviewStore(dir);
   spaced2.load();
   const cards2 = new ReviewCardStore(dir);
@@ -3206,13 +3967,12 @@ function sampleCards() {
     spaced2.scCount() === 1 && spaced2.scGet("c1").fsrsState.due === NOW + DAY,
     "AI cache \u6E05\u9664\u4E0D\u5F71\u54CD FSRS state\uFF08\xA752\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("mig");
-  fs4.mkdirSync(path3.join(dir, "cache"), { recursive: true });
-  fs4.writeFileSync(path3.join(dir, "cache", "cards.json"), JSON.stringify({ formatVersion: 1, entries: [{ id: "old1", sourcePath: "a.md", sourceVersion: "v1", question: "\u65E7\u5361", answer: "\u65E7\u7B54\u6848", questionType: "recall", createdAt: NOW, updatedAt: NOW }] }), "utf8");
-  fs4.writeFileSync(path3.join(dir, "cache", "card-reviews.json"), JSON.stringify({ formatVersion: 1, records: [{ cardId: "old1", reviewedAt: NOW, rating: "good" }] }), "utf8");
+  seedStateText(path.join(dir, "cache", "cards.json"), JSON.stringify({ formatVersion: 1, entries: [{ id: "old1", sourcePath: "a.md", sourceVersion: "v1", question: "\u65E7\u5361", answer: "\u65E7\u7B54\u6848", questionType: "recall", createdAt: NOW, updatedAt: NOW }] }), "utf8");
+  seedStateText(path.join(dir, "cache", "card-reviews.json"), JSON.stringify({ formatVersion: 1, records: [{ cardId: "old1", reviewedAt: NOW, rating: "good" }] }), "utf8");
   const cs = new ReviewCardStore(dir);
   test("P21-53", cs.load() === false && cs.count() === 1 && cs.get("old1")?.question === "\u65E7\u5361", "\u65E7 cards.json \u52A0\u8F7D\uFF08\xA753\uFF09");
   const cr = new CardReviewStore(dir);
@@ -3227,21 +3987,21 @@ function sampleCards() {
     first.next.due > NOW && spaced.scGet("old1") === void 0,
     "\u9996\u6B21\u8BC4\u5206 createEmptyCard \u8BED\u4E49\u53EF\u7528\uFF08\u72B6\u6001\u521B\u5EFA\u7531 main.rateSavedCard \u8D1F\u8D23\uFF0C\xA738\uFF09"
   );
-  fs4.writeFileSync(path3.join(dir, "cache", "spaced-review.json"), "{broken", "utf8");
+  seedStateText(path.join(dir, "cache", "spaced-review.json"), "{broken", "utf8");
   const corrupt = new SpacedReviewStore(dir);
   test(
     "P21-56",
     corrupt.load() === true && corrupt.scCount() === 0 && corrupt.count() === 0,
     "corrupt spaced-review.json \u9694\u79BB\u4E3A\u7A7A\uFF08\xA756/36\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("fmt");
   const spaced = new SpacedReviewStore(dir);
   spaced.load();
   spaced.scCommitReview("c1", savedState("c1", NOW + DAY, 5, 70), { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 5, difficulty: 5, retrievability: 1 });
-  const raw = JSON.parse(fs4.readFileSync(path3.join(dir, "cache", "spaced-review.json"), "utf8"));
+  const raw = JSON.parse(readStateText(path.join(dir, "cache", "spaced-review.json")));
   test(
     "P21-60a",
     raw.formatVersion === 2 && typeof raw.savedCards === "object" && Array.isArray(raw.savedCardReviewLogs),
@@ -3250,7 +4010,7 @@ function sampleCards() {
   const log = raw.savedCardReviewLogs[0];
   const keys = ["cardId", "timestamp", "rating", "previousDue", "nextDue", "intervalDays", "stability", "difficulty", "retrievability"];
   test("P21-60b", keys.every((k) => k in log) && !("prompt" in log) && !("content" in log), "Saved Card Review Log \u5B57\u6BB5\u767D\u540D\u5355\uFF08\xA77\uFF09");
-  fs4.writeFileSync(path3.join(dir, "cache", "spaced-review.json"), JSON.stringify({ formatVersion: 1, cards: {}, reviewLogs: [] }), "utf8");
+  seedStateText(path.join(dir, "cache", "spaced-review.json"), JSON.stringify({ formatVersion: 1, cards: {}, reviewLogs: [] }), "utf8");
   const v1 = new SpacedReviewStore(dir);
   v1.load();
   test("P21-60c", v1.scCount() === 0 && v1.count() === 0, "v1 \u6587\u4EF6\u5BB9\u9519\u52A0\u8F7D\uFF08savedCards \u7F3A\u5931 \u2192 \u7A7A\uFF0C\xA76/38\uFF09");
@@ -3274,7 +4034,7 @@ function sampleCards() {
     ov.total === 2 && ov.due === 1 && ov.stable === 0 && ov.avgRetrievability !== null && ov.avgMastery !== null,
     "Saved Card \u6982\u89C8\uFF08\u5230\u671F/\u4FDD\u6301\u7387/\u638C\u63E1\u5EA6\u805A\u5408\u53EF\u7528\uFF09"
   );
-  fs4.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 setTimeout(() => {
   const pass = results.filter((r) => r.pass).length;

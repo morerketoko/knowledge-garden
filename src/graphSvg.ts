@@ -48,6 +48,15 @@ export class GraphSvg {
   private dragTx = 0;
   private dragTy = 0;
   private cleanup: (() => void)[] = [];
+  /** Phase 24 §四十二/§四十三：触摸手势状态（pointerType=touch 也能缩放/拖动/点按） */
+  private pointers = new Map<number, { x: number; y: number }>();
+  private pinch: { dist: number; cx: number; cy: number; scale: number; tx: number; ty: number } | null = null;
+  private downAt = 0;
+  private downX = 0;
+  private downY = 0;
+  private movedFar = false;
+  private lastPointerType = "mouse";
+  private tipTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(container: HTMLElement, model: GraphModel, layout: GraphLayout, cb: GraphSvgCallbacks) {
     this.model = model;
@@ -253,6 +262,10 @@ export class GraphSvg {
   // ---------- 交互 ----------
 
   private bindEvents(container: HTMLElement): void {
+    // §四十二：iOS/Android 的系统级手势（双指页面缩放、长按选择）必须让位给图交互。
+    // touch-action:none 只作用于这张 SVG，不影响 Vault 其它区域。
+    this.svg.style.touchAction = "none";
+
     const onWheel = (ev: WheelEvent) => {
       ev.preventDefault();
       if (ev.ctrlKey || ev.metaKey) {
@@ -273,28 +286,87 @@ export class GraphSvg {
     this.svg.addEventListener("wheel", onWheel, { passive: false });
     this.cleanup.push(() => this.svg.removeEventListener("wheel", onWheel));
 
+    const localPoint = (ev: PointerEvent): { x: number; y: number } => {
+      const rect = this.svg.getBoundingClientRect();
+      return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+    };
+
+    /** 双指缩放：以两指中点为锚点缩放（§四十二 pinch zoom） */
     const onPointerDown = (ev: PointerEvent) => {
-      if (ev.button !== 0) return;
+      this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      if (this.pointers.size === 2) {
+        // 进入双指模式：取消单指拖动，避免与缩放打架
+        this.dragging = false;
+        const [a, b] = Array.from(this.pointers.values());
+        this.pinch = {
+          dist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+          cx: (a.x + b.x) / 2,
+          cy: (a.y + b.y) / 2,
+          scale: this.scale,
+          tx: this.tx,
+          ty: this.ty,
+        };
+        try { this.svg.setPointerCapture(ev.pointerId); } catch { /* 忽略 */ }
+        return;
+      }
+      if (this.pinch) return; // 双指期间忽略新增手指
+      if (ev.button !== 0 && ev.pointerType === "mouse") return;
       const target = ev.target as Element;
-      if (target.closest && target.closest(".kg-gn")) return; // 节点交给 click，不拖动
+      // 节点交给 click/tap，不拖动（触摸端同样适用：想拖空白处拖动）
+      if (target.closest && target.closest(".kg-gn")) {
+        this.downAt = Date.now();
+        this.downX = ev.clientX;
+        this.downY = ev.clientY;
+        this.movedFar = false;
+        return;
+      }
       this.dragging = true;
       this.dragId = ev.pointerId;
       this.dragStartX = ev.clientX;
       this.dragStartY = ev.clientY;
       this.dragTx = this.tx;
       this.dragTy = this.ty;
-      this.svg.setPointerCapture(ev.pointerId);
+      this.downAt = Date.now();
+      this.movedFar = false;
+      try { this.svg.setPointerCapture(ev.pointerId); } catch { /* 忽略 */ }
     };
+
     const onPointerMove = (ev: PointerEvent) => {
+      if (this.pointers.has(ev.pointerId)) this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+      if (this.pinch && this.pointers.size >= 2) {
+        const [a, b] = Array.from(this.pointers.values());
+        const dist = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+        const ns = Math.max(MIN_SCALE, Math.min(MAX_SCALE, this.pinch.scale * (dist / this.pinch.dist)));
+        const p = localPoint(ev);
+        // 以初始中点为锚点：保持该点在缩放前后屏幕位置一致
+        const anchorX = this.pinch.cx - this.svg.getBoundingClientRect().left;
+        const anchorY = this.pinch.cy - this.svg.getBoundingClientRect().top;
+        this.tx = anchorX - ((anchorX - this.pinch.tx) / this.pinch.scale) * ns;
+        this.ty = anchorY - ((anchorY - this.pinch.ty) / this.pinch.scale) * ns;
+        this.scale = ns;
+        void p;
+        this.applyTransform();
+        this.movedFar = true;
+        return;
+      }
+
       if (!this.dragging || ev.pointerId !== this.dragId) return;
-      this.tx = this.dragTx + (ev.clientX - this.dragStartX);
-      this.ty = this.dragTy + (ev.clientY - this.dragStartY);
+      const dx = ev.clientX - this.dragStartX;
+      const dy = ev.clientY - this.dragStartY;
+      if (Math.abs(dx) + Math.abs(dy) > 6) this.movedFar = true;
+      this.tx = this.dragTx + dx;
+      this.ty = this.dragTy + dy;
       this.applyTransform();
     };
+
     const endDrag = (ev: PointerEvent) => {
-      if (!this.dragging || ev.pointerId !== this.dragId) return;
-      this.dragging = false;
-      try { this.svg.releasePointerCapture(ev.pointerId); } catch { /* 忽略 */ }
+      this.pointers.delete(ev.pointerId);
+      if (this.pointers.size < 2) this.pinch = null;
+      if (this.pointers.size === 0 && this.dragging) {
+        this.dragging = false;
+        try { this.svg.releasePointerCapture(ev.pointerId); } catch { /* 忽略 */ }
+      }
     };
     this.svg.addEventListener("pointerdown", onPointerDown);
     this.svg.addEventListener("pointermove", onPointerMove);
@@ -308,21 +380,38 @@ export class GraphSvg {
     });
 
     const onClick = (ev: MouseEvent) => {
+      // 拖拽/捏合结束后的 click 不算点按（触摸端必须有这个判定，否则滑一下就会打开笔记）
+      if (this.movedFar || Date.now() - this.downAt > 700) { this.movedFar = false; return; }
       const target = ev.target as Element;
       const nodeEl = target.closest ? target.closest(".kg-gn") : null;
       if (nodeEl) {
         const id = nodeEl.getAttribute("data-id") || "";
         const path = nodeEl.getAttribute("data-path") || "";
         this.selectNode(id);
+        // §四十三：移动端没有 hover，点按先给信息面板（tooltip），用户再决定是否打开笔记。
+        // 桌面仍保持「点节点 = 打开笔记」的既有行为，不改变 Phase 6-23 的交互契约。
+        const node = this.model.nodes.find((n) => n.id === id);
+        const touchLike = ev.detail === 0 || this.lastPointerType !== "mouse";
+        if (touchLike && node) {
+          this.showTipAt(node.label, node.reason || "（AI 未给出具体理由）", this.downX, this.downY);
+          this.scheduleTipHide(4200);
+        }
         if (path) this.cb.onOpenNote(path); // 点击节点打开真实笔记（§39/Test 2）
         return;
       }
       this.clearHighlight(); // 点击空白恢复
+      this.hideTip();
     };
     this.svg.addEventListener("click", onClick);
     this.cleanup.push(() => this.svg.removeEventListener("click", onClick));
 
+    // 记录最近一次指针类型：触摸端 click 事件不携带 pointerType，需要旁路判断
+    const rememberType = (ev: PointerEvent) => { this.lastPointerType = ev.pointerType || "mouse"; };
+    this.svg.addEventListener("pointerdown", rememberType);
+    this.cleanup.push(() => this.svg.removeEventListener("pointerdown", rememberType));
+
     const onOver = (ev: MouseEvent) => {
+      // 触摸端不派发 hover：showTip 只在鼠标路径使用
       const target = ev.target as Element;
       const nodeEl = target.closest ? target.closest(".kg-gn") : null;
       if (nodeEl) {
@@ -356,9 +445,34 @@ export class GraphSvg {
       this.svg.removeEventListener("mouseover", onOver);
       this.svg.removeEventListener("mouseout", onOut);
     });
+
+    // §四十六：用户进入「知识漫游」才初始化（本类由调用方在视图可见时构造）；
+    // 若容器被隐藏（移动端切到别的页签），停止 tip 计时器避免后台常驻。
+    const onVis = () => { if (document.hidden) this.hideTip(); };
+    document.addEventListener("visibilitychange", onVis);
+    this.cleanup.push(() => document.removeEventListener("visibilitychange", onVis));
+    void container;
   }
 
-  private showTip(head: string, body: string, ev: MouseEvent): void {
+  /** tap 之后自动收起信息面板（§四十三：hover-only tooltip 的移动端替代） */
+  private scheduleTipHide(ms: number): void {
+    if (this.tipTimer) clearTimeout(this.tipTimer);
+    this.tipTimer = setTimeout(() => { this.tipTimer = null; this.hideTip(); }, ms);
+  }
+
+  /** 用屏幕坐标显示信息面板（触摸端没有 MouseEvent，按点击点定位） */
+  private showTipAt(head: string, body: string, clientX: number, clientY: number): void {
+    this.renderTip(head, body);
+    const rect = this.svg.getBoundingClientRect();
+    const left = Math.max(6, Math.min(clientX - rect.left + 12, rect.width - 200));
+    this.tip.style.left = left + "px";
+    this.tip.style.top = Math.max(6, clientY - rect.top - 20) + "px";
+    this.tip.style.bottom = "auto";
+    this.tip.style.display = "block";
+  }
+
+  /** Phase 24 §四十三：移动端使用 bottom sheet（底部信息面板），不再依赖 hover */
+  private renderTip(head: string, body: string): void {
     this.tip.empty?.();
     while (this.tip.firstChild) this.tip.removeChild(this.tip.firstChild);
     const h = document.createElement("div");
@@ -369,13 +483,19 @@ export class GraphSvg {
     b.textContent = body;
     this.tip.appendChild(h);
     this.tip.appendChild(b);
+  }
+
+  private showTip(head: string, body: string, ev: MouseEvent): void {
+    this.renderTip(head, body);
     const rect = this.svg.getBoundingClientRect();
     this.tip.style.left = Math.min(ev.clientX - rect.left + 14, rect.width - 220) + "px";
     this.tip.style.top = Math.min(ev.clientY - rect.top + 14, rect.height - 90) + "px";
+    this.tip.style.bottom = "auto";
     this.tip.style.display = "block";
   }
 
   private hideTip(): void {
+    if (this.tipTimer) { clearTimeout(this.tipTimer); this.tipTimer = null; }
     this.tip.style.display = "none";
   }
 
@@ -439,10 +559,13 @@ export class GraphSvg {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.tipTimer) { clearTimeout(this.tipTimer); this.tipTimer = null; }
     for (const fn of this.cleanup) {
       try { fn(); } catch { /* 忽略 */ }
     }
     this.cleanup = [];
+    this.pointers.clear();
+    this.pinch = null;
     if (this.resizeObs) this.resizeObs.disconnect();
     this.svg.remove();
     this.tip.remove();

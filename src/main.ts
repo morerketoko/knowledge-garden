@@ -1,4 +1,4 @@
-import { Plugin, WorkspaceLeaf, Notice, TFile, TFolder, normalizePath } from "obsidian";
+import { Plugin, WorkspaceLeaf, Notice, TFile, TFolder, normalizePath, Platform } from "obsidian";
 import { DEFAULT_SETTINGS, mergeSettings, type Period, type PluginSettings, type ReviewQueue, type ReviewQuestion, type ReviewQueueItem } from "./types";
 import { NoteIndex, type NoteMetadata } from "./noteIndex";
 import { SearchIndex, extractAliases, extractHeadings, tokenizeText } from "./searchIndex";
@@ -78,8 +78,18 @@ import { WorkbenchSessionStore } from "./workbenchSession";
 import { ArtifactStore } from "./artifactStore";
 import { PromptLibraryStore, seedPromptLibrary } from "./promptLibrary";
 import { LatencyCollector } from "./latency";
-import * as path from "path";
+import * as path from "./portable/pathShim";
 import { AIWorkbenchView, VIEW_TYPE_AI_WORKBENCH } from "./workbenchView";
+import {
+  PortableStorageHost, STATE_DIR_NAME,
+} from "./portable/host";
+import { MemoryRoot, PluginDataRoot, VaultRoot } from "./portable/root";
+import {
+  flushMirror, initSyncMirror, mirrorStats,
+} from "./portable/fsPortable";
+import { migrateLegacyState, describeMigration } from "./portable/legacyMigration";
+import { joinVaultPath } from "./portable/paths";
+import { copyText as copyToClipboard, readText as readClipboardText } from "./portable/clipboard";
 
 /** Discovery Scope：discoveryPrep 的返回结构（AIPrep 的 Discovery 变体，含 scope 指纹 / 选择版本 / 展示上下文） */
 interface DiscoveryPrepResult {
@@ -202,11 +212,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    const manifest = this.manifest as unknown as { dir?: string };
-    const baseDir =
-      manifest.dir ??
-      (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ??
-      ".";
+    this.applyPlatformClasses();
+    const legacyDir = await this.initPortableStorage();
+    const baseDir = legacyDir;
     this.index = new NoteIndex(this.app, baseDir);
     await this.index.load();
     this.searchIndex = new SearchIndex(this.app, (pathStr) => this.index.get(pathStr));
@@ -290,17 +298,17 @@ export default class KnowledgeGardenPlugin extends Plugin {
       },
       baseDir
     );
-    // §九/十/十一/十三：损坏文件已隔离为 *.corrupt-*（保留原文件）并重建
-    if (cacheCorrupt) new Notice("AI 缓存已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
-    if (activityCorrupt) new Notice("最近访问数据已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
-    if (evolutionCorrupt) new Notice("知识演化缓存已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
+    // §九/十/十一/十三：损坏文件已隔离到 .corrupt/ 目录（保留原文件）并重建
+    if (cacheCorrupt) new Notice("AI 缓存已损坏，已隔离并重建。原文件已保留在 .corrupt/ 目录。");
+    if (activityCorrupt) new Notice("最近访问数据已损坏，已隔离并重建。原文件已保留在 .corrupt/ 目录。");
+    if (evolutionCorrupt) new Notice("知识演化缓存已损坏，已隔离并重建。原文件已保留在 .corrupt/ 目录。");
     if (reviewCorrupt) {
       this.ensureReviewQueue(); // §十三：queue 损坏 → 重新生成当前周期队列（纯本地，不调用 AI）
       new Notice("复习队列已损坏，已隔离并重建当前队列。");
     }
-    if (spacedCorrupt) new Notice("间隔重复(FSRS)数据已损坏，已隔离并重建（原文件保留为 .corrupt-*）。");
-    if (discoveryCorrupt) new Notice("知识发现曝光数据已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
-    if (workbenchCorrupt) new Notice("来源台账已损坏，已隔离重建（原文件保留为 .corrupt-*）。");
+    if (spacedCorrupt) new Notice("间隔重复(FSRS)数据已损坏，已隔离并重建（原文件保留在 .corrupt/ 目录）。");
+    if (discoveryCorrupt) new Notice("知识发现曝光数据已损坏，已隔离并重建。原文件已保留在 .corrupt/ 目录。");
+    if (workbenchCorrupt) new Notice("来源台账已损坏，已隔离重建（原文件保留在 .corrupt/ 目录）。");
     if (tasksCorrupt) new Notice("AI 任务数据已损坏，已隔离重建。");
     if (projectsCorrupt) new Notice("知识项目索引已损坏，已隔离重建（Projects/*.md 仍可恢复）。");
 
@@ -312,11 +320,11 @@ export default class KnowledgeGardenPlugin extends Plugin {
       void this.reindexCards(); // §一百九十六：cards.json 损坏 → 从 Review Cards/*.md 恢复（0 AI）
       new Notice("复习卡索引已损坏，已隔离；正在从 Review Cards/*.md 恢复（0 AI）。");
     }
-    if (examSessionsCorrupt) new Notice("考试会话已损坏，已隔离重建（原文件保留为 .corrupt-*）。");
+    if (examSessionsCorrupt) new Notice("考试会话已损坏，已隔离重建（原文件保留在 .corrupt/ 目录）。");
     if (cardReviewsCorrupt) new Notice("复习卡复习记录已损坏，已隔离重建。");
-    if (queryHistoryCorrupt) new Notice("最近探索历史已损坏，已隔离并重建。原文件已保留为 .corrupt-*。");
+    if (queryHistoryCorrupt) new Notice("最近探索历史已损坏，已隔离并重建。原文件已保留在 .corrupt/ 目录。");
     if (savedCorrupt) {
-      new Notice("收藏索引已损坏，原文件已隔离（.corrupt-*）；正在从收藏 Markdown 重新建立索引（§四十一/四十三）。");
+      new Notice("收藏索引已损坏，原文件已隔离到 .corrupt/ 目录；正在从收藏 Markdown 重新建立索引（§四十一/四十三）。");
       this.reindexSaved(); // 0 AI；Saved/*.md 是恢复源
     }
     if (relCorrupt) {
@@ -497,7 +505,141 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.queryHistory?.flush();
     this.saved?.flush();
     void this.index?.saveCache();
+    // §十三：把同步镜像里尚未落盘的状态立刻写入便携存储（移动端尤其重要：
+    // 后台挂起会直接冻结 WebView，不等 800ms 防抖）
+    void flushMirror();
   }
+
+  /**
+   * Phase 24 §六/§七/§九/§十一：初始化便携存储。
+   *
+   * 顺序（每一步都对应一条硬约束）：
+   *  1. 构造 Plugin Data 后端（永远可用，loadData/saveData 是官方设置 API，§八）——
+   *     即使它的快照读失败，也只是空状态，不会抛出。
+   *  2. 构造 Vault 后端（状态根 `Knowledge Garden/.state`）。**不做平台判断**，
+   *     而是真的写一个探针文件来探测可写性（只读仓库 / iCloud 只读会被正确识别）。
+   *  3. 探测失败 → 降级为全 plugin-data 后端（§九：必须提供替代实现，不是「移动端直接 return」）。
+   *  4. 一次性迁移旧桌面 `cache/*.json`（只复制、不删除旧文件，§十一）。
+   *  5. 预热同步镜像（业务存储的同步读依赖它）。
+   *
+   * 返回值：历史插件目录字符串（存储基）。既有业务代码把它 join 成
+   * `<legacy>/cache/x.json`，host.resolve 会映射到新的状态根，因此**零改动**。
+   */
+  private async initPortableStorage(): Promise<string> {
+    const pluginId = (this.manifest as { id?: string }).id ?? "knowledge-garden";
+    const manifest = this.manifest as unknown as { dir?: string };
+    // manifest.dir 在桌面是绝对/相对插件目录，移动端不可用；仅作为历史基使用（不拼绝对路径）
+    const legacyDir = manifest.dir ?? "plugin-dir";
+    const basePath = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ?? "";
+    const stateRoot = joinVaultPath("Knowledge Garden", STATE_DIR_NAME);
+
+    const pluginDataRoot = new PluginDataRoot(
+      () => this.loadData(),
+      (data) => this.saveData(data)
+    );
+    const mirror = new PluginDataRoot(
+      () => this.loadData(),
+      (data) => this.saveData(data),
+      "kgMirror"
+    );
+    // PluginDataRoot 需要先读快照（异步）才能在同步镜像里被读到
+    await pluginDataRoot.init();
+    await mirror.init();
+
+    const vaultRoot = new VaultRoot(this.app.vault as never, stateRoot);
+    const host = new PortableStorageHost({
+      stateRoot,
+      pluginData: mirror,
+      vault: vaultRoot,
+      useVault: true,
+      reason: "初始探测中",
+      // 其它 vault 命名空间：本版本状态全部收敛在 .state 下，此列表留给后续可见资产
+      vaultMounts: [],
+      stripPrefixes: [stateRoot],
+    });
+    host.baseDir = legacyDir;
+    // 同步镜像的键 = host 解析后的键：先用临时宿主读入旧位置（迁移前），再切到新宿主重读
+    await host.init();
+
+    // §十一：旧桌面 cache/*.json → 便携存储（只补缺失、永不删除旧文件）
+    let migration = describeMigration({ detected: false, copied: [], skippedExisting: [], failed: [], target: host.location });
+    try {
+      const r = await migrateLegacyState(this.app, host, pluginId);
+      migration = describeMigration(r);
+      if (r.detected && (r.copied.length || r.failed.length)) {
+        new Notice("知识花园：旧版数据迁移完成 —— " + migration, 8000);
+      }
+    } catch { /* 迁移失败不阻塞启动 */ }
+
+    const writable = await host.probeWritable();
+    host.setVaultEnabled(
+      writable,
+      writable
+        ? "Vault API（" + stateRoot + "/）"
+        : "Vault 不可写 → 已降级为 Plugin Data API（只读仓库 / iCloud 只读 / 权限不足）"
+    );
+    if (!writable) {
+      new Notice("知识花园：当前仓库无法写入状态目录，已改用插件数据存储（功能不降级，仅位置不同）。", 8000);
+    }
+
+    await initSyncMirror(host);
+    this.storageHost = host;
+    this.storageBackendLabel = host.reason + " · " + (writable ? "vault" : "plugin-data");
+    this.migrationSummary = migration;
+    return legacyDir;
+  }
+
+  /** 诊断用：存储后端 + 迁移摘要 + 镜像状态（不暴露绝对路径） */
+  storageDiagnostics(): { backend: string; migration: string; mirror: string } {
+    const m = mirrorStats();
+    return {
+      backend: this.storageBackendLabel || "未初始化",
+      migration: this.migrationSummary || "未执行",
+      mirror: m.files + " 个文件（待落盘 " + m.dirty + "）",
+    };
+  }
+
+  /** 便携存储宿主（迁移 / 诊断 / 测试使用） */
+  storageHost: PortableStorageHost | null = null;
+  private storageBackendLabel = "";
+  private migrationSummary = "";
+
+  /**
+   * Phase 24 §九十四 / §九十五：平台 Class。
+   *
+   * 只做两件 JS 必须做的事：
+   *  1. 在 `<body>` 加 `kg-mobile` / `kg-ios` / `kg-android` / `kg-desktop`（插件命名空间前缀，
+   *     不改任何 Obsidian 自身样式，§一百零九）。
+   *  2. 让后续动态创建的 `.kg-dashboard` 容器**自动**带上同样的 class（平台差异行为如
+   *     剪贴板、音频手势、安全区需要它），而**不是**用 JS 去算布局。
+   *
+   * 布局本身仍完全由 CSS 负责（§九十五：能用 CSS 就不用 JS）。
+   */
+  private applyPlatformClasses(): void {
+    const platform = [
+      Platform.isMobile ? "kg-mobile" : "kg-desktop",
+      Platform.isIosApp ? "kg-ios" : "",
+      Platform.isAndroidApp ? "kg-android" : "",
+      Platform.isDesktopApp ? "kg-desktop-app" : "kg-mobile-app",
+    ].filter(Boolean);
+    this.platformClasses = platform;
+    for (const c of platform) document.body.addClass(c);
+    // 动态容器自动继承（MutationObserver 只观察 class 变化，不读布局、不触发重排）
+    try {
+      const observer = new MutationObserver((records) => {
+        for (const r of records) {
+          const el = r.target as HTMLElement;
+          if (!el.classList || !el.classList.contains("kg-dashboard")) continue;
+          for (const c of platform) if (!el.classList.contains(c)) el.classList.add(c);
+        }
+      });
+      observer.observe(document.body, { subtree: true, attributeFilter: ["class"] });
+      this.register(() => observer.disconnect());
+    } catch { /* 环境不支持 MutationObserver：样式层本身已按视口适配，不阻塞 */ }
+  }
+
+  /** 当前平台 class 列表（视图可在自身容器上复用） */
+  platformClasses: string[] = [];
 
   async loadSettings(): Promise<void> {
     const raw = (await this.loadData()) as Partial<PluginSettings> | null | undefined;
@@ -1522,13 +1664,14 @@ export default class KnowledgeGardenPlugin extends Plugin {
     await this.refreshCaptureSummary();
   }
 
-  /** §二十：从剪贴板捕获（中文/英文/多段；0 AI；剪贴板失败时降级为表单） */
+  /** §二十：从剪贴板捕获（中文/英文/多段；0 AI；剪贴板失败时降级为表单）
+   *  Phase 24 §六十六/§一百二十八：移动端可能拒绝读取剪贴板 → 必须提供「手动粘贴」替代路径。 */
   async clipboardCapture(): Promise<void> {
-    let text = "";
-    try { text = await navigator.clipboard.readText(); } catch { /* 降级：提示手动粘贴 */ }
-    if (!text || !text.trim()) {
+    const read = await readClipboardText();
+    const text = read.text;
+    if (!read.ok || !text.trim()) {
       new CaptureFormModal(this.app, (input) => { void this.createCapture(input); }).open();
-      new Notice("剪贴板为空或不可读，已打开新建捕获表单代替（§二十）。");
+      new Notice((read.reason ?? "剪贴板为空或不可读") + " 已打开新建捕获表单代替。");
       return;
     }
     const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);

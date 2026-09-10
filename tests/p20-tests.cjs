@@ -7,9 +7,9 @@ var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    for (let key2 of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key2) && key2 !== except)
+        __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
   }
   return to;
 };
@@ -22,14 +22,594 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
-// tests/p20-tests.ts
-var fs5 = __toESM(require("node:fs"));
-var os = __toESM(require("node:os"));
-var path5 = __toESM(require("node:path"));
+// src/portable/paths.ts
+function isUnsafeRelativePath(p) {
+  if (!p || typeof p !== "string") return true;
+  if (p.startsWith("/") || p.startsWith("\\")) return true;
+  if (/^[A-Za-z]:[\\/]/.test(p)) return true;
+  if (p.startsWith("\\\\") || p.startsWith("//")) return true;
+  const normalized = p.replace(/\\/g, "/");
+  const segments = normalized.split("/");
+  for (const seg of segments) {
+    const s = seg.trim();
+    if (s === "..") return true;
+    if (s.includes(":")) return true;
+  }
+  return false;
+}
+function isReservedStoragePath(p) {
+  const n = normalizeVaultPath(p);
+  if (!n) return true;
+  const lower = n.toLowerCase();
+  return lower === ".obsidian" || lower.startsWith(".obsidian/") || lower === ".trash" || lower.startsWith(".trash/") || lower.split("/").includes("node_modules");
+}
+function normalizeVaultPath(input) {
+  if (input === null || input === void 0) return "";
+  let p = String(input).replace(/\\/g, "/").trim();
+  if (!p) return "";
+  if (isUnsafeRelativePath(p)) return "";
+  const out = [];
+  for (const seg of p.split("/")) {
+    if (!seg || seg === ".") continue;
+    out.push(seg);
+  }
+  return out.join("/");
+}
+function joinVaultPath(...parts) {
+  const pieces = parts.filter((x) => typeof x === "string" && x.length > 0).map((x) => x.replace(/\\/g, "/")).join("/");
+  return normalizeVaultPath(pieces);
+}
+function dirnameVaultPath(p) {
+  const n = normalizeVaultPath(p);
+  const i = n.lastIndexOf("/");
+  return i < 0 ? "" : n.slice(0, i);
+}
 
-// src/spacedReview.ts
-var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
+// src/portable/root.ts
+var MemoryRoot = class {
+  constructor(seed) {
+    this.kind = "memory";
+    this.persistent = false;
+    this.location = "memory://";
+    this.files = /* @__PURE__ */ new Map();
+    /** 可注入故障：写失败次数（测试损坏/降级路径） */
+    this.failWrites = 0;
+    if (seed) for (const [k, v] of Object.entries(seed)) this.files.set(normalizeVaultPath(k), v);
+  }
+  async exists(path2) {
+    const p = normalizeVaultPath(path2);
+    if (this.files.has(p)) return true;
+    return this.hasChildren(p);
+  }
+  async isFile(path2) {
+    return this.files.has(normalizeVaultPath(path2));
+  }
+  async isDirectory(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return true;
+    return this.hasChildren(p);
+  }
+  hasChildren(p) {
+    const prefix = p + "/";
+    for (const k of this.files.keys()) if (k.startsWith(prefix)) return true;
+    return false;
+  }
+  async read(path2) {
+    const v = this.files.get(normalizeVaultPath(path2));
+    return v === void 0 ? null : v;
+  }
+  async write(path2, data) {
+    if (this.failWrites > 0) {
+      this.failWrites--;
+      throw new Error("memory root: injected write failure");
+    }
+    this.files.set(normalizeVaultPath(path2), data);
+  }
+  async remove(path2) {
+    const p = normalizeVaultPath(path2);
+    if (this.files.delete(p)) return true;
+    const prefix = p + "/";
+    let removed = false;
+    for (const k of Array.from(this.files.keys())) if (k.startsWith(prefix)) {
+      this.files.delete(k);
+      removed = true;
+    }
+    return removed;
+  }
+  async rename(from, to) {
+    const f = normalizeVaultPath(from);
+    const t = normalizeVaultPath(to);
+    const v = this.files.get(f);
+    if (v === void 0) return false;
+    this.files.delete(f);
+    this.files.set(t, v);
+    return true;
+  }
+  async mkdirp() {
+  }
+  async list(path2) {
+    const p = normalizeVaultPath(path2);
+    const prefix = p ? p + "/" : "";
+    const out = [];
+    for (const [k, v] of this.files) {
+      if (prefix && !k.startsWith(prefix)) continue;
+      const rest = k.slice(prefix.length);
+      if (!rest || rest.includes("/")) continue;
+      out.push({ path: k, name: rest, size: v.length, mtime: 0 });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async prefetch() {
+  }
+  /** 测试辅助：全部键 */
+  keys() {
+    return Array.from(this.files.keys());
+  }
+  /** 测试辅助：目录是否为空 */
+  isEmptyDir(path2) {
+    const prefix = (normalizeVaultPath(path2) || "") + "/";
+    for (const k of this.files.keys()) if (k.startsWith(prefix)) return false;
+    return true;
+  }
+};
+
+// src/storage.ts
+var PortableStorage = class {
+  constructor(root) {
+    this.root = root;
+  }
+  get backend() {
+    return this.root.kind;
+  }
+  get location() {
+    return this.root.location;
+  }
+  get persistent() {
+    return this.root.persistent;
+  }
+  /** 启动前调用：让 VaultRoot 的读缓存 / PluginDataRoot 的快照就绪 */
+  async init() {
+    await this.root.prefetch();
+  }
+  async exists(path2) {
+    return this.root.exists(normalizeVaultPath(path2));
+  }
+  async readText(path2) {
+    return this.root.read(normalizeVaultPath(path2));
+  }
+  async readJson(path2) {
+    const raw = await this.readText(path2);
+    if (raw === null) return null;
+    return JSON.parse(raw);
+  }
+  /**
+   * §十三：平台无关写入。
+   *
+   * `atomic` 的选择依据是**后端能力**，不是 `Platform.isMobile` 的猜测：
+   * - vault / plugin-data 后端：Obsidian 的 create+modify 本身不提供跨文件原子替换，
+   *   因此先写 `<file>.bak` 备份，再写目标；任一步失败都会保留备份（§十二）。
+   * - 桌面（调用方传入 nativeAtomic=true）：沿用 tmp + rename。
+   */
+  async writeText(path2, data, opts) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return { ok: false, atomic: false, backend: this.root.kind, error: "\u975E\u6CD5\u8DEF\u5F84" };
+    try {
+      const dir = dirnameVaultPath(p);
+      if (dir) await this.root.mkdirp(dir);
+      if (opts?.nativeAtomic) {
+        const tmp = p + ".tmp";
+        await this.root.write(tmp, data);
+        const renamed = await this.root.rename(tmp, p);
+        if (renamed) return { ok: true, atomic: true, backend: this.root.kind };
+        await this.root.write(p, data);
+        await this.root.remove(tmp);
+        return { ok: true, atomic: false, backend: this.root.kind };
+      }
+      const backup = p + ".bak";
+      const prev = await this.root.read(p);
+      if (prev !== null) await this.root.write(backup, prev);
+      await this.root.write(p, data);
+      return { ok: true, atomic: false, backend: this.root.kind };
+    } catch (e) {
+      return { ok: false, atomic: false, backend: this.root.kind, error: e?.message ?? String(e) };
+    }
+  }
+  async writeJson(path2, value, opts) {
+    return this.writeText(path2, JSON.stringify(value), opts);
+  }
+  async remove(path2) {
+    return this.root.remove(normalizeVaultPath(path2));
+  }
+  async rename(from, to) {
+    return this.root.rename(normalizeVaultPath(from), normalizeVaultPath(to));
+  }
+  /** 列出目录下的直接子项（相对 path 的名字） */
+  async list(path2) {
+    return this.root.list(normalizeVaultPath(path2));
+  }
+  async isDirectory(path2) {
+    return this.root.isDirectory(normalizeVaultPath(path2));
+  }
+  async isFile(path2) {
+    return this.root.isFile(normalizeVaultPath(path2));
+  }
+};
+
+// src/portable/host.ts
+var STATE_DIR_NAME = ".state";
+var PortableStorageHost = class {
+  constructor(opts) {
+    this.opts = opts;
+    /** 历史插件目录（旧 manifest.dir / getBasePath）；用于把旧路径映射到新根 */
+    this.baseDir = "";
+    this.stateRoot = normalizeVaultPath(opts.stateRoot);
+    this.vaultMounts = (opts.vaultMounts ?? []).map((m) => normalizeVaultPath(m)).filter(Boolean);
+    this.stripPrefixes = (opts.stripPrefixes ?? []).map((p) => normalizeVaultPath(p)).filter(Boolean);
+    this.dataStorage = new PortableStorage(opts.pluginData);
+    this.vaultStorage = opts.useVault && opts.vault ? new PortableStorage(opts.vault) : null;
+    this.reasonText = opts.reason;
+    this.baseDir = this.stateRoot;
+  }
+  /* ---------------- 后端状态 ---------------- */
+  get backendKind() {
+    return (this.vaultStorage ?? this.dataStorage).backend;
+  }
+  get vaultEnabled() {
+    return this.vaultStorage !== null;
+  }
+  get reason() {
+    return this.reasonText;
+  }
+  /** 诊断位置的展示名（永不返回绝对路径） */
+  get location() {
+    return this.vaultStorage ? this.stateRoot + "/" : "plugin-data://";
+  }
+  /** 能力探测后修正后端选择（只读仓库 / iCloud 只读 → 降级到 plugin-data） */
+  setVaultEnabled(enabled, reason) {
+    if (enabled === this.vaultEnabled) {
+      if (reason) this.reasonText = reason;
+      return;
+    }
+    this.vaultStorage = enabled && this.opts.vault ? new PortableStorage(this.opts.vault) : null;
+    if (reason) this.reasonText = reason;
+  }
+  /** 该相对路径对应的存储 */
+  backendFor(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return this.dataStorage;
+    if (!this.vaultStorage) return this.dataStorage;
+    return this.isVaultPath(p) ? this.vaultStorage : this.dataStorage;
+  }
+  isVaultPath(p) {
+    if (p === this.stateRoot || p.startsWith(this.stateRoot + "/")) return true;
+    for (const m of this.vaultMounts) {
+      if (p === m || p.startsWith(m + "/")) return true;
+    }
+    return false;
+  }
+  /* ---------------- 路径解析 ---------------- */
+  /**
+   * 归一化并解析插件相对路径。
+   *
+   * 业务存储类历史上拿到的是**插件目录**（manifest.dir / 旧 getBasePath）并在其上
+   * `join(baseDir, "cache", "x.json")`。重构后它们拿到的仍是同一个字符串，
+   * 因此这里要把「以历史基开头的路径」映射到 `.state/` 之下；
+   * 已经是 vault 挂载前缀或 `.state/` 的路径原样保留。
+   */
+  resolve(path2) {
+    const raw = String(path2 ?? "").replace(/\\/g, "/");
+    if (raw === "" || raw === this.baseDir) return this.stateRoot;
+    if (this.baseDir && raw.startsWith(this.baseDir + "/")) {
+      const rel = raw.slice(this.baseDir.length + 1);
+      return joinVaultPath(this.stateRoot, rel);
+    }
+    if (raw === this.stateRoot || raw.startsWith(this.stateRoot + "/")) return normalizeVaultPath(raw);
+    for (const m of this.vaultMounts) {
+      if (raw === m || raw.startsWith(m + "/")) return normalizeVaultPath(raw);
+    }
+    return normalizeVaultPath(raw);
+  }
+  /** plugin-data 后端的存储键（剥离冗长前缀，保持 data.json 可读） */
+  dataKey(target) {
+    for (const pre of this.stripPrefixes) {
+      if (target === pre) return "";
+      if (target.startsWith(pre + "/")) return target.slice(pre.length + 1);
+    }
+    return target;
+  }
+  /* ---------------- 读写 ---------------- */
+  async write(path2, data, opts) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    const key2 = backend === this.dataStorage ? this.dataKey(target) : target;
+    return backend.writeText(key2, data, opts);
+  }
+  async read(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.readText(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async exists(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.exists(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async remove(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.remove(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async rename(from, to) {
+    const f = this.resolve(from);
+    const t = this.resolve(to);
+    const bf = this.backendFor(f);
+    const bt = this.backendFor(t);
+    if (bf !== bt) {
+      const raw = await this.read(f);
+      if (raw === null) return false;
+      const w = await this.write(t, raw);
+      if (!w.ok) return false;
+      await this.remove(f);
+      return true;
+    }
+    const keyF = bf === this.dataStorage ? this.dataKey(f) : f;
+    const keyT = bf === this.dataStorage ? this.dataKey(t) : t;
+    return bf.rename(keyF, keyT);
+  }
+  async list(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.list(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  async isDirectory(path2) {
+    const target = this.resolve(path2);
+    const backend = this.backendFor(target);
+    return backend.isDirectory(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  /* ---------------- 启动 ---------------- */
+  /** 初始化两个后端的读缓存（同步镜像的遍历由 fsPortable.initSyncMirror 负责） */
+  async init() {
+    if (this.vaultStorage) await this.vaultStorage.init();
+    await this.dataStorage.init();
+  }
+  /**
+   * 后端能力探测（§七 / §九 / §一百三十七）：
+   * 通过**真实写入一个探针文件**判断 Vault 是否可写，而不是猜平台 ——
+   * 只读仓库、iCloud 只读、沙盒权限不足都能被正确探测出来。
+   */
+  async probeWritable() {
+    const probe = joinVaultPath(this.stateRoot, ".kg-write-probe");
+    const wasEnabled = this.vaultEnabled;
+    if (!wasEnabled && this.opts.vault) this.vaultStorage = new PortableStorage(this.opts.vault);
+    try {
+      if (!this.vaultStorage) return false;
+      const out = await this.vaultStorage.writeText(probe, String(Date.now()), { nativeAtomic: true });
+      if (!out.ok) return false;
+      await this.vaultStorage.remove(probe);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (!wasEnabled) this.vaultStorage = null;
+    }
+  }
+  /** 校验任意相对路径是否安全（供 NoteIndex / 迁移使用，§十七） */
+  static isSafe(path2) {
+    const raw = String(path2 ?? "").replace(/\\/g, "/");
+    if (!raw) return false;
+    if (isUnsafeRelativePath(raw)) return false;
+    const n = normalizeVaultPath(raw);
+    if (!n.length) return false;
+    return !isReservedStoragePath(n);
+  }
+  /** 某个存储路径的父目录（创建文件前用） */
+  dirOf(path2) {
+    return dirnameVaultPath(this.resolve(path2));
+  }
+};
+
+// src/portable/fsPortable.ts
+var host = null;
+var mirror = /* @__PURE__ */ new Map();
+var dirty = /* @__PURE__ */ new Set();
+var pendingError = null;
+var flushTimer = null;
+var flushing = false;
+var initialized = false;
+var MIRROR_FLUSH_MS = 800;
+function setStorageHost(h) {
+  host = h;
+  mirror.clear();
+  dirty.clear();
+  pendingError = null;
+  initialized = false;
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+}
+async function initSyncMirror(h) {
+  setStorageHost(h);
+  try {
+    const walk = async (rel, depth) => {
+      if (depth > 4) return;
+      const items = await h.list(rel);
+      for (const it of items) {
+        const child = rel ? rel + "/" + it.name : it.name;
+        if (await h.isDirectory(child)) await walk(child, depth + 1);
+        else {
+          const raw = await h.read(child);
+          if (raw !== null) mirror.set(child, raw);
+        }
+      }
+    };
+    await walk(h.stateRoot, 0);
+    for (const it of await h.list("mirror")) {
+      const raw = await h.read("mirror/" + it.name);
+      if (raw !== null) mirror.set(it.name, raw);
+    }
+  } catch {
+  }
+  initialized = true;
+}
+function schedule() {
+  if (flushTimer !== null) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void flushMirror();
+  }, MIRROR_FLUSH_MS);
+}
+async function flushMirror() {
+  if (!host || flushing || dirty.size === 0) return;
+  flushing = true;
+  const paths = Array.from(dirty);
+  dirty.clear();
+  try {
+    for (const p of paths) {
+      const data = mirror.get(p);
+      if (data === void 0) {
+        await host.remove(p);
+        continue;
+      }
+      const out = await host.write(p, data, { nativeAtomic: host.backendFor(p).backend === "vault" });
+      if (!out.ok) pendingError = pendingError ?? new Error(out.error ?? "\u5199\u5165\u5931\u8D25\uFF1A" + p);
+    }
+  } catch (e) {
+    pendingError = pendingError ?? e;
+  } finally {
+    flushing = false;
+    if (dirty.size) schedule();
+  }
+}
+function bump() {
+  if (pendingError) {
+    const e = pendingError;
+    pendingError = null;
+    throw e;
+  }
+}
+function key(p) {
+  if (!host) return "";
+  return host.resolve(p);
+}
+function existsSync(p) {
+  if (!host || !p) return false;
+  const k = key(p);
+  if (!k) return false;
+  if (mirror.has(k)) return true;
+  const prefix = k + "/";
+  for (const m of mirror.keys()) if (m.startsWith(prefix)) return true;
+  return false;
+}
+function readFileSync(p, _enc) {
+  const k = key(p);
+  const v = k ? mirror.get(k) : void 0;
+  if (v === void 0) throw new Error("ENOENT: " + (k || p));
+  return v;
+}
+function writeFileSync(p, data, _enc) {
+  bump();
+  const k = key(p);
+  if (!k) {
+    pendingError = new Error("\u5B58\u50A8\u672A\u5C31\u7EEA\uFF0C\u5199\u5165\u88AB\u5FFD\u7565\uFF1A" + p);
+    return;
+  }
+  mirror.set(k, String(data ?? ""));
+  dirty.add(k);
+  schedule();
+}
+function renameSync(from, to) {
+  bump();
+  const f = key(from);
+  const t = key(to);
+  if (!f || !t) throw new Error("\u5B58\u50A8\u672A\u5C31\u7EEA\uFF0Crename \u5931\u8D25");
+  const v = mirror.get(f);
+  if (v === void 0) throw new Error("ENOENT: " + f);
+  mirror.delete(f);
+  mirror.set(t, v);
+  dirty.add(t);
+  schedule();
+}
+function unlinkSync(p) {
+  bump();
+  const k = key(p);
+  if (!k) return;
+  mirror.delete(k);
+  dirty.add(k);
+  schedule();
+}
+function readdirSync(p, _opts) {
+  if (!host || !p) return [];
+  const k = key(p);
+  const prefix = k ? k + "/" : "";
+  const seen = /* @__PURE__ */ new Map();
+  for (const m of mirror.keys()) {
+    if (!m.startsWith(prefix)) continue;
+    const rest = m.slice(prefix.length);
+    if (!rest) continue;
+    const slash = rest.indexOf("/");
+    const name = slash < 0 ? rest : rest.slice(0, slash);
+    const isDir = slash >= 0;
+    seen.set(name, (seen.get(name) ?? false) || isDir);
+  }
+  return Array.from(seen.entries()).map(([name, isDir]) => ({ name, isFile: () => !isDir, isDirectory: () => isDir })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// tests/portable-bootstrap.ts
+var TEST_TMP_ROOT = ".kg-tests";
+var dirSeq = 0;
+function mkdtemp(prefix = "") {
+  dirSeq++;
+  const safe = String(prefix).replace(/[\\/]+$/, "").replace(/[^\w.-]+/g, "-") || "d";
+  return TEST_TMP_ROOT + "/" + safe + "-" + dirSeq;
+}
+var host2 = null;
+var ready = false;
+function initTestStorage() {
+  if (ready && host2) return host2;
+  const stateRoot = joinVaultPath("Knowledge Garden", STATE_DIR_NAME);
+  const h = new PortableStorageHost({
+    stateRoot,
+    pluginData: new MemoryRoot(),
+    vault: new MemoryRoot(),
+    useVault: true,
+    reason: "node-test(memory)",
+    stripPrefixes: [stateRoot]
+  });
+  h.baseDir = TEST_TMP_ROOT;
+  host2 = h;
+  void h.init();
+  void initSyncMirror(h);
+  ready = true;
+  return h;
+}
+function testHost() {
+  if (!host2) throw new Error("\u6D4B\u8BD5\u5B58\u50A8\u672A\u521D\u59CB\u5316\uFF1A\u8BF7\u5148\u8C03\u7528 initTestStorage()");
+  return host2;
+}
+initTestStorage();
+function stateKeyOf(relPath) {
+  return testHost().resolve(relPath);
+}
+function readStateText(rel) {
+  return readFileSync(stateKeyOf(rel), "utf8");
+}
+function stateList(rel = "") {
+  return readdirSync(stateKeyOf(rel)).map((d) => d.name);
+}
+function seedStateText(rel, text) {
+  writeFileSync(stateKeyOf(rel), text);
+}
+
+// tests/p20-tests.ts
+var fs = __toESM(require("node:fs"));
+var os = __toESM(require("node:os"));
+var path = __toESM(require("node:path"));
+
+// src/portable/pathShim.ts
+function join(...parts) {
+  return joinVaultPath(...parts);
+}
 
 // node_modules/ts-fsrs/dist/index.mjs
 var FSRSError = class _FSRSError extends Error {
@@ -751,8 +1331,8 @@ var FSRSAlgorithm = class {
   }
   update_parameters(params) {
     const _params = this.prepare_parameters(params);
-    for (const key in _params) {
-      const paramKey = key;
+    for (const key2 in _params) {
+      const paramKey = key2;
       this.param[paramKey] = _params[paramKey];
     }
   }
@@ -1866,29 +2446,50 @@ var fsrs = (params) => {
 };
 
 // src/migrations.ts
-var fs = __toESM(require("fs"));
-var path = __toESM(require("path"));
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
 function corruptStamp(now = /* @__PURE__ */ new Date()) {
   return String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate()) + "-" + pad2(now.getHours()) + pad2(now.getMinutes()) + pad2(now.getSeconds());
 }
+function corruptTargetPath(filePath, now = /* @__PURE__ */ new Date()) {
+  const p = String(filePath).replace(/\\/g, "/");
+  const i = p.lastIndexOf("/");
+  const dir = i < 0 ? "" : p.slice(0, i);
+  const name = i < 0 ? p : p.slice(i + 1);
+  const stamp = name + "." + corruptStamp(now);
+  return dir ? dir + "/.corrupt/" + stamp : ".corrupt/" + stamp;
+}
 function isolateCorruptFile(filePath) {
   try {
-    if (!fs.existsSync(filePath)) return false;
-    fs.renameSync(filePath, filePath + ".corrupt-" + corruptStamp());
+    if (!existsSync(filePath)) return false;
+    renameSync(filePath, corruptTargetPath(filePath));
     return true;
   } catch {
-    return false;
+    try {
+      const raw = readFileSync(filePath, "utf8");
+      writeFileSync(corruptTargetPath(filePath), raw);
+      unlinkSync(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 function atomicWriteJson(filePath, value) {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
+  const data = JSON.stringify(value);
   const tmp = filePath + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
-  fs.renameSync(tmp, filePath);
+  try {
+    writeFileSync(tmp, data, "utf8");
+    renameSync(tmp, filePath);
+    return;
+  } catch {
+    try {
+      unlinkSync(tmp);
+    } catch {
+    }
+    writeFileSync(filePath, data, "utf8");
+  }
 }
 
 // src/spacedReview.ts
@@ -1953,20 +2554,20 @@ var DAY_MS = 864e5;
 function num(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function toTsCard(fs6) {
-  const lastReview = typeof fs6.lastReview === "number" ? new Date(fs6.lastReview) : void 0;
-  const dueMs = num(fs6.due, Date.now());
+function toTsCard(fs2) {
+  const lastReview = typeof fs2.lastReview === "number" ? new Date(fs2.lastReview) : void 0;
+  const dueMs = num(fs2.due, Date.now());
   const elapsedDays = lastReview ? Math.max(0, Math.round((dueMs - lastReview.getTime()) / DAY_MS)) : 0;
   return {
     due: new Date(dueMs),
-    stability: Math.max(1e-3, num(fs6.stability, 0)),
-    difficulty: Math.min(10, Math.max(1, num(fs6.difficulty, 5))),
+    stability: Math.max(1e-3, num(fs2.stability, 0)),
+    difficulty: Math.min(10, Math.max(1, num(fs2.difficulty, 5))),
     elapsed_days: elapsedDays,
     scheduled_days: Math.max(0, Math.floor((dueMs - (lastReview?.getTime() ?? dueMs)) / DAY_MS)),
-    learning_steps: Math.max(0, Math.floor(num(fs6.learningSteps, 0))),
-    reps: Math.max(0, Math.floor(num(fs6.reps, 0))),
-    lapses: Math.max(0, Math.floor(num(fs6.lapses, 0))),
-    state: fs6.state === State.Learning || fs6.state === State.Review || fs6.state === State.Relearning ? fs6.state : State.New,
+    learning_steps: Math.max(0, Math.floor(num(fs2.learningSteps, 0))),
+    reps: Math.max(0, Math.floor(num(fs2.reps, 0))),
+    lapses: Math.max(0, Math.floor(num(fs2.lapses, 0))),
+    state: fs2.state === State.Learning || fs2.state === State.Review || fs2.state === State.Relearning ? fs2.state : State.New,
     last_review: lastReview
   };
 }
@@ -2261,7 +2862,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
     this.logs = [];
     this.savedCards = /* @__PURE__ */ new Map();
     this.savedLogs = [];
-    this.file = path2.join(pluginDir, "cache", "spaced-review.json");
+    this.file = join(pluginDir, "cache", "spaced-review.json");
   }
   static {
     this.FORMAT_VERSION = 2;
@@ -2269,8 +2870,8 @@ var SpacedReviewStore = class _SpacedReviewStore {
   /** 启动恢复；损坏 → 隔离 *.corrupt-* 后置空（§36，不阻塞启动） */
   load() {
     try {
-      if (!fs2.existsSync(this.file)) return false;
-      const raw = JSON.parse(fs2.readFileSync(this.file, "utf8"));
+      if (!existsSync(this.file)) return false;
+      const raw = JSON.parse(readFileSync(this.file, "utf8"));
       if (!raw || typeof raw !== "object") throw new Error("invalid spaced-review structure");
       if (raw.cards && typeof raw.cards === "object") {
         for (const [p, c] of Object.entries(raw.cards)) {
@@ -2411,7 +3012,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
   /** 文件原文备份（§76：重排前备份，失败 rollback） */
   fileSnapshot() {
     try {
-      return fs2.existsSync(this.file) ? fs2.readFileSync(this.file, "utf8") : null;
+      return existsSync(this.file) ? readFileSync(this.file, "utf8") : null;
     } catch {
       return null;
     }
@@ -2427,7 +3028,7 @@ var SpacedReviewStore = class _SpacedReviewStore {
         this.persist(this.cards, this.logs, this.savedCards, this.savedLogs);
         return true;
       }
-      fs2.writeFileSync(this.file, snapshot, "utf8");
+      writeFileSync(this.file, snapshot, "utf8");
       this.load();
       return true;
     } catch {
@@ -2508,10 +3109,6 @@ function sanitizeSavedCard(id, c) {
     updatedAt: f(rec["updatedAt"], Date.now())
   };
 }
-
-// src/reviewCenter.ts
-var fs3 = __toESM(require("fs"));
-var path3 = __toESM(require("path"));
 
 // src/knowledgeState.ts
 function daysSince(t, now) {
@@ -2696,16 +3293,16 @@ var ReviewCenterStore = class {
     this.queue = null;
     this.skipHistory = {};
     this.session = null;
-    this.queueFile = path3.join(pluginDir, "cache", "review-queue.json");
-    this.sessionFile = path3.join(pluginDir, "cache", "review-session.json");
+    this.queueFile = join(pluginDir, "cache", "review-queue.json");
+    this.sessionFile = join(pluginDir, "cache", "review-session.json");
   }
   /** 启动时恢复；损坏文件隔离 *.corrupt-* 后置空（§十三：queue 重建由调用方生成当前周期队列；session 置空）。
    *  返回是否执行了隔离。 */
   load() {
     let isolated = false;
     try {
-      if (fs3.existsSync(this.queueFile)) {
-        const raw = JSON.parse(fs3.readFileSync(this.queueFile, "utf8"));
+      if (existsSync(this.queueFile)) {
+        const raw = JSON.parse(readFileSync(this.queueFile, "utf8"));
         if (!raw || typeof raw !== "object") throw new Error("invalid queue structure");
         if (raw.queue && typeof raw.queue === "object" && Array.isArray(raw.queue.items)) {
           const rq = raw.queue;
@@ -2729,8 +3326,8 @@ var ReviewCenterStore = class {
       this.queue = null;
     }
     try {
-      if (fs3.existsSync(this.sessionFile)) {
-        const s = JSON.parse(fs3.readFileSync(this.sessionFile, "utf8"));
+      if (existsSync(this.sessionFile)) {
+        const s = JSON.parse(readFileSync(this.sessionFile, "utf8"));
         if (s && typeof s.periodKey === "string" && typeof s.currentIndex === "number") {
           this.session = {
             periodKey: s.periodKey,
@@ -2786,14 +3383,14 @@ var ReviewCenterStore = class {
   /** 删除笔记后合并清理（§六十六 Test 18）：队列移除不存在的 item；skipHistory 清掉 */
   prunePaths(existing) {
     if (this.queue) this.queue = pruneQueue(this.queue, existing);
-    let dirty = false;
+    let dirty2 = false;
     for (const k of Object.keys(this.skipHistory)) {
       if (!existing.has(k)) {
         delete this.skipHistory[k];
-        dirty = true;
+        dirty2 = true;
       }
     }
-    if (dirty || this.queue) this.writeQueue();
+    if (dirty2 || this.queue) this.writeQueue();
   }
   /** 笔记 rename 后队列与跳过历史随行更新（§六十六 Test 19），不产生假死路径 */
   migratePaths(oldPath, newPath) {
@@ -2947,20 +3544,18 @@ function deriveAnswerFromMarkdown(src, question) {
 }
 
 // src/activity.ts
-var fs4 = __toESM(require("fs"));
-var path4 = __toESM(require("path"));
 var ActivityStore = class {
   constructor(pluginDir) {
     this.data = /* @__PURE__ */ new Map();
     this.flushTimer = null;
     this.dirty = false;
-    this.file = path4.join(pluginDir, "cache", "activity.json");
+    this.file = join(pluginDir, "cache", "activity.json");
   }
   /** 启动时恢复；损坏 → 隔离 *.corrupt-* 后重建空 Activity（§十一），返回是否执行了隔离 */
   load() {
     try {
-      if (!fs4.existsSync(this.file)) return false;
-      const raw = JSON.parse(fs4.readFileSync(this.file, "utf8"));
+      if (!existsSync(this.file)) return false;
+      const raw = JSON.parse(readFileSync(this.file, "utf8"));
       if (!raw || typeof raw !== "object") throw new Error("invalid activity structure");
       for (const [p, e] of Object.entries(raw)) {
         if (!e || typeof e !== "object") continue;
@@ -3032,10 +3627,10 @@ var ActivityStore = class {
     return this.data.size;
   }
   recent(limit) {
-    return Array.from(this.data.entries()).filter(([, e]) => typeof e.lastAccessedAt === "number").sort((a, b) => (b[1].lastAccessedAt ?? 0) - (a[1].lastAccessedAt ?? 0)).slice(0, limit).map(([path6, entry]) => ({ path: path6, entry }));
+    return Array.from(this.data.entries()).filter(([, e]) => typeof e.lastAccessedAt === "number").sort((a, b) => (b[1].lastAccessedAt ?? 0) - (a[1].lastAccessedAt ?? 0)).slice(0, limit).map(([path2, entry]) => ({ path: path2, entry }));
   }
-  set(path6, entry) {
-    this.data.set(path6, entry);
+  set(path2, entry) {
+    this.data.set(path2, entry);
     this.markDirty();
   }
 };
@@ -3053,7 +3648,7 @@ function eqSet(a, b) {
   return a.length === b.length && a.every((x) => b.includes(x));
 }
 function tmpRoot(tag) {
-  return fs5.mkdtempSync(path5.join(os.tmpdir(), "kg-p20-" + tag + "-"));
+  return mkdtemp(path.join(os.tmpdir(), "kg-p20-" + tag + "-"));
 }
 var DAY = 864e5;
 var NOW = new Date(2026, 0, 15, 12, 0, 0).getTime();
@@ -3223,7 +3818,7 @@ function makeGraduated(s, start) {
   );
   const other = { ...q, key: "daily:2026-01-15#s2#f1" };
   test("P20-10c", safeResumeIndex(sess, other) === 0, "\u4E0D\u540C scope/config \u6307\u7EB9 \u2192 \u4E0D\u590D\u7528\u65E7 session\uFF08\xA731/38\uFF09");
-  fs5.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const s = sched();
@@ -3315,7 +3910,7 @@ function makeGraduated(s, start) {
   const cardA = makeGraduated(s, NOW - 40 * DAY);
   cardA.path = "A.md";
   spaced.commitReview("A.md", cardA, { timestamp: NOW, rating: "good", previousDue: NOW - DAY, nextDue: NOW + DAY, intervalDays: 1, stability: 10, difficulty: 5, retrievability: 0.9 });
-  const fileBefore = fs5.readFileSync(path5.join(dir, "cache", "spaced-review.json"), "utf8");
+  const fileBefore = readStateText(path.join(dir, "cache", "spaced-review.json"));
   const q = {
     periodKey: "daily:2026-01-15",
     createdAt: NOW,
@@ -3330,14 +3925,14 @@ function makeGraduated(s, start) {
   rc.setQueue(markSkipped(freshQueue(), "A.md"));
   test(
     "P20-21",
-    fs5.readFileSync(path5.join(dir, "cache", "spaced-review.json"), "utf8") === fileBefore && spaced.count() === 1 && spaced.get("A.md")?.fsrsState.due === cardA.fsrsState.due,
+    readStateText(path.join(dir, "cache", "spaced-review.json")) === fileBefore && spaced.count() === 1 && spaced.get("A.md")?.fsrsState.due === cardA.fsrsState.due,
     "Skip\uFF1A\u4E0D\u8C03\u7528 FSRS\u3001\u4E0D\u6539 stability/difficulty/due\uFF08\xA710/21\uFF09"
   );
   test("P20-24", activity.get("A.md")?.reviewCount === void 0, "Skip\uFF1AreviewCount \u4E0D\u53D8\uFF08\xA724\uFF09");
   rc.setQueue(markSnoozed(freshQueue(), "A.md", NOW + 3 * DAY));
   test(
     "P20-22",
-    fs5.readFileSync(path5.join(dir, "cache", "spaced-review.json"), "utf8") === fileBefore && rc.getQueue()?.items.find((i) => i.path === "A.md")?.snoozedUntil > NOW,
+    readStateText(path.join(dir, "cache", "spaced-review.json")) === fileBefore && rc.getQueue()?.items.find((i) => i.path === "A.md")?.snoozedUntil > NOW,
     "Snooze\uFF1A\u4E0D\u8C03\u7528 FSRS\uFF0C\u53EA\u6539 session/queue\uFF08\xA711/22\uFF09"
   );
   const res = s.schedule("good", spaced.get("A.md")?.fsrsState ?? null, NOW + DAY);
@@ -3358,15 +3953,15 @@ function makeGraduated(s, start) {
     spaced.get("A.md")?.reviewCount === 4 && activity.get("A.md")?.reviewCount === 1,
     "FSRS rating \u2192 FSRS \u5361 reviewCount+1 \u4E14 activity.reviewCount+1\uFF08\xA723\uFF09"
   );
-  const fileAfterRating = fs5.readFileSync(path5.join(dir, "cache", "spaced-review.json"), "utf8");
+  const fileAfterRating = readStateText(path.join(dir, "cache", "spaced-review.json"));
   const activityAfter = activity.get("A.md")?.reviewCount;
   rc.setQueue(freshQueue());
   test(
     "P20-25",
-    fs5.readFileSync(path5.join(dir, "cache", "spaced-review.json"), "utf8") === fileAfterRating && activity.get("A.md")?.reviewCount === activityAfter && spaced.logsAll().length === 2,
+    readStateText(path.join(dir, "cache", "spaced-review.json")) === fileAfterRating && activity.get("A.md")?.reviewCount === activityAfter && spaced.logsAll().length === 2,
     "Refresh\uFF1A\u4E0D\u6539 FSRS\u3001\u4E0D\u52A0 review log\u3001\u4E0D\u6539 reviewCount\uFF08\xA725/35\uFF09"
   );
-  fs5.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const m1 = nextMasteryPercent(80, 5, "again");
@@ -3378,8 +3973,8 @@ function makeGraduated(s, start) {
     "reviewCount<3 \u2192 \u6570\u636E\u8F83\u5C11\uFF1B\u22653 \u2192 \u4E0D\u663E\u793A\uFF08\xA757\uFF09"
   );
   test("P20-26b", nextMasteryPercent(void 0, 0, "good") === FSRS_RATING_SCORE.good, "\u9996\u6B21\u8BC4\u5206\u76F4\u63A5\u91C7\u7528\u5BF9\u5E94\u6863\u4F4D\u5206\u6570");
-  const mkCard = (path6, mastery, stability) => ({
-    path: path6,
+  const mkCard = (path2, mastery, stability) => ({
+    path: path2,
     fsrsState: {
       due: NOW + 5 * DAY,
       stability,
@@ -3461,8 +4056,7 @@ function makeGraduated(s, start) {
 }
 {
   const dir = tmpRoot("legacy");
-  fs5.mkdirSync(path5.join(dir, "cache"), { recursive: true });
-  fs5.writeFileSync(path5.join(dir, "cache", "review-queue.json"), JSON.stringify({
+  seedStateText(path.join(dir, "cache", "review-queue.json"), JSON.stringify({
     queue: {
       periodKey: "daily:2026-01-15",
       createdAt: NOW,
@@ -3483,24 +4077,23 @@ function makeGraduated(s, start) {
     !isolated && q !== null && q.items.length === 2 && q.periodKey === "daily:2026-01-15" && rc.getSkipHistory()["\u65E7\u7B14\u8BB0.md"]?.consecutive === 2,
     "\u65E7 cache\uFF08\u65E0 key/scope/source \u5B57\u6BB5\uFF09\u6B63\u5E38\u52A0\u8F7D\uFF0C\u4E0D\u5220\u9664\u65E7 Review Queue\uFF08\xA714\uFF09"
   );
-  fs5.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const dir = tmpRoot("corrupt");
-  fs5.mkdirSync(path5.join(dir, "cache"), { recursive: true });
-  fs5.writeFileSync(path5.join(dir, "cache", "spaced-review.json"), "{ not json !!", "utf8");
+  seedStateText(path.join(dir, "cache", "spaced-review.json"), "{ not json !!");
   const spaced = new SpacedReviewStore(dir);
   const isolated = spaced.load();
-  const corruptFiles = fs5.readdirSync(path5.join(dir, "cache")).filter((f) => f.includes(".corrupt-"));
+  const corruptFiles = stateList(path.join(dir, "cache", ".corrupt"));
   test(
     "P20-36",
     isolated && corruptFiles.length === 1 && spaced.count() === 0 && spaced.logsAll().length === 0,
-    "\u635F\u574F\u6587\u4EF6\u9694\u79BB\u4E3A *.corrupt-*\uFF0C\u6062\u590D\u7A7A\u72B6\u6001\uFF08\xA736\uFF09"
+    "\u635F\u574F\u6587\u4EF6\u9694\u79BB\u5230 cache/.corrupt/\uFF08\u4FDD\u7559\u526F\u672C\uFF09\uFF0C\u6062\u590D\u7A7A\u72B6\u6001\uFF08\xA712/\xA736\uFF09"
   );
   const s = sched();
   const card = makeGraduated(s, NOW);
   spaced.commitReview("A.md", { ...card, path: "A.md" }, { timestamp: NOW, rating: "good", previousDue: null, nextDue: NOW + DAY, intervalDays: 1, stability: 10, difficulty: 5, retrievability: 0.9 });
-  const files = fs5.readdirSync(path5.join(dir, "cache"));
+  const files = stateList(path.join(dir, "cache"));
   test(
     "P20-37",
     files.includes("spaced-review.json") && !files.some((f) => f.endsWith(".tmp")),
@@ -3513,7 +4106,7 @@ function makeGraduated(s, start) {
     reload.count() === 1 && reload.logsAll().length === 1 && reload.get("A.md")?.fsrsState.due === card.fsrsState.due,
     "\u91CD\u542F\u6062\u590D\uFF1A\u5361 + \u65E5\u5FD7\u5B8C\u6574"
   );
-  fs5.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 {
   const sA = { mode: "folder", folderPath: "01 \u76D2\u5B50" };
@@ -3559,8 +4152,8 @@ function makeGraduated(s, start) {
   );
 }
 {
-  const mkItem = (path6, status) => ({
-    path: path6,
+  const mkItem = (path2, status) => ({
+    path: path2,
     stateAtSelection: "active",
     priorityScore: 1,
     status,

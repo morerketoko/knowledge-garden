@@ -4,8 +4,8 @@
  * - Discovery 与 Review Candidate 完全分离（§三十三）：不复用 buildReviewQueue，可复用 NoteMetadata / Activity。
  * - Exposure（§二十一~二十三）：AI Discovery 行为 ≠ 用户行为，只更新 cache/discovery.json，绝不写 activity。
  */
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
+import * as path from "./portable/pathShim";
 import { fingerprintKey } from "./ai/cache";
 import { atomicWriteJson, FORMAT_VERSION, isolateCorruptFile } from "./migrations";
 import type { ActivityEntry, DiscoveryMetaEntry, DiscoveryScope, KnowledgeArea } from "./types";

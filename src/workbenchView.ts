@@ -8,6 +8,7 @@
  * - 渲染安全：createEl / textContent / MarkdownRenderer，不用 innerHTML（§177）。
  */
 import { ItemView, Notice, MarkdownRenderer, TFile, SuggestModal, Modal } from "obsidian";
+import { copyText as copyToClipboard } from "./portable/clipboard";
 import type { App } from "obsidian";
 import type { WorkspaceLeaf } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
@@ -197,12 +198,9 @@ export class AIWorkbenchView extends ItemView {
         text += "- " + (s.title || s.path || s.url || "来源") + (s.path ? " [[" + s.path + "]]" : "") + (s.url ? " (" + s.url + ")" : "") + "\n";
       }
     }
-    try {
-      await navigator.clipboard.writeText(text);
-      new Notice("已复制" + (withSources ? "（含来源）" : "") + "。");
-    } catch {
-      new Notice("复制失败（剪贴板不可用）。");
-    }
+    const out = await copyToClipboard(text);
+    if (out.ok) new Notice("已复制" + (withSources ? "（含来源）" : "") + "。");
+    else new Notice(out.reason ?? "复制失败（剪贴板不可用）。");
   }
 
   private async regenerateMessage(m: WorkbenchSessionMessage): Promise<void> {
@@ -310,12 +308,18 @@ export class AIWorkbenchView extends ItemView {
         if (t) { this.addShelf("prompt", t.id, "★ " + t.name); this.plugin.promptLibraryStore.touch(t.id); }
       }).open();
     });
-    this.inputEl = box.createEl("textarea", { cls: "kg-wb-textarea", attr: { placeholder: this.placeholder(), rows: "6", wrap: "soft" } }) as HTMLTextAreaElement;
+    this.inputEl = box.createEl("textarea", { cls: "kg-wb-textarea", attr: { placeholder: this.placeholder(), rows: "6", wrap: "soft", enterkeyhint: "send", inputmode: "text" } }) as HTMLTextAreaElement;
+    // Phase 24 §九十：桌面 Enter = 发送、Shift+Enter = 换行、Ctrl/Cmd+Enter 也发送；
+    // 移动端软键盘的 Enter 同样按「发送」处理（并剔除输入法组合态，中文输入不会误发），
+    // 同时始终保留显式 [发送] 按钮作为主要提交方式（§五十八）。
     this.inputEl.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
-        ev.preventDefault();
-        void this.submit();
-      }
+      if (ev.key !== "Enter") return;
+      const composing = (ev as KeyboardEvent & { isComposing?: boolean }).isComposing === true
+        || (ev as unknown as { keyCode?: number }).keyCode === 229;
+      if (composing) return;
+      if (ev.shiftKey) return; // Shift+Enter = 换行（浏览器默认行为）
+      ev.preventDefault();
+      void this.submit();
     });
     const btns = box.createDiv({ cls: "kg-wb-actions" });
     const go = btns.createEl("button", { text: this.submitLabel(), cls: "mod-cta" });

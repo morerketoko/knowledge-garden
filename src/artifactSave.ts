@@ -9,6 +9,7 @@ import { TFile } from "obsidian";
 import type { App } from "obsidian";
 import type { AIAnswerSource, ArtifactType, MessageArtifact } from "./types";
 import { safeArtifactPath, buildArtifactMarkdown, snapshotSources, type ArtifactSaveLocation } from "./artifactStore";
+import { copyText as copyToClipboard } from "./portable/clipboard";
 
 /** §68/§16：保存请求（title 用户可改；overwrite 默认 false） */
 export interface ArtifactSaveRequest {
@@ -113,7 +114,9 @@ export async function saveArtifact(app: App, req: ArtifactSaveRequest): Promise<
       // 剪贴板：完整文档 Markdown；不建索引（§82 Dashboard 只列 Vault 保存）
       artifact.vaultPath = "(clipboard)";
       const md = artifactFullMarkdown(artifact);
-      await navigator.clipboard.writeText(md);
+      // Phase 24 §六十六：不再直接用 navigator.clipboard（移动端可能拒绝），走便携层兜底
+      const out = await copyToClipboard(md);
+      if (!out.ok) return { ok: false, error: out.reason ?? "剪贴板不可用，请改用「保存到 Vault」。" };
       return { ok: true, artifact, vaultPath: "(clipboard)" };
     }
     if (req.location.kind === "current_note") {

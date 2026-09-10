@@ -3,6 +3,7 @@
  * 删除卡后端语义、新卡定义、🌱新卡优先排序、推荐权重(savedCardNewWeight 默认 30)、统计/分布边界。
  * UI（确认框出现、点击流、review 删卡进下一张等）在最终报告标 NOT TESTED。
  */
+import { mkdtemp } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -111,7 +112,7 @@ function metaOf(m: Partial<SavedCardSortMeta> & { retrievability: number | null 
 
 /* ============ 删除后端语义（P-HF-DELETE-03/04/05/07/08/13/15，模拟 main.deleteCard 存储步骤） ============ */
 {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-mgmt-"));
+  const dir = mkdtemp(path.join(os.tmpdir(), "kg-mgmt-"));
   const cards = new ReviewCardStore(dir); cards.load();
   const cr = new CardReviewStore(dir); cr.load();
   const exams = new ExamStore(dir); exams.load();

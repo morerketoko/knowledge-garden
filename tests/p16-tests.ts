@@ -1,3 +1,4 @@
+import { mkdtemp, stateExists, readStateText, seedStateText, stateList } from "./portable-bootstrap";
 import { classifyTaskComplexity, suggestWebForQuestion, detectProjectIntent, detectResearchIntent, maxStepsFor, contextBudgetFor, complexityLabel } from "../src/taskClassifier";
 import { percentile, LatencyTracker, LatencyCollector, type LatencySummary } from "../src/latency";
 import { promptFingerprint, promptStableId, searchPrompts, PromptLibraryStore, seedDefaultPrompts, parsePromptMarkdown, buildPromptMarkdown } from "../src/promptLibrary";
@@ -22,16 +23,16 @@ function test(id: string, pass: boolean, detail: string): void {
 // ---------- 工具 ----------
 let _tmpRoot = "";
 function tmpRoot(): string {
-  if (!_tmpRoot) _tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kg-p16-"));
+  if (!_tmpRoot) _tmpRoot = mkdtemp(path.join(os.tmpdir(), "kg-p16-"));
   return _tmpRoot;
 }
 
 // ---------- P16-01~08 Prompt Library ----------
 {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-p16-pl-"));
+  const dir = mkdtemp(path.join(os.tmpdir(), "kg-p16-pl-"));
   const store = new PromptLibraryStore(dir);
   const created = store.create({ name: "测试提示词", description: "用于测试", prompt: "请按学术风格回答。", tags: ["academic", "test"], category: "Academic", favorite: false });
-  test("P16-01", !!created && store.count() === 1 && fs.existsSync(path.join(dir, "Knowledge Garden", "Prompts", "Academic", "测试提示词.md")), "create 写入 Markdown：" + (created ? created.id : "null"));
+  test("P16-01", !!created && store.count() === 1 && stateExists(path.join(dir, "Knowledge Garden", "Prompts", "Academic", "测试提示词.md")), "create 写入 Markdown：" + (created ? created.id : "null"));
 
   const fav = store.setFavorite(created.id, true);
   test("P16-02", !!fav && fav.favorite === true && store.get(created.id)?.favorite === true, "favorite=true 生效");
@@ -43,7 +44,7 @@ function tmpRoot(): string {
   test("P16-04", !!upd && upd.id === created.id && upd.prompt.includes("简洁") && store.get(created.id)?.prompt.includes("简洁"), "update id 不变、内容更新");
 
   const del = store.remove(created.id);
-  test("P16-05", del && store.count() === 0 && !fs.existsSync(path.join(dir, "Knowledge Garden", "Prompts", "Academic", "测试提示词.md")), "remove 删除文件与记录");
+  test("P16-05", del && store.count() === 0 && !stateExists(path.join(dir, "Knowledge Garden", "Prompts", "Academic", "测试提示词.md")), "remove 删除文件与记录");
 
   const tmp = [
     { name: "Alpha Prompt", description: "关于 A", prompt: "内容 A", tags: ["x"], category: "General", favorite: false, id: "a", usageCount: 0, version: 1, createdAt: 1, updatedAt: 1 },
@@ -152,12 +153,12 @@ function tmpRoot(): string {
 
 // ---------- P16-36~38 Session ----------
 {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-p16-sess-"));
+  const dir = mkdtemp(path.join(os.tmpdir(), "kg-p16-sess-"));
   const store = new WorkbenchSessionStore(dir);
   const sid = sessionIdFor("第一问", 111);
   const rec = { sessionId: sid, title: "t", turnCount: 1, question: "第一问", sources: [], skillIds: [], createdAt: 111, updatedAt: 111 };
   store.put(rec);
-  test("P16-36", store.get(sid)?.turnCount === 1 && fs.existsSync(path.join(dir, "cache", "workbench-sessions.json")), "session persistence：put → 文件落盘");
+  test("P16-36", store.get(sid)?.turnCount === 1 && stateExists(path.join(dir, "cache", "workbench-sessions.json")), "session persistence：put → 文件落盘");
   const rec2 = { ...rec, turnCount: 2, question: "追问", prior: { question: "第一问", answerSnippet: "摘要", sourcePaths: [] }, updatedAt: 222 };
   store.put(rec2);
   test("P16-37", store.get(sid)?.turnCount === 2 && store.get(sid)?.prior?.question === "第一问", "follow-up：turnCount 递增且 prior 保留上下文");
@@ -225,7 +226,7 @@ function tmpRoot(): string {
 
   test("P16-59", fingerprintKey(["model:gpt-4o-mini", "feature:x"]) !== fingerprintKey(["model:gpt-4o", "feature:x"]), "model 变化 → miss");
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-p16-cache-"));
+  const dir = mkdtemp(path.join(os.tmpdir(), "kg-p16-cache-"));
   const cache = new AICache(dir);
   const sameKey = fingerprintKey(["same-input", "v1"]);
   cache.put({ key: sameKey, type: "workbench_ask", createdAt: Date.now(), updatedAt: Date.now(), promptVersion: "1", status: "success", data: "缓存内容", model: "m" } as never);

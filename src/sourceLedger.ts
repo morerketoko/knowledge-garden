@@ -6,8 +6,8 @@
  * - Tool Result 不写 AICache（§二百六十五）；来源是证据登记，不是 AI 缓存。
  * - I/O 与 discovery.ts 一致：import * as fs + migrations.atomicWriteJson / isolateCorruptFile。
  */
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
+import * as path from "./portable/pathShim";
 import { atomicWriteJson, FORMAT_VERSION, isolateCorruptFile } from "./migrations";
 import { sha256 } from "./ai/cache";
 import type { SourceRecord } from "./types";

@@ -5,6 +5,7 @@
  * - 绝不保存 Prompt / Note / Web / API Key / User Answer 全文（§二十 / §一百二十五）。
  */
 import { atomicWriteJson } from "./migrations";
+import * as fs from "./portable/fsPortable";
 
 export type LatencyPhase =
   | "taskCreatedAt"
@@ -77,7 +78,8 @@ export class LatencyCollector {
   constructor(private file: string) {}
   load(): void {
     try {
-      const raw = JSON.parse(require("fs").readFileSync(this.file, "utf8")) as LatencyCollectorShape;
+      // Phase 24 §三：不再使用 Node 动态模块加载 —— 移动端不存在模块解析与内置模块
+      const raw = JSON.parse(fs.readFileSync(this.file, "utf8")) as LatencyCollectorShape;
       if (raw && Array.isArray(raw.samples)) this.samples = raw.samples.slice(0, 300);
     } catch {
       this.samples = [];

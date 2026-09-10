@@ -1,12 +1,15 @@
 /**
  * Phase 9：统一数据版本化 / 损坏隔离 / 原子写（§三~五 / §八~十三 / §七十）。
+ * Phase 24：改为平台无关实现 —— 不再 import Node fs/path，改用 portable 存储层：
+ * 桌面与 iOS/Android 走同一套代码，路径一律是存储根相对路径，绝不产生绝对路径。
+ *
  * - FORMAT_VERSION：持久化文件顶层版本号（未知字段一律保留，绝不 parse→rewrite 删字段）。
- * - isolateCorruptFile：损坏的 cache 文件隔离重命名为 *.corrupt-YYYYMMDD-HHmmss，不直接覆盖（§九：不能丢唯一原文件）。
- * - atomicWriteJson：写 .tmp 后 rename 原子替换，避免崩溃留下半截文件（§七十 Crash Consistency）。
- * 本模块不依赖 Obsidian API，便于 Node 自动测试。
+ * - isolateCorruptFile：损坏文件移入 `.corrupt/` 并保留可恢复副本（§九/§十二）。
+ * - atomicWriteJson：写 `.tmp` 后 rename 原子替换；rename 不可用时退化为直接写（§十三：
+ *   原子性以平台能力为准，不假装移动端存在 fs atomic rename）。
+ * 本模块不依赖 Obsidian API（只依赖 portable 层），便于 Node 自动测试。
  */
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
 
 /** 当前持久化格式版本 */
 export const FORMAT_VERSION = 1;
@@ -28,31 +31,56 @@ export function corruptStamp(now = new Date()): string {
   );
 }
 
+/** 损坏副本目标路径：<dir>/.corrupt/<name>.<stamp>（纯字符串，无 Node path） */
+export function corruptTargetPath(filePath: string, now = new Date()): string {
+  const p = String(filePath).replace(/\\/g, "/");
+  const i = p.lastIndexOf("/");
+  const dir = i < 0 ? "" : p.slice(0, i);
+  const name = i < 0 ? p : p.slice(i + 1);
+  const stamp = name + "." + corruptStamp(now);
+  return dir ? dir + "/.corrupt/" + stamp : ".corrupt/" + stamp;
+}
+
 /**
- * 损坏文件隔离：<file> → <file>.corrupt-<stamp>。
- * 返回是否真的执行了隔离（文件存在且 rename 成功）。失败不抛错（不阻塞启动）。
+ * 损坏文件隔离：<file> → <dir>/.corrupt/<name>.<stamp>（保留可恢复副本，不直接删除）。
+ * 返回是否真的执行了隔离（文件存在且移动成功）。失败不抛错（不阻塞启动）。
  */
 export function isolateCorruptFile(filePath: string): boolean {
   try {
     if (!fs.existsSync(filePath)) return false;
-    fs.renameSync(filePath, filePath + ".corrupt-" + corruptStamp());
+    fs.renameSync(filePath, corruptTargetPath(filePath));
     return true;
   } catch {
-    return false;
+    // rename 不可用（后端不支持）→ 读出来写到副本再删原文件，语义等价
+    try {
+      const raw = fs.readFileSync(filePath, "utf8");
+      fs.writeFileSync(corruptTargetPath(filePath), raw);
+      fs.unlinkSync(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
 /**
- * 原子写 JSON：先写 <file>.tmp 再 rename 覆盖。
- * - mkdir 父目录（递归）
- * - 写失败/rename 失败时抛错由调用方捕获（与原有 writeFileSync 错误处理一致）
+ * 原子写 JSON（平台无关）：
+ * - 优先 `.tmp` → rename；rename 抛错时退化为直接写目标文件。
+ * - 写失败时抛错由调用方捕获（与原有 writeFileSync 错误处理一致）。
  */
 export function atomicWriteJson(filePath: string, value: unknown): void {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
+  const data = JSON.stringify(value);
   const tmp = filePath + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.writeFileSync(tmp, data, "utf8");
+    fs.renameSync(tmp, filePath);
+    return;
+  } catch {
+    // tmp+rename 不可用：清理临时文件后直接写（移动端 Vault API 的 create/modify 本身
+    // 不提供跨文件原子替换；此处如实退化，不伪装成原子写）
+    try { fs.unlinkSync(tmp); } catch { /* 临时文件可能不存在 */ }
+    fs.writeFileSync(filePath, data, "utf8");
+  }
 }
 
 /**

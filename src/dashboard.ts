@@ -641,7 +641,7 @@ export class DashboardView extends ItemView {
     const bar = section.createDiv({ cls: "kg-query-bar" });
     const input = bar.createEl("input", {
       cls: "kg-query-input",
-      attr: { type: "text", placeholder: "输入一个问题或关键词，例如：为什么好的系统需要清晰的边界？", maxlength: String(QUERY_MAX_LENGTH), "aria-label": "探索问题" },
+      attr: { type: "search", enterkeyhint: "search", placeholder: "输入一个问题或关键词，例如：为什么好的系统需要清晰的边界？", maxlength: String(QUERY_MAX_LENGTH), "aria-label": "探索问题" },
     });
     input.value = st.rawQuery || "";
     const scopeSel = bar.createEl("select", { cls: "kg-select", attr: { "aria-label": "探索范围" } });

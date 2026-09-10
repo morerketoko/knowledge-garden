@@ -1,7 +1,7 @@
 import { App, Modal, Notice } from "obsidian";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
+import * as path from "./portable/pathShim";
 import type { Period, PluginSettings, ScheduleRecord, ScheduleStatus } from "./types";
 import type { AIService } from "./ai/service";
 import type { ReviewManager } from "./review";

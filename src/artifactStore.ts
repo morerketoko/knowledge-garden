@@ -5,8 +5,8 @@
  * - 写 Vault 由调用方（main）执行（Permission=ask / Safe Apply / Preview，§20-21）。
  * - 绝不保存 hidden reasoning（§一百四十四 / §176）：本模块只处理 final answer + sources 摘要。
  */
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "./portable/fsPortable";
+import * as path from "./portable/pathShim";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
 import { sha256 } from "./ai/cache";
 import type { AIAnswerSource, ArtifactIndexEntry, ArtifactRef, ArtifactType, MessageArtifact } from "./types";

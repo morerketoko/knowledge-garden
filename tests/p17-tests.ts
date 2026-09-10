@@ -2,6 +2,7 @@
  * Phase 17 自动测试（§131~§147）：Message Bubble / Trace / Artifact 纯函数与持久化。
  * 不能实测 Obsidian 运行时的部分在最终报告中标 NOT TESTED（不把代码审查写成实机验证）。
  */
+import { mkdtemp, stateExists, readStateText, seedStateText, stateList } from "./portable-bootstrap";
 import { suggestArtifactTitle, safeArtifactPath, buildArtifactMarkdown, snapshotSources, ArtifactStore, artifactIdFor, defaultArtifactFolder } from "../src/artifactStore";
 import { cleanArtifactTitle, artifactRelPath, artifactFullMarkdown, artifactAppendBlock, saveArtifact } from "../src/artifactSave";
 import { workbenchMessageId, traceEventId, sessionIdFor, WorkbenchSessionStore } from "../src/workbenchSession";
@@ -18,7 +19,7 @@ function test(id: string, pass: boolean, detail: string): void {
 }
 
 function tmpRoot(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "kg-p17-"));
+  return mkdtemp(path.join(os.tmpdir(), "kg-p17-"));
 }
 
 // ---------- P17-01~05：消息 / Trace / Session ID 纯函数 ----------
@@ -64,7 +65,7 @@ function tmpRoot(): string {
   const refs = store.toRefs("msg-y");
   test("P17-10", refs.length === 1 && refs[0].title === "AI 分析：模块化", "toRefs(messageId) → ArtifactRef（气泡 📎 链接用）");
   // 独立文件：cache/artifacts.json
-  test("P17-11", fs.existsSync(path.join(dir, "cache", "artifacts.json")), "索引写入 cache/artifacts.json（独立于 AI Cache）");
+  test("P17-11", stateExists(path.join(dir, "cache", "artifacts.json")), "索引写入 cache/artifacts.json（独立于 AI Cache）");
   const store2 = new ArtifactStore(dir);
   store2.load();
   test("P17-12", store2.count() === 2, "重新 load 恢复索引（重装/重启后 Artifact 仍在）");
@@ -121,8 +122,8 @@ function tmpRoot(): string {
 {
   const dir = tmpRoot();
   // 模拟 AI Cache 目录存在，清空 AI cache 不影响 Artifact
-  fs.mkdirSync(path.join(dir, "cache"), { recursive: true });
-  fs.writeFileSync(path.join(dir, "cache", "ai-cache.json"), JSON.stringify({ cleared: true }));
+  
+  seedStateText(path.join(dir, "cache", "ai-cache.json"), JSON.stringify({ cleared: true }));
   const store = new ArtifactStore(dir);
   store.load();
   const a = {
@@ -141,7 +142,7 @@ function tmpRoot(): string {
   // Prompt/Model 变化不改变 Artifact（Artifact 无 fingerprint 依赖）
   test("P17-28", store2.get(a.id)?.id === a.id, "Artifact ID 与 Prompt/Model 无关（§129-130）");
   // 文件本体独立于插件目录外读取
-  test("P17-29", fs.existsSync(path.join(dir, "cache", "artifacts.json")), "Artifact 索引文件独立存在");
+  test("P17-29", stateExists(path.join(dir, "cache", "artifacts.json")), "Artifact 索引文件独立存在");
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

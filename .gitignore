@@ -11,6 +11,15 @@ cache/
 *.corrupt-*
 .tmp/
 
+# Phase 24：便携存储（桌面旧位置 + Vault 内新位置）
+# 这些是运行时状态（索引 / Activity / AI 缓存 / FSRS / 考试 …），不属于源码
+**/.state/
+.state/
+
+# 测试临时目录（便携存储的 Node 测试会用到）
+.kg-tests/
+tests/.build/
+
 # 系统文件
 .DS_Store
 Thumbs.db

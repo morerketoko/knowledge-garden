@@ -29,6 +29,7 @@ import type { AIFeature, QueryExplorationResult } from "./types";
 import { promptFingerprint } from "./promptLibrary";
 import { LatencyTracker } from "./latency";
 import { PromptLibraryModal, PromptSaveModal } from "./promptLibraryUi";
+import { copyText as copyToClipboard } from "./portable/clipboard";
 
 /** 右键时的菜单上下文快照（§二十/一百一十五：创建菜单时捕获，点击回调只读快照） */
 export interface NoteMenuContext {
@@ -348,7 +349,8 @@ class TranslationModal extends Modal {
     pre.textContent = this.result ?? "";
     const row = this.boxEl.createDiv({ cls: "kg-toolbox-actions" });
     row.createEl("button", { cls: "kg-btn", text: "复制" }).addEventListener("click", () => {
-      void navigator.clipboard.writeText(this.result ?? "").then(() => new Notice("已复制翻译结果。")).catch(() => new Notice("复制失败，请手动选择复制。"));
+      // Phase 24 §六十六：便携剪贴板（移动端 navigator.clipboard 可能不可用）
+      void copyToClipboard(this.result ?? "").then((r) => new Notice(r.ok ? "已复制翻译结果。" : (r.reason ?? "复制失败，请手动选择复制。")));
     });
     row.createEl("button", { cls: "kg-btn", text: "新建翻译笔记" }).addEventListener("click", () => void this.createNewNote());
     if (this.ctx.selectedText && this.ctx.editor && this.ctx.selStart !== undefined && this.ctx.selEnd !== undefined) {
@@ -945,7 +947,7 @@ class WritingAssistantModal extends Modal {
       if (this.runBtnEl) void this.run(this.runBtnEl);
     });
     row.createEl("button", { cls: "kg-btn", text: "复制" }).addEventListener("click", () => {
-      void navigator.clipboard.writeText(this.result ?? "").then(() => new Notice("已复制。")).catch(() => new Notice("复制失败，请手动复制。"));
+      void copyToClipboard(this.result ?? "").then((r) => new Notice(r.ok ? "已复制。" : (r.reason ?? "复制失败，请手动复制。")));
     });
     if (this.ctx.editor) {
       row.createEl("button", { cls: "kg-btn", text: "插入当前位置" }).addEventListener("click", () => {

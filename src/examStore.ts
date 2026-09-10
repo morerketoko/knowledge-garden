@@ -6,7 +6,7 @@
 import type { CardReviewRecord, ExamAnswer, ExamAnswerMode, ExamDifficulty, ExamContentStrategy, ExamMode, ExamQuestion, ExamSessionState, ExamSource, ExamRepeatPolicy, MasteryRating, NoteExam, SavedReviewCard } from "./types";
 import { fingerprintKey } from "./ai/cache";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
-import * as fs from "fs";
+import * as fs from "./portable/fsPortable";
 
 function escYaml(s: string): string {
   return '"' + (s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';

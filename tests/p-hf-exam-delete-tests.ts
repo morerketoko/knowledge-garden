@@ -3,6 +3,7 @@
  * 覆盖：AICache.remove 精确失效、Store/Session 清理与保留语义、历史去重移除、UI/视图结构断言。
  * Obsidian 实机（弹窗点击、Markdown 文件删除、view 展示）在最终报告标 NOT TESTED。
  */
+import { mkdtemp } from "./portable-bootstrap";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,7 +18,7 @@ function test(id: string, pass: boolean, detail: string): void {
   results.push({ id, pass, detail });
   console.log((pass ? "PASS" : "FAIL") + " " + id + " :: " + detail);
 }
-function dir(): string { return fs.mkdtempSync(path.join(os.tmpdir(), "kg-examdel-")); }
+function dir(): string { return mkdtemp(path.join(os.tmpdir(), "kg-examdel-")); }
 const NOW = new Date(2026, 4, 1, 12, 0, 0).getTime();
 function mkExam(id: string, src: string, title: string, createdAt: number): NoteExam {
   return { id, sourcePath: src, sourceVersion: "v1", title, mode: "holistic", questionCount: 1, answerMode: "source_only", questions: [{ id: "q1", type: "recall", question: title + " 题?", referenceAnswer: "r", sourcePath: src }], examVersion: 1, createdAt, updatedAt: createdAt };

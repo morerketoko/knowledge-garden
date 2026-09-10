@@ -95,7 +95,7 @@ export class SavedExplorationView extends ItemView {
     head.createDiv({ cls: "kg-section-title", text: "★ 我的知识收藏" });
     const all = this.plugin.saved.all();
     const bar = inner.createDiv({ cls: "kg-query-bar" });
-    const input = bar.createEl("input", { cls: "kg-query-input", attr: { type: "text", placeholder: "🔎 搜索收藏……（标题 / 问题 / 摘要 / 节点 / 标签）", "aria-label": "搜索收藏" } });
+    const input = bar.createEl("input", { cls: "kg-query-input", attr: { type: "search", enterkeyhint: "search", placeholder: "🔎 搜索收藏……（标题 / 问题 / 摘要 / 节点 / 标签）", "aria-label": "搜索收藏" } });
     input.value = this.searchQuery;
     input.addEventListener("input", () => { this.searchQuery = input.value.trim(); this.render(); });
     const sel = bar.createEl("select", { cls: "kg-select", attr: { "aria-label": "筛选来源" } });

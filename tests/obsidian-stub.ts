@@ -11,6 +11,14 @@ export const MarkdownRenderer = { render: async (): Promise<void> => {} };
 export const normalizePath = (p: string): string => p;
 export const setIcon = (): void => {};
 export const Platform = { isMobile: false };
-export const requestUrl = async (): Promise<{ text: string; json: unknown; status: number }> => ({ text: "", json: null, status: 200 });
+/**
+ * requestUrl 结果（Phase 24：provider 走 requestUrl，不再裸 fetch）。
+ * 测试可通过 `globalThis.__kgMockRequestUrl` 注入网络失败 / 自定义响应。
+ */
+export const requestUrl = async (req: unknown): Promise<{ text: string; json: unknown; status: number }> => {
+  const mock = (globalThis as unknown as { __kgMockRequestUrl?: (r: unknown) => unknown }).__kgMockRequestUrl;
+  if (mock) return (await mock(req)) as { text: string; json: unknown; status: number };
+  return { text: "", json: null, status: 200 };
+};
 export const parseYaml = (s: string): unknown => ({} as unknown);
 export const stringifyYaml = (o: unknown): string => JSON.stringify(o);export class App { vault = {} as never; }
