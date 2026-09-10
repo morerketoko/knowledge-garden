@@ -452,7 +452,8 @@ void (async () => {
     test("P24-10", r.detected && r.copied.includes("cache/activity.json"), "检测到旧桌面 cache/ 并迁移（§十一 / P24-10）");
     test("P24-10b", r.failed.includes("cache/evolution.json"), "非法 JSON 的旧文件被跳过（不隔离、不删除）");
     test("P24-10c", r.copied.includes("prompts/General/p.md"), "旧 Markdown 资产（prompts/）一并迁移");
-    test("P24-10d", (await host.read(joinVaultPath(STATE_DIR_NAME, "cache/activity.json"))) === JSON.stringify({ "a.md": { accessCount: 3 } }), "迁移结果落在便携存储且内容一致");
+    test("P24-10d", (await host.read(joinVaultPath(host.stateRoot, "cache/activity.json"))) === JSON.stringify({ "a.md": { accessCount: 3 } }),
+      "迁移结果落在 host.stateRoot 下的便携存储（§六/§七：目标只由 stateRoot 决定）");
     test("P24-10e", fs.existsSync(path.join(abs, "cache", "activity.json")) && fs.existsSync(path.join(abs, "cache", "evolution.json")), "旧文件**未被删除**（§十一：保留兼容期）");
     test("P24-10f", describeMigration(r).includes("旧文件未删除"), "迁移摘要明确说明旧文件保留");
     const again = await migrateLegacyState(app, host, fakeId);

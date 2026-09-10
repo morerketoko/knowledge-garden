@@ -108,6 +108,29 @@ export class PortableStorage {
     const root = this.root as unknown as { listAllFilesSync?: () => string[] };
     return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
   }
+
+  /**
+   * **原位读**：按给定路径直接读后端，不做任何前缀重写。
+   * 迁移 / 诊断要读 `.obsidian/plugins/<id>/cache/…`、`.state/cache/…`、嵌套层文件，
+   * 这些路径必须保持原样读取（而 `host.resolve` 会把 store 路径重定向到状态根）。
+   */
+  async readRaw(path: string): Promise<string | null> {
+    return this.root.read(normalizeVaultPath(path));
+  }
+
+  /** **原位写**：按给定路径直接写后端，绝不做前缀重写（备份 / 恢复目标以外用） */
+  async writeRaw(path: string, data: string): Promise<boolean> {
+    const p = normalizeVaultPath(path);
+    if (!p) return false;
+    try {
+      const dir = dirnameVaultPath(p);
+      if (dir) await this.root.mkdirp(dir);
+      await this.root.write(p, data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /**

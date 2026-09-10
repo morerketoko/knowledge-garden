@@ -215,6 +215,16 @@ var VaultRoot = class {
    * 嵌套位置，而读取走的是 `.state/cache/...`，于是所有状态都「看起来消失了」。
    */
   full(path2) {
+    return this.vaultPathFor(path2);
+  }
+  /**
+   * 统一的「相对路径 → 完整 vault 路径」映射（幂等）。
+   *
+   * 所有内部调用（mkdirp / write / rename / list）都必须用它，
+   * 否则逐段拼接出来的前缀会被二次加前缀 —— 这正是
+   * `.state-recovery/…` 被写到 `Knowledge Garden/.state/.state-recovery/…` 的原因。
+   */
+  vaultPathFor(path2) {
     const p = normalizeVaultPath(path2);
     if (!p) return "";
     if (!this.basePath) return p;
@@ -241,19 +251,41 @@ var VaultRoot = class {
     const f = this.abstractFile(path2);
     return !!f && Array.isArray(f.children);
   }
+  /**
+   * 读取文件内容。
+   *
+   * 刻意**不经过 `full()`**：raw / 业务两种写法都要能读。
+   * - 传入「完整 vault 路径」（如 `.state/cache/cards.json` 或 `Knowledge Garden/.state/cache/…`）→ 直接按该路径读；
+   * - 传入「相对 basePath 的路径」（如 `cache/cards.json`）→ 补上 basePath 再读。
+   * 两条都失败时再退回 `getAbstractFileByPath`（覆盖 Obsidian 内部路径归一化的差异）。
+   */
   async read(path2) {
     const p = normalizeVaultPath(path2);
+    if (!p) return null;
     const cached = this.fileCache.get(p);
     if (cached !== void 0) return cached;
-    const f = this.abstractFile(p);
-    if (!f) return null;
-    try {
-      const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
-      this.fileCache.set(p, text);
-      return text;
-    } catch {
-      return null;
+    const attempts = p.startsWith(this.basePath + "/") || p === this.basePath ? [p] : [this.basePath ? this.basePath + "/" + p : p, p];
+    for (const abs of attempts) {
+      const f = this.abstractFileByExactPath(abs);
+      if (!f) continue;
+      try {
+        const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
+        this.fileCache.set(p, text);
+        return text;
+      } catch {
+      }
     }
+    return null;
+  }
+  /** 精确路径查找（不走 full()，避免任何再次拼接） */
+  abstractFileByExactPath(abs) {
+    try {
+      const hit = this.vault.getAbstractFileByPath(abs);
+      if (hit) return hit;
+    } catch {
+    }
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    return all.find((f) => f.path === abs) ?? null;
   }
   async write(path2, data) {
     const p = normalizeVaultPath(path2);
@@ -336,7 +368,7 @@ var VaultRoot = class {
       acc = acc ? acc + "/" + seg : seg;
       if (this.abstractFile(acc)) continue;
       try {
-        await this.vault.createFolder(this.full(acc));
+        await this.vault.createFolder(this.vaultPathFor(acc));
       } catch {
       }
     }
@@ -464,6 +496,27 @@ var PortableStorage = class {
     const root = this.root;
     return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
   }
+  /**
+   * **原位读**：按给定路径直接读后端，不做任何前缀重写。
+   * 迁移 / 诊断要读 `.obsidian/plugins/<id>/cache/…`、`.state/cache/…`、嵌套层文件，
+   * 这些路径必须保持原样读取（而 `host.resolve` 会把 store 路径重定向到状态根）。
+   */
+  async readRaw(path2) {
+    return this.root.read(normalizeVaultPath(path2));
+  }
+  /** **原位写**：按给定路径直接写后端，绝不做前缀重写（备份 / 恢复目标以外用） */
+  async writeRaw(path2, data) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return false;
+    try {
+      const dir = dirnameVaultPath(p);
+      if (dir) await this.root.mkdirp(dir);
+      await this.root.write(p, data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 };
 var PortableJsonStore = class {
   constructor(storage, path2, opts) {
@@ -544,7 +597,20 @@ var PortableStorageHost = class {
     const p = normalizeVaultPath(path2);
     if (!p) return this.dataStorage;
     if (!this.vaultStorage) return this.dataStorage;
+    if (this.isOrphanPath(p)) return this.vaultStorage;
     return this.isVaultPath(p) ? this.vaultStorage : this.dataStorage;
+  }
+  /**
+   * 「原位位置」判定：恢复备份目录 `.state-recovery/…`。
+   *
+   * 这些路径不属于 store 命名空间，**必须**按原样读写，绝不能被重定向到状态根。
+   *
+   * 注意：`.obsidian/plugins/<id>/cache/…` **故意不在**此列 —— 历史 store 路径
+   * （baseDir + `/cache/x.json`）仍按原语义被重定向到当前状态根；迁移/诊断读旧桌面文件
+   * 走的是 `app.vault.adapter.read()`（原位、权威），不依赖这里。
+   */
+  isOrphanPath(p) {
+    return p === ".state-recovery" || p.startsWith(".state-recovery/");
   }
   isVaultPath(p) {
     if (p === this.stateRoot || p.startsWith(this.stateRoot + "/")) return true;
@@ -565,6 +631,7 @@ var PortableStorageHost = class {
   resolve(path2) {
     const raw = String(path2 ?? "").replace(/\\/g, "/");
     if (raw === "" || raw === this.baseDir) return this.stateRoot;
+    if (this.isOrphanPath(normalizeVaultPath(raw))) return normalizeVaultPath(raw);
     if (this.baseDir && raw.startsWith(this.baseDir + "/")) {
       const rel = raw.slice(this.baseDir.length + 1);
       return joinVaultPath(this.stateRoot, rel);
@@ -594,6 +661,24 @@ var PortableStorageHost = class {
     const target = this.resolve(path2);
     const backend = this.backendFor(target);
     return backend.readText(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  /**
+   * **原位读**：按 vault 相对路径原样读取，**不做 baseDir / 状态根重写**。
+   *
+   * 迁移与恢复必须用它：`.obsidian/plugins/<id>/cache/…`、vault 根的 `.state/cache/…`、
+   * 嵌套层 `…/<stateRoot>/cache/…` 都是「别的历史位置」，`resolve()` 会把它们
+   * 当成 store 路径重定向到当前状态根，从而读不到真正的内容（旧数据等于没迁移）。
+   */
+  async readRaw(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return null;
+    if (this.vaultStorage) return this.vaultStorage.readRaw(p);
+    return null;
+  }
+  /** 原位写（把来源复制进备份目录用；恢复目标写入走 write()） */
+  async writeRaw(path2, data) {
+    if (!this.vaultStorage) return false;
+    return this.vaultStorage.writeRaw(path2, data);
   }
   async exists(path2) {
     const target = this.resolve(path2);
@@ -1134,6 +1219,24 @@ async function isolateCorrupt(storage, path2) {
   }
 }
 
+// src/portable/recovery.ts
+function jsonWeight(value) {
+  if (value === null || value === void 0) return 0;
+  if (Array.isArray(value)) return value.length;
+  if (typeof value !== "object") return 0;
+  const o = value;
+  for (const k of ["entries", "snapshots", "templates", "records", "sessions", "cards", "logs", "reviewLogs"]) {
+    const v = o[k];
+    if (Array.isArray(v)) return v.length;
+    if (v && typeof v === "object") return Object.keys(v).length;
+  }
+  if (o["queue"] && typeof o["queue"] === "object") {
+    const items = o["queue"]["items"];
+    if (Array.isArray(items)) return items.length;
+  }
+  return Object.keys(o).length;
+}
+
 // src/portable/legacyMigration.ts
 var LEGACY_STATE_FILES = [
   "cache/index.json",
@@ -1162,7 +1265,19 @@ var LEGACY_STATE_FILES = [
 ];
 var LEGACY_ASSET_DIRS = ["prompts", "projects"];
 function legacyPluginDirCandidates(pluginId, configDir = ".obsidian") {
-  return [joinVaultPath(configDir, "plugins", pluginId), joinVaultPath(configDir, "plugins", "kg-knowledge-garden")];
+  const dirs = [joinVaultPath(configDir, "plugins", pluginId)];
+  for (const alt of ["knowledge-garden", "kg-knowledge-garden"]) {
+    const p = joinVaultPath(configDir, "plugins", alt);
+    if (!dirs.includes(p)) dirs.push(p);
+  }
+  return dirs;
+}
+function isNonEmptyStateJson(raw) {
+  try {
+    return jsonWeight(JSON.parse(raw)) > 0;
+  } catch {
+    return false;
+  }
 }
 async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
   const result = {
@@ -1170,6 +1285,7 @@ async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
     copied: [],
     skippedExisting: [],
     failed: [],
+    skippedEmpty: [],
     target: host3.stateRoot + "/"
   };
   const adapter = app.vault?.adapter;
@@ -1187,7 +1303,7 @@ async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
     result.detected = true;
     for (const rel of LEGACY_STATE_FILES) {
       const src = joinVaultPath(dir, rel);
-      const dst = joinVaultPath(STATE_DIR_NAME, rel);
+      const dst = joinVaultPath(host3.stateRoot, rel);
       try {
         const exists = await adapter.exists(src);
         if (!exists) continue;
@@ -1201,6 +1317,10 @@ async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
           continue;
         }
         JSON.parse(raw);
+        if (!isNonEmptyStateJson(raw)) {
+          result.skippedEmpty.push(rel);
+          continue;
+        }
         const out = await host3.write(dst, raw, { nativeAtomic: true });
         if (out.ok) result.copied.push(rel);
         else result.failed.push(rel);
@@ -1219,7 +1339,7 @@ async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
           for (const f of listing.files) {
             const relFile = joinVaultPath(assetDir, rel, f);
             const src = joinVaultPath(dir, relFile);
-            const dst = joinVaultPath(STATE_DIR_NAME, relFile);
+            const dst = joinVaultPath(host3.stateRoot, relFile);
             try {
               if (await host3.exists(dst)) {
                 result.skippedExisting.push(relFile);
@@ -1243,7 +1363,6 @@ async function migrateLegacyState(app, host3, pluginId = "knowledge-garden") {
       } catch {
       }
     }
-    break;
   }
   return result;
 }
@@ -1251,6 +1370,7 @@ function describeMigration(r) {
   if (!r.detected) return "\u672A\u68C0\u6D4B\u5230\u65E7\u7248\u684C\u9762\u7F13\u5B58\u3002";
   const parts = ["\u5DF2\u8FC1\u79FB " + r.copied.length + " \u4E2A\u72B6\u6001\u6587\u4EF6\u5230 " + r.target];
   if (r.skippedExisting.length) parts.push("\u8DF3\u8FC7\u5DF2\u5B58\u5728 " + r.skippedExisting.length + " \u4E2A");
+  if (r.skippedEmpty.length) parts.push("\u8DF3\u8FC7\u7A7A\u6570\u636E " + r.skippedEmpty.length + " \u4E2A");
   if (r.failed.length) parts.push("\u5931\u8D25 " + r.failed.length + " \u4E2A\uFF08\u65E7\u6587\u4EF6\u5DF2\u4FDD\u7559\uFF09");
   parts.push("\u65E7\u6587\u4EF6\u672A\u5220\u9664\u3002");
   return parts.join("\uFF1B");
@@ -1567,14 +1687,13 @@ function atomicWriteJson(filePath, value) {
   try {
     writeFileSync(tmp, data, "utf8");
     renameSync(tmp, filePath);
-    return;
   } catch {
     try {
       unlinkSync(tmp);
     } catch {
     }
-    writeFileSync(filePath, data, "utf8");
   }
+  writeFileSync(filePath, data, "utf8");
 }
 
 // src/ai/cache.ts
@@ -3532,7 +3651,11 @@ void (async () => {
     test("P24-10", r.detected && r.copied.includes("cache/activity.json"), "\u68C0\u6D4B\u5230\u65E7\u684C\u9762 cache/ \u5E76\u8FC1\u79FB\uFF08\xA7\u5341\u4E00 / P24-10\uFF09");
     test("P24-10b", r.failed.includes("cache/evolution.json"), "\u975E\u6CD5 JSON \u7684\u65E7\u6587\u4EF6\u88AB\u8DF3\u8FC7\uFF08\u4E0D\u9694\u79BB\u3001\u4E0D\u5220\u9664\uFF09");
     test("P24-10c", r.copied.includes("prompts/General/p.md"), "\u65E7 Markdown \u8D44\u4EA7\uFF08prompts/\uFF09\u4E00\u5E76\u8FC1\u79FB");
-    test("P24-10d", await host3.read(joinVaultPath(STATE_DIR_NAME, "cache/activity.json")) === JSON.stringify({ "a.md": { accessCount: 3 } }), "\u8FC1\u79FB\u7ED3\u679C\u843D\u5728\u4FBF\u643A\u5B58\u50A8\u4E14\u5185\u5BB9\u4E00\u81F4");
+    test(
+      "P24-10d",
+      await host3.read(joinVaultPath(host3.stateRoot, "cache/activity.json")) === JSON.stringify({ "a.md": { accessCount: 3 } }),
+      "\u8FC1\u79FB\u7ED3\u679C\u843D\u5728 host.stateRoot \u4E0B\u7684\u4FBF\u643A\u5B58\u50A8\uFF08\xA7\u516D/\xA7\u4E03\uFF1A\u76EE\u6807\u53EA\u7531 stateRoot \u51B3\u5B9A\uFF09"
+    );
     test("P24-10e", fs.existsSync(path.join(abs, "cache", "activity.json")) && fs.existsSync(path.join(abs, "cache", "evolution.json")), "\u65E7\u6587\u4EF6**\u672A\u88AB\u5220\u9664**\uFF08\xA7\u5341\u4E00\uFF1A\u4FDD\u7559\u517C\u5BB9\u671F\uFF09");
     test("P24-10f", describeMigration(r).includes("\u65E7\u6587\u4EF6\u672A\u5220\u9664"), "\u8FC1\u79FB\u6458\u8981\u660E\u786E\u8BF4\u660E\u65E7\u6587\u4EF6\u4FDD\u7559");
     const again = await migrateLegacyState(app, host3, fakeId);

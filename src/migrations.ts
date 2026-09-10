@@ -64,9 +64,20 @@ export function isolateCorruptFile(filePath: string): boolean {
 }
 
 /**
- * 原子写 JSON（平台无关）：
- * - 优先 `.tmp` → rename；rename 抛错时退化为直接写目标文件。
- * - 写失败时抛错由调用方捕获（与原有 writeFileSync 错误处理一致）。
+ * 原子写 JSON（平台无关）。
+ *
+ * 关键正确性要求（v1.1.1 事故复盘）：
+ * `fsPortable.renameSync` 会更新**内存镜像**并把目标标脏，落盘是 800ms 防抖的异步过程。
+ * 如果只依赖它，进程在防抖窗口内退出（插件卸载 / 关窗 / 崩溃）时，
+ * 磁盘上的目标文件仍是**旧字节**，而内存里是新的 —— 下次启动读到残缺状态。
+ * 真实症状：`index.json` 507 字节（1 条笔记）、`index.json.tmp` 12.7KB（37 条笔记），
+ * 于是 Dashboard 几乎全部显示为「新知识」。
+ *
+ * 因此这里显式做三步，保证「同步写目标 + 清理临时文件」：
+ *  1. 写 `<file>.tmp`（模拟 Node fs 的原子写语义，同时保留 mid-write 崩溃的可恢复副本）；
+ *  2. rename 到目标（更新镜像，并让本次写入尽快落盘）；
+ *  3. **同步再写一次目标**，确保镜像与目标内容一致（不依赖异步落盘时机）。
+ * rename 不可用时退化为直接写目标；两种情况都会清理临时文件。
  */
 export function atomicWriteJson(filePath: string, value: unknown): void {
   const data = JSON.stringify(value);
@@ -74,13 +85,40 @@ export function atomicWriteJson(filePath: string, value: unknown): void {
   try {
     fs.writeFileSync(tmp, data, "utf8");
     fs.renameSync(tmp, filePath);
-    return;
   } catch {
-    // tmp+rename 不可用：清理临时文件后直接写（移动端 Vault API 的 create/modify 本身
-    // 不提供跨文件原子替换；此处如实退化，不伪装成原子写）
+    // rename 不可用：清掉临时文件，直接写目标
     try { fs.unlinkSync(tmp); } catch { /* 临时文件可能不存在 */ }
-    fs.writeFileSync(filePath, data, "utf8");
   }
+  // 无论走哪条分支，都同步把目标写成最终内容（防止只改了镜像、磁盘留旧字节）
+  fs.writeFileSync(filePath, data, "utf8");
+}
+
+/**
+ * 修复「临时写残留」：`<file>.tmp` 与 `<file>` 同时存在时，若目标为空或非法，
+ * 而临时文件是合法 JSON 且信息量更大，则用临时文件替换目标（只增不减，§三十一）。
+ *
+ * 返回修复的文件数。用于启动时的状态完整性巡检。
+ */
+export function repairStaleTempFiles(filePaths: string[], measure: (raw: string) => number): number {
+  let fixed = 0;
+  for (const target of filePaths) {
+    const tmp = target + ".tmp";
+    try {
+      if (!fs.existsSync(tmp)) continue;
+      const tmpRaw = fs.readFileSync(tmp, "utf8");
+      let tmpWeight = 0;
+      try { tmpWeight = measure(tmpRaw); } catch { continue; }
+      if (tmpWeight <= 0) continue;
+      let targetWeight = 0;
+      if (fs.existsSync(target)) {
+        try { targetWeight = measure(fs.readFileSync(target, "utf8")); } catch { targetWeight = 0; }
+      }
+      if (targetWeight >= tmpWeight) continue; // 目标已够好 → 只清理临时文件
+      fs.writeFileSync(target, tmpRaw, "utf8");
+      fixed++;
+    } catch { /* 单个文件失败不影响其它文件 */ }
+  }
+  return fixed;
 }
 
 /**

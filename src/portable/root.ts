@@ -163,6 +163,17 @@ export class VaultRoot implements StorageRoot {
    * 嵌套位置，而读取走的是 `.state/cache/...`，于是所有状态都「看起来消失了」。
    */
   private full(path: string): string {
+    return this.vaultPathFor(path);
+  }
+
+  /**
+   * 统一的「相对路径 → 完整 vault 路径」映射（幂等）。
+   *
+   * 所有内部调用（mkdirp / write / rename / list）都必须用它，
+   * 否则逐段拼接出来的前缀会被二次加前缀 —— 这正是
+   * `.state-recovery/…` 被写到 `Knowledge Garden/.state/.state-recovery/…` 的原因。
+   */
+  private vaultPathFor(path: string): string {
     const p = normalizeVaultPath(path);
     if (!p) return "";
     if (!this.basePath) return p;
@@ -186,17 +197,43 @@ export class VaultRoot implements StorageRoot {
     return !!f && Array.isArray((f as { children?: unknown }).children);
   }
 
+  /**
+   * 读取文件内容。
+   *
+   * 刻意**不经过 `full()`**：raw / 业务两种写法都要能读。
+   * - 传入「完整 vault 路径」（如 `.state/cache/cards.json` 或 `Knowledge Garden/.state/cache/…`）→ 直接按该路径读；
+   * - 传入「相对 basePath 的路径」（如 `cache/cards.json`）→ 补上 basePath 再读。
+   * 两条都失败时再退回 `getAbstractFileByPath`（覆盖 Obsidian 内部路径归一化的差异）。
+   */
   async read(path: string): Promise<string | null> {
     const p = normalizeVaultPath(path);
+    if (!p) return null;
     const cached = this.fileCache.get(p);
     if (cached !== undefined) return cached;
-    const f = this.abstractFile(p);
-    if (!f) return null;
+
+    const attempts = p.startsWith(this.basePath + "/") || p === this.basePath
+      ? [p]
+      : [this.basePath ? this.basePath + "/" + p : p, p];
+    for (const abs of attempts) {
+      const f = this.abstractFileByExactPath(abs);
+      if (!f) continue;
+      try {
+        const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
+        this.fileCache.set(p, text);
+        return text;
+      } catch { /* 换下一种写法 */ }
+    }
+    return null;
+  }
+
+  /** 精确路径查找（不走 full()，避免任何再次拼接） */
+  private abstractFileByExactPath(abs: string): VaultLikeFile | null {
     try {
-      const text = this.vault.cachedRead ? await this.vault.cachedRead(f) : await this.vault.read(f);
-      this.fileCache.set(p, text);
-      return text;
-    } catch { return null; }
+      const hit = this.vault.getAbstractFileByPath(abs);
+      if (hit) return hit;
+    } catch { /* 忽略：退回 getFiles 扫描 */ }
+    const all = this.vault.getFiles ? this.vault.getFiles() : [];
+    return all.find((f) => f.path === abs) ?? null;
   }
 
   async write(path: string, data: string): Promise<void> {
@@ -271,7 +308,7 @@ export class VaultRoot implements StorageRoot {
     for (const seg of segments) {
       acc = acc ? acc + "/" + seg : seg;
       if (this.abstractFile(acc)) continue;
-      try { await this.vault.createFolder(this.full(acc)); } catch { /* 并发/已存在 */ }
+      try { await this.vault.createFolder(this.vaultPathFor(acc)); } catch { /* 并发/已存在 */ }
     }
   }
 

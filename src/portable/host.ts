@@ -96,7 +96,21 @@ export class PortableStorageHost {
     const p = normalizeVaultPath(path);
     if (!p) return this.dataStorage;
     if (!this.vaultStorage) return this.dataStorage;
+    if (this.isOrphanPath(p)) return this.vaultStorage; // 原位位置必须留在 vault 后端
     return this.isVaultPath(p) ? this.vaultStorage : this.dataStorage;
+  }
+
+  /**
+   * 「原位位置」判定：恢复备份目录 `.state-recovery/…`。
+   *
+   * 这些路径不属于 store 命名空间，**必须**按原样读写，绝不能被重定向到状态根。
+   *
+   * 注意：`.obsidian/plugins/<id>/cache/…` **故意不在**此列 —— 历史 store 路径
+   * （baseDir + `/cache/x.json`）仍按原语义被重定向到当前状态根；迁移/诊断读旧桌面文件
+   * 走的是 `app.vault.adapter.read()`（原位、权威），不依赖这里。
+   */
+  private isOrphanPath(p: string): boolean {
+    return p === ".state-recovery" || p.startsWith(".state-recovery/");
   }
 
   private isVaultPath(p: string): boolean {
@@ -120,6 +134,8 @@ export class PortableStorageHost {
   resolve(path: string): string {
     const raw = String(path ?? "").replace(/\\/g, "/");
     if (raw === "" || raw === this.baseDir) return this.stateRoot;
+    // 原位位置（旧插件目录 / 恢复备份目录）原样保留，绝不重定向
+    if (this.isOrphanPath(normalizeVaultPath(raw))) return normalizeVaultPath(raw);
     if (this.baseDir && raw.startsWith(this.baseDir + "/")) {
       const rel = raw.slice(this.baseDir.length + 1);
       return joinVaultPath(this.stateRoot, rel);
@@ -154,6 +170,26 @@ export class PortableStorageHost {
     const target = this.resolve(path);
     const backend = this.backendFor(target);
     return backend.readText(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+
+  /**
+   * **原位读**：按 vault 相对路径原样读取，**不做 baseDir / 状态根重写**。
+   *
+   * 迁移与恢复必须用它：`.obsidian/plugins/<id>/cache/…`、vault 根的 `.state/cache/…`、
+   * 嵌套层 `…/<stateRoot>/cache/…` 都是「别的历史位置」，`resolve()` 会把它们
+   * 当成 store 路径重定向到当前状态根，从而读不到真正的内容（旧数据等于没迁移）。
+   */
+  async readRaw(path: string): Promise<string | null> {
+    const p = normalizeVaultPath(path);
+    if (!p) return null;
+    if (this.vaultStorage) return this.vaultStorage.readRaw(p);
+    return null;
+  }
+
+  /** 原位写（把来源复制进备份目录用；恢复目标写入走 write()） */
+  async writeRaw(path: string, data: string): Promise<boolean> {
+    if (!this.vaultStorage) return false;
+    return this.vaultStorage.writeRaw(path, data);
   }
 
   async exists(path: string): Promise<boolean> {

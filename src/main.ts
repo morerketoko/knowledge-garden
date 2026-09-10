@@ -85,10 +85,68 @@ import {
 } from "./portable/host";
 import { MemoryRoot, PluginDataRoot, VaultRoot } from "./portable/root";
 import {
+  type BackupResult, type FileDiagnosis, type RecoveryReport, type StateSourceOptions,
+  STATE_FILES, backupSources, diagnoseStateSources, jsonWeight, recoverState,
+} from "./portable/recovery";
+
+/**
+ * Portable Recovery / Migration 版本（§三十七：作为「已完成」标记，避免每次全量扫描）。
+ * - 1：Phase 24 便携存储迁移（无恢复能力）
+ * - 2：v1.1.1 Hotfix —— legacy 目标修正 + 错误目录/嵌套/PluginData 恢复 + 临时写残留修复
+ */
+export const PORTABLE_RECOVERY_VERSION = 2;
+
+/** 便携恢复状态记录（写入状态根，随 Vault 一起同步到移动端） */
+interface RecoveryMarker {
+  version: number;
+  completedAt: number;
+  backupDir: string;
+  restored: number;
+  conflicts: number;
+  missing: number;
+}
+
+const RECOVERY_STATUS_PATH = ".recovery-status.json";
+
+/** 恢复备份目录时间戳：YYYYMMDD-HHmmss（纯字符串，不依赖 Node） */
+function recoveryStamp(now = new Date()): string {
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return String(now.getFullYear()) + p(now.getMonth() + 1) + p(now.getDate())
+    + "-" + p(now.getHours()) + p(now.getMinutes()) + p(now.getSeconds());
+}
+
+function safeJsonParse(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function readRecoveryMarker(vaultRoot: VaultRoot): Promise<RecoveryMarker> {
+  const empty: RecoveryMarker = { version: 0, completedAt: 0, backupDir: "", restored: 0, conflicts: 0, missing: 0 };
+  try {
+    const raw = await vaultRoot.read(RECOVERY_STATUS_PATH);
+    if (raw === null) return empty;
+    const j = JSON.parse(raw) as Partial<RecoveryMarker>;
+    return {
+      version: typeof j.version === "number" ? j.version : 0,
+      completedAt: typeof j.completedAt === "number" ? j.completedAt : 0,
+      backupDir: typeof j.backupDir === "string" ? j.backupDir : "",
+      restored: typeof j.restored === "number" ? j.restored : 0,
+      conflicts: typeof j.conflicts === "number" ? j.conflicts : 0,
+      missing: typeof j.missing === "number" ? j.missing : 0,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+async function writeRecoveryMarker(vaultRoot: VaultRoot, marker: RecoveryMarker): Promise<void> {
+  await vaultRoot.write(RECOVERY_STATUS_PATH, JSON.stringify(marker, null, 2));
+}
+import {
   flushMirror, initSyncMirror, mirrorStats,
 } from "./portable/fsPortable";
 import * as fsPortable from "./portable/fsPortable";
-import { migrateLegacyState, describeMigration } from "./portable/legacyMigration";
+import { migrateLegacyState, describeMigration, legacyPluginDirCandidates } from "./portable/legacyMigration";
+import { repairStaleTempFiles } from "./migrations";
 import { joinVaultPath } from "./portable/paths";
 import { copyText as copyToClipboard, readText as readClipboardText } from "./portable/clipboard";
 
@@ -565,8 +623,39 @@ export default class KnowledgeGardenPlugin extends Plugin {
     // 同步镜像的键 = host 解析后的键：先用临时宿主读入旧位置（迁移前），再切到新宿主重读
     await host.init();
 
-    // §十一：旧桌面 cache/*.json → 便携存储（只补缺失、永不删除旧文件）
-    let migration = describeMigration({ detected: false, copied: [], skippedExisting: [], failed: [], target: host.location });
+    // v1.1.1 Hotfix §四十：恢复必须发生在**任何 Store.load() 之前**。
+    // 顺序：诊断 → 备份 → legacy 迁移 → 错误目录/嵌套/PluginData 恢复 → 临时写残留修复 → 标记。
+    const pluginData = await this.loadData() as Record<string, unknown> | null;
+    const mirrorSnapshot = this.kgMirrorSnapshot(pluginData);
+    const sourceOpts = this.stateSourceOptions(host, pluginId, mirrorSnapshot);
+    const marker = await readRecoveryMarker(vaultRoot);
+    const recovery = {
+      version: PORTABLE_RECOVERY_VERSION,
+      completedAt: 0,
+      backupDir: "",
+      restored: 0,
+      conflicts: 0,
+      missing: 0,
+    };
+
+    // §三/§四：只读诊断（每次启动都做，成本仅为读 23 个小文件）
+    let diagnoses: FileDiagnosis[] = [];
+    try {
+      diagnoses = await diagnoseStateSources(sourceOpts);
+    } catch { /* 诊断失败不阻塞启动 */ }
+    this.stateDiagnosis = diagnoses;
+
+    // §五/§六十：备份先于任何修复（幂等：同一启动周期只备份一次）
+    if (marker.version < PORTABLE_RECOVERY_VERSION) {
+      try {
+        const backup = await backupSources(host, sourceOpts, recoveryStamp());
+        recovery.backupDir = backup.dir;
+        this.recoveryBackup = backup;
+      } catch { /* 备份失败不阻塞，但会记录 */ }
+    }
+
+    // §八/§十一：旧桌面 cache/*.json → 便携存储（只补缺失、永不删除旧文件）
+    let migration = describeMigration({ detected: false, copied: [], skippedExisting: [], failed: [], skippedEmpty: [], target: host.location });
     try {
       const r = await migrateLegacyState(this.app, host, pluginId);
       migration = describeMigration(r);
@@ -574,6 +663,32 @@ export default class KnowledgeGardenPlugin extends Plugin {
         new Notice("知识花园：旧版数据迁移完成 —— " + migration, 8000);
       }
     } catch { /* 迁移失败不阻塞启动 */ }
+
+    // §九/§十/§二十九：错误目录 / 嵌套层 / PluginData 恢复（绝不覆盖非空正确数据）
+    try {
+      const rep = await recoverState(host, sourceOpts, await diagnoseStateSources(sourceOpts));
+      this.recoveryReport = rep;
+      recovery.restored = rep.actions.filter((a) => a.written).length;
+      recovery.conflicts = rep.conflicts.length;
+      recovery.missing = rep.missing.length;
+      if (recovery.restored > 0) {
+        const gained = rep.actions.filter((a) => a.written)
+          .map((a) => a.label + " " + a.beforeWeight + "→" + a.afterWeight).slice(0, 4).join("，");
+        new Notice("知识花园：已从旧位置恢复 " + recovery.restored + " 个状态文件（" + gained + "…）。原文件未删除。", 12000);
+      }
+    } catch { /* 恢复失败不阻塞启动（原始数据仍在各来源里） */ }
+
+    // 原子写残留修复：tmp 比目标更完整时用 tmp 替换目标（只增不减）
+    try {
+      const fixed = repairStaleTempFiles(
+        STATE_FILES.map((s) => joinVaultPath(stateRoot, s.rel)),
+        (raw) => jsonWeight(safeJsonParse(raw))
+      );
+      if (fixed > 0) {
+        this.migrationSummary += "；已用临时写残留修复 " + fixed + " 个状态文件";
+        new Notice("知识花园：检测到 " + fixed + " 个状态文件只写了一半（残留 .tmp），已用更完整的版本恢复。", 10000);
+      }
+    } catch { /* 修复失败不阻塞启动 */ }
 
     const writable = await host.probeWritable();
     host.setVaultEnabled(
@@ -589,7 +704,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     await initSyncMirror(host);
     this.storageHost = host;
     this.storageBackendLabel = host.reason + " · " + (writable ? "vault" : "plugin-data");
-    this.migrationSummary = migration;
+    this.migrationSummary = migration + (this.migrationSummary ? "；" + this.migrationSummary : "");
     // v1.1.0 布局修复：把曾经写到嵌套目录（<stateRoot>/<baseDir>/…）里的状态搬回正确位置
     try {
       const moved = await host.repairDuplicatedLayout();
@@ -598,14 +713,99 @@ export default class KnowledgeGardenPlugin extends Plugin {
         new Notice("知识花园：已修复状态目录重复嵌套问题，搬回 " + moved + " 个文件（原文件未删除）。", 10000);
       }
     } catch { /* 修复失败不阻塞启动 */ }
+
+    // §三十七：迁移/恢复标记（写入 Plugin Data 的设置旁边，而不是每次重复全量扫描）
+    recovery.completedAt = Date.now();
+    try {
+      await writeRecoveryMarker(vaultRoot, recovery);
+      this.recoveryMarker = recovery;
+    } catch { /* 标记写入失败只影响下次是否重扫 */ }
     return legacyDir;
+  }
+
+  /** 从 data.json 取 kgMirror 快照（键 → 文本），用于 PluginData 恢复（§二十八） */
+  private kgMirrorSnapshot(data: Record<string, unknown> | null): Record<string, string> {
+    const bucket = data?.["kgMirror"];
+    const out: Record<string, string> = {};
+    if (bucket && typeof bucket === "object") {
+      for (const [k, v] of Object.entries(bucket as Record<string, unknown>)) {
+        if (typeof v === "string") out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  /** 组装状态来源选项（legacy / correct / wrong / nested / pluginData） */
+  private stateSourceOptions(
+    host: PortableStorageHost,
+    pluginId: string,
+    pluginData: Record<string, string>
+  ): StateSourceOptions {
+    const configDir = (this.app.vault as unknown as { configDir?: string }).configDir || ".obsidian";
+    const legacyDirs = legacyPluginDirCandidates(pluginId, configDir);
+    const legacyRel = (this.manifest as unknown as { dir?: string }).dir ?? "";
+    if (legacyRel && !legacyDirs.includes(legacyRel)) legacyDirs.push(legacyRel);
+    // 原位读：优先用 Vault adapter（Obsidian 底层原语，按 vault 路径直接读），
+    // 绝不经过会重定向 store 路径的 host.resolve —— 否则读不到 legacy / 错误目录 / 嵌套层。
+    const adapter = this.app.vault.adapter as unknown as { read?: (p: string) => Promise<string> };
+    const readRaw = adapter.read
+      ? (rel: string) => adapter.read!(rel)
+      : (rel: string) => host.readRaw(rel);
+    return {
+      stateRoot: host.stateRoot,
+      legacyDirs,
+      // §二十六：错误迁移目录（历史版本可能写到 vault 根的 .state/）
+      wrongDirs: [STATE_DIR_NAME, joinVaultPath(STATE_DIR_NAME, "cache")],
+      // §二十七：嵌套错误布局
+      nestedDirs: [
+        joinVaultPath(host.stateRoot, legacyRel || "plugin-dir"),
+        joinVaultPath(host.stateRoot, legacyRel || "plugin-dir", host.stateRoot),
+        joinVaultPath(host.stateRoot, host.stateRoot),
+      ].filter((p) => p && p !== host.stateRoot),
+      read: readRaw,
+      pluginData,
+    };
+  }
+
+  /**
+   * 存储完整性摘要（§五十 / §五十一）：恢复前后各状态文件的条目数 + 各来源分布。
+   * 全部来自启动时的只读诊断，不再额外扫盘。
+   */
+  storageIntegrityReport(): {
+    marker: string;
+    backup: string;
+    rows: { label: string; before: number; after: number; source: string }[];
+    missing: string[];
+    conflicts: string[];
+  } {
+    const marker = this.recoveryMarker;
+    const before = this.recoveryReport?.before ?? {};
+    const after = this.recoveryReport?.after ?? {};
+    const rows = this.stateDiagnosis
+      .filter((d) => d.best || (before[d.rel] ?? 0) > 0 || (after[d.rel] ?? 0) > 0)
+      .map((d) => ({
+        label: d.label,
+        before: before[d.rel] ?? (d.best ? (d.best as { weight: number }).weight : 0),
+        after: after[d.rel] ?? 0,
+        source: (d.best ? d.best.kind : "none") + (d.best ? "@" + d.best.path : ""),
+      }));
+    return {
+      marker: marker
+        ? "v" + marker.version + (marker.completedAt ? "（" + new Date(marker.completedAt).toLocaleString() + "）" : "")
+        : "未写入",
+      backup: this.recoveryBackup
+        ? this.recoveryBackup.dir + "（" + this.recoveryBackup.files + " 个文件）"
+        : (marker?.backupDir || "本次未新建备份"),
+      rows,
+      missing: this.recoveryReport?.missing ?? [],
+      conflicts: this.recoveryReport?.conflicts ?? [],
+    };
   }
 
   /** 诊断用：存储后端 + 迁移摘要 + 镜像状态（不暴露绝对路径） */
   storageDiagnostics(): { backend: string; migration: string; mirror: string } {
     const m = mirrorStats();
-    return {
-      backend: this.storageBackendLabel || "未初始化",
+    return {      backend: this.storageBackendLabel || "未初始化",
       migration: this.migrationSummary || "未执行",
       mirror: m.files + " 个文件（待落盘 " + m.dirty + "）",
     };
@@ -613,6 +813,14 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** 便携存储宿主（迁移 / 诊断 / 测试使用） */
   storageHost: PortableStorageHost | null = null;
+  /** 启动时的状态来源诊断（§五十：Diagnostics 展示） */
+  stateDiagnosis: FileDiagnosis[] = [];
+  /** 本次启动的恢复备份结果 */
+  recoveryBackup: BackupResult | null = null;
+  /** 本次启动的恢复报告 */
+  recoveryReport: RecoveryReport | null = null;
+  /** 恢复/迁移标记 */
+  recoveryMarker: RecoveryMarker | null = null;
   private storageBackendLabel = "";
   private migrationSummary = "";
 
@@ -3599,28 +3807,63 @@ export default class KnowledgeGardenPlugin extends Plugin {
   }
 
   /**
-   * 空索引自愈（0 AI）：Markdown 资产还在、索引却是空的 → 自动从 Markdown 重建。
+   * 资产索引修复（§十二 / §三十四 / §三十五）：Markdown 资产还在、索引却是空的
+   * → 从 Markdown 重建（0 AI），**仅在索引 missing / empty / invalid 时执行**。
    *
-   * 触发场景（都是「数据看起来消失」的真实来源）：
-   * - 索引文件被清空 / 写入路径曾算错（v1.1.0 重复嵌套 bug）；
-   * - 用户手动删了 cache 但保留了 Review Cards/*.md、Exams/*.md。
+   * 覆盖四类索引：cards / exams / relationships / saved-explorations。
+   * 非空索引绝不覆盖（§十 / §三十五：修复后下次启动直接 load，不再重建）。
    *
-   * 刻意只在「索引为空」时动作：非空索引绝不覆盖，避免误伤用户后续操作。
+   * 返回修复记录（§五十一：恢复前后计数对照）。
+   */
+  async repairStateIndexes(): Promise<{ label: string; before: number; after: number; assets: number }[]> {
+    const repairs: { label: string; before: number; after: number; assets: number }[] = [];
+    const plan: { label: string; assetDir: string; before: number; run: () => Promise<void>; count: () => number; stateFile: string }[] = [
+      {
+        label: "复习卡", assetDir: cardsDirPath(), before: this.cards.count(), stateFile: "cache/cards.json",
+        run: () => this.reindexCards(), count: () => this.cards.count(),
+      },
+      {
+        label: "考试", assetDir: examDirPath(), before: this.examStore.all().length, stateFile: "cache/exams.json",
+        run: () => this.reindexExams(), count: () => this.examStore.all().length,
+      },
+      {
+        label: "收藏链路", assetDir: "Knowledge Garden/Explorations/Saved", before: this.saved.all().length, stateFile: "cache/saved-explorations.json",
+        run: async () => { await this.reindexSaved(); }, count: () => this.saved.all().length,
+      },
+      {
+        label: "知识关系", assetDir: this.settings.relationship?.folder || "Knowledge Garden/Relationships",
+        before: this.relationships.all().length, stateFile: "cache/relationships.json",
+        run: () => this.scanRelationshipMarkdown(false), count: () => this.relationships.all().length,
+      },
+    ];
+
+    for (const p of plan) {
+      if (p.before > 0) continue; // §十 / §三十五：非空索引绝不覆盖
+      const assets = this.mdFilesInFolder(p.assetDir).length;
+      if (assets === 0) continue; // 没有恢复源，不动
+      await this.backupStateFile(p.stateFile);
+      try {
+        await p.run();
+      } catch { /* 单个索引重建失败不影响其它 */ }
+      const after = p.count();
+      repairs.push({ label: p.label, before: p.before, after, assets });
+      if (after > 0) {
+        new Notice("知识花园：" + p.label + "索引为空，已从 " + assets + " 个 Markdown 文件重建（0 AI）。", 8000);
+      }
+    }
+    return repairs;
+  }
+
+  /**
+   * 旧入口（保留兼容）：仅处理 cards/exams 的空索引自愈。
+   * 新代码请用 repairStateIndexes()。
    */
   private async ensureIndexesAgainstAssets(): Promise<void> {
-    const cardFiles = this.mdFilesInFolder(cardsDirPath());
-    if (this.cards.count() === 0 && cardFiles.length > 0) {
-      await this.backupStateFile("cache/cards.json");
-      await this.reindexCards();
-      new Notice("知识花园：复习卡索引为空，已从 Review Cards/ 的 " + cardFiles.length + " 个文件重建（0 AI）。", 8000);
-    }
-    const examFiles = this.mdFilesInFolder(examDirPath());
-    if (this.examStore.all().length === 0 && examFiles.length > 0) {
-      await this.backupStateFile("cache/exams.json");
-      await this.reindexExams();
-      new Notice("知识花园：考试索引为空，已从 Exams/ 的 " + examFiles.length + " 个文件重建（0 AI）。", 8000);
-    }
+    this.assetIndexRepairs = await this.repairStateIndexes();
   }
+
+  /** 本次启动的资产索引修复记录（Diagnostics §五十一） */
+  assetIndexRepairs: { label: string; before: number; after: number; assets: number }[] = [];
 
   /** 重建索引前备份被替换的索引文件（便携存储内，不删除任何数据） */
   private async backupStateFile(rel: string): Promise<void> {

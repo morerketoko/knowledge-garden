@@ -242,6 +242,27 @@ var PortableStorage = class {
     const root = this.root;
     return typeof root.listAllFilesSync === "function" ? root.listAllFilesSync() : [];
   }
+  /**
+   * **原位读**：按给定路径直接读后端，不做任何前缀重写。
+   * 迁移 / 诊断要读 `.obsidian/plugins/<id>/cache/…`、`.state/cache/…`、嵌套层文件，
+   * 这些路径必须保持原样读取（而 `host.resolve` 会把 store 路径重定向到状态根）。
+   */
+  async readRaw(path2) {
+    return this.root.read(normalizeVaultPath(path2));
+  }
+  /** **原位写**：按给定路径直接写后端，绝不做前缀重写（备份 / 恢复目标以外用） */
+  async writeRaw(path2, data) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return false;
+    try {
+      const dir = dirnameVaultPath(p);
+      if (dir) await this.root.mkdirp(dir);
+      await this.root.write(p, data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 };
 
 // src/portable/host.ts
@@ -289,7 +310,20 @@ var PortableStorageHost = class {
     const p = normalizeVaultPath(path2);
     if (!p) return this.dataStorage;
     if (!this.vaultStorage) return this.dataStorage;
+    if (this.isOrphanPath(p)) return this.vaultStorage;
     return this.isVaultPath(p) ? this.vaultStorage : this.dataStorage;
+  }
+  /**
+   * 「原位位置」判定：恢复备份目录 `.state-recovery/…`。
+   *
+   * 这些路径不属于 store 命名空间，**必须**按原样读写，绝不能被重定向到状态根。
+   *
+   * 注意：`.obsidian/plugins/<id>/cache/…` **故意不在**此列 —— 历史 store 路径
+   * （baseDir + `/cache/x.json`）仍按原语义被重定向到当前状态根；迁移/诊断读旧桌面文件
+   * 走的是 `app.vault.adapter.read()`（原位、权威），不依赖这里。
+   */
+  isOrphanPath(p) {
+    return p === ".state-recovery" || p.startsWith(".state-recovery/");
   }
   isVaultPath(p) {
     if (p === this.stateRoot || p.startsWith(this.stateRoot + "/")) return true;
@@ -310,6 +344,7 @@ var PortableStorageHost = class {
   resolve(path2) {
     const raw = String(path2 ?? "").replace(/\\/g, "/");
     if (raw === "" || raw === this.baseDir) return this.stateRoot;
+    if (this.isOrphanPath(normalizeVaultPath(raw))) return normalizeVaultPath(raw);
     if (this.baseDir && raw.startsWith(this.baseDir + "/")) {
       const rel = raw.slice(this.baseDir.length + 1);
       return joinVaultPath(this.stateRoot, rel);
@@ -339,6 +374,24 @@ var PortableStorageHost = class {
     const target = this.resolve(path2);
     const backend = this.backendFor(target);
     return backend.readText(backend === this.dataStorage ? this.dataKey(target) : target);
+  }
+  /**
+   * **原位读**：按 vault 相对路径原样读取，**不做 baseDir / 状态根重写**。
+   *
+   * 迁移与恢复必须用它：`.obsidian/plugins/<id>/cache/…`、vault 根的 `.state/cache/…`、
+   * 嵌套层 `…/<stateRoot>/cache/…` 都是「别的历史位置」，`resolve()` 会把它们
+   * 当成 store 路径重定向到当前状态根，从而读不到真正的内容（旧数据等于没迁移）。
+   */
+  async readRaw(path2) {
+    const p = normalizeVaultPath(path2);
+    if (!p) return null;
+    if (this.vaultStorage) return this.vaultStorage.readRaw(p);
+    return null;
+  }
+  /** 原位写（把来源复制进备份目录用；恢复目标写入走 write()） */
+  async writeRaw(path2, data) {
+    if (!this.vaultStorage) return false;
+    return this.vaultStorage.writeRaw(path2, data);
   }
   async exists(path2) {
     const target = this.resolve(path2);
@@ -915,14 +968,13 @@ function atomicWriteJson(filePath, value) {
   try {
     writeFileSync(tmp, data, "utf8");
     renameSync(tmp, filePath);
-    return;
   } catch {
     try {
       unlinkSync(tmp);
     } catch {
     }
-    writeFileSync(filePath, data, "utf8");
   }
+  writeFileSync(filePath, data, "utf8");
 }
 
 // src/spacedReview.ts
