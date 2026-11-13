@@ -65,7 +65,25 @@ export class DashboardView extends ItemView {
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (file instanceof TFile) this.scheduleRender();
     }));
-    this.render();
+    // 启动期被 workspace 恢复的标签页：先渲染占位，等布局就绪且浏览器空闲后再做首帧渲染，
+    // 避免 Dashboard（壁纸扫描 + 统计 + 知识图）与 Obsidian 启动抢主线程，拖慢整个启动。
+    if (this.app.workspace.layoutReady) {
+      this.render();
+    } else {
+      this.inner.createDiv({ cls: "kg-loading", text: "知识花园将在启动完成后加载…" });
+      this.app.workspace.onLayoutReady(() => { if (!this.closed) this.renderWhenIdle(); });
+    }
+  }
+
+  /** 首帧渲染延后到浏览器空闲时段（不支持 requestIdleCallback 时退化为短延时） */
+  private renderWhenIdle(): void {
+    const run = (): void => {
+      if (this.closed || !this.containerEl.isConnected) return;
+      this.render();
+    };
+    const w = window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
+    if (typeof w.requestIdleCallback === "function") w.requestIdleCallback(run, { timeout: 4000 });
+    else window.setTimeout(run, 800);
   }
 
   async onClose(): Promise<void> {

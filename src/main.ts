@@ -203,10 +203,13 @@ export default class KnowledgeGardenPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
     const manifest = this.manifest as unknown as { dir?: string };
-    const baseDir =
-      manifest.dir ??
-      (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ??
-      ".";
+    const vaultBase = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ?? ".";
+    const relDir = manifest.dir ?? ".obsidian/plugins/knowledge-garden";
+    // Obsidian 进程 cwd 不一定是 vault 根目录（从快捷方式/其它目录启动时是任意路径），
+    // 而本插件所有 store 都用 fs 相对路径读写，必须转成绝对路径，否则 cache 全部读不到。
+    const baseDir = /^[A-Za-z]:[\\/]/.test(relDir) || relDir.startsWith("/")
+      ? relDir
+      : vaultBase.replace(/[\\/]+$/, "") + "/" + relDir.replace(/^[\\/]+/, "");
     this.index = new NoteIndex(this.app, baseDir);
     await this.index.load();
     this.searchIndex = new SearchIndex(this.app, (pathStr) => this.index.get(pathStr));
@@ -324,8 +327,6 @@ export default class KnowledgeGardenPlugin extends Plugin {
       new Notice("知识关系数据已损坏，已隔离并重建；已确认关系将从 Relationships/*.md 恢复（0 AI）。");
     }
     this.scheduler.start(); // §36：load schedule + 启动检查（绝不无提示消耗 AI）
-    // Query Explorer：后台分批构建搜索索引（§十二/十六/十七：不阻塞启动；增量由 NoteIndex 事件联动，§二十~二十二）
-    void this.searchIndex.buildFromList(this.index.all().map((n) => n.path), (st) => { if (!st.building) this.rerenderDashboard(); });
     // §8：用 Obsidian 生命周期 API 注册周期任务，插件卸载时自动清理
     this.registerInterval(window.setInterval(() => { void this.scheduler.checkNow(); }, 60 * 1000));
 
@@ -484,11 +485,25 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (this.settings.openOnStartup) {
       this.app.workspace.onLayoutReady(() => { void this.activateView(); });
     }
-    if (this.settings.evolution.enabled) this.updateWeeklySnapshot();
-    // Phase 10：确保关系目录 + 从 Relationships/*.md 恢复（0 AI，§五十二/五十五）
-    void this.ensureRelationshipFolder().then(() => void this.scanRelationshipMarkdown());
-    // Capture/Processing（本阶段）：确保目录可用 + 刷新计数（0 AI，§六十九/一百一十一）
-    void this.ensureCaptureFolders();
+    // 启动优化：索引构建/关系恢复/捕获目录/周快照全部延后到布局就绪后的空闲时段，
+    // 不与 Obsidian 启动争抢主线程与磁盘 IO（原先这些任务在 onload 里同步触发）。
+    this.app.workspace.onLayoutReady(() => this.runStartupTasksWhenIdle());
+  }
+
+  /** 启动后台任务：延后到浏览器空闲时段依次执行（requestIdleCallback 不可用时退化为短延时） */
+  private runStartupTasksWhenIdle(): void {
+    const tasks = (): void => {
+      // Query Explorer：后台分批构建搜索索引（§十二/十六/十七：不阻塞启动；增量由 NoteIndex 事件联动）
+      void this.searchIndex.buildFromList(this.index.all().map((n) => n.path), (st) => { if (!st.building) this.rerenderDashboard(); });
+      if (this.settings.evolution.enabled) this.updateWeeklySnapshot();
+      // Phase 10：确保关系目录 + 从 Relationships/*.md 恢复（0 AI，§五十二/五十五）
+      void this.ensureRelationshipFolder().then(() => void this.scanRelationshipMarkdown());
+      // Capture/Processing（本阶段）：确保目录可用 + 刷新计数（0 AI，§六十九/一百一十一）
+      void this.ensureCaptureFolders();
+    };
+    const w = window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
+    if (typeof w.requestIdleCallback === "function") w.requestIdleCallback(tasks, { timeout: 5000 });
+    else window.setTimeout(tasks, 1500);
   }
 
   onunload(): void {
@@ -2484,7 +2499,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   rerenderDashboard(): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_KG)) {
-      (leaf.view as unknown as { scheduleRender(): void }).scheduleRender();
+      const view = leaf.view as unknown as { scheduleRender?: unknown; getViewType?: () => string };
+      if (typeof view?.scheduleRender !== "function") continue;
+      if (typeof view.getViewType === "function" && view.getViewType() !== VIEW_TYPE_KG) continue;
+      (view as unknown as { scheduleRender(): void }).scheduleRender();
     }
   }
 
