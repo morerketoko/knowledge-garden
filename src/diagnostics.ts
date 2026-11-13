@@ -8,6 +8,11 @@
 import { App, Modal, Notice } from "obsidian";
 import type KnowledgeGardenPlugin from "./main";
 import type { AIFeature } from "./types";
+import { VIEW_TYPE_KG } from "./dashboard";
+import { VIEW_TYPE_CARDS } from "./cardsView";
+import { VIEW_TYPE_EXAM } from "./examView";
+import { VIEW_TYPE_EXAM_REVIEW } from "./examHub";
+import { VIEW_TYPE_AI_WORKBENCH } from "./workbenchView";
 import { DEFAULT_PROFILE_ID, allFeatures, cacheTypeForFeature, featureLabel, resolveAIFunctionRoute } from "./aiRouting";
 import { webFetchCount } from "./webContext";
 import { capabilitiesUnknown } from "./capabilities";
@@ -88,22 +93,54 @@ export class DiagnosticsModal extends Modal {
       row.createSpan({ cls: "kg-review-qlabel", text: label });
       row.createSpan({ text: value });
     }
+
+    // Phase 25：启动性能 / 懒加载可观测性（各阶段耗时、任务状态、上次错误、索引统计、View 延迟状态）
+    inner.createDiv({ cls: "kg-section-title-row" }).createDiv({ cls: "kg-section-title", text: "Startup Performance（Phase 25）" });
+    for (const [label, value] of this.startupLines()) {
+      const row = inner.createDiv({ cls: "kg-row" });
+      row.createSpan({ cls: "kg-review-qlabel", text: label });
+      row.createSpan({ text: value });
+    }
+    inner.createDiv({ cls: "kg-section-desc", text: "只统计耗时/状态/错误摘要；不显示 API Key、不显示笔记正文。后台任务失败会保留完整堆栈到控制台，并在这里显示 last error。" });
     inner.createDiv({ cls: "kg-section-title-row" }).createDiv({ cls: "kg-section-title", text: "操作" });
     const copyBtn = inner.createEl("button", { cls: "kg-btn", text: "复制诊断摘要" });
     copyBtn.addEventListener("click", () => this.copySummary());
     const repairRow = inner.createDiv({ cls: "kg-row" });
-    this.addRepairBtn(repairRow, "重建索引", () => { void this.plugin.rescanAll(); }, "全量重新扫描 Vault 重建索引缓存。");
+    this.addRepairBtn(repairRow, "重建索引", () => {
+      // Phase 25：懒加载安全——先确保索引可用再重扫；失败保留原缓存，绝不半途清空
+      void this.plugin.rebuildIndexFromScratch().catch((err) => {
+        console.error("[KnowledgeGarden][Diagnostics] rebuild index failed", err);
+        new Notice("重建索引失败：" + ((err as Error)?.message ?? String(err)));
+      });
+    }, "全量重新扫描 Vault 重建索引缓存（分批执行，失败不删缓存）。");
     this.addRepairBtn(repairRow, "重建搜索索引", () => {
-      const paths = this.plugin.index.all().map((n) => n.path);
-      this.plugin.searchIndex.cancel();
-      void this.plugin.searchIndex.buildFromList(paths, () => { this.plugin.rerenderDashboard(); });
-      new Notice("已在后台重建搜索索引（" + paths.length + " 篇，不重建 NoteIndex）。");
+      // Phase 25：先按需准备 NoteIndex → SearchIndex（不直接对未就绪索引 build）
+      void (async () => {
+        try {
+          this.plugin.invalidateSearchIndex();
+          await this.plugin.ensureSearchIndexReady("diagnostics-rebuild-search", { retry: true });
+          new Notice("搜索索引已重建（" + this.plugin.searchIndex.count() + " 篇）。");
+          this.plugin.rerenderDashboard();
+        } catch (err) {
+          console.error("[KnowledgeGarden][Diagnostics] rebuild search index failed", err);
+          new Notice("搜索索引重建失败：" + ((err as Error)?.message ?? String(err)));
+        }
+      })();
     }, "只重建 Search Index（Query Explorer 的本地检索层），不重建 NoteIndex、不影响 AI 缓存。");
     this.addRepairBtn(repairRow, "重新建立收藏索引", () => { void this.plugin.reindexSaved(); }, "从 Saved/*.md 的 frontmatter 重建收藏索引（只写 cache/saved-explorations.json，不调 AI）。");
     this.addRepairBtn(repairRow, "清理失效 Activity", () => {
-      this.plugin.activity.prune(new Set(this.plugin.index.all().map((n) => n.path)));
-      new Notice("已清理不存在的笔记对应的 Activity 条目。");
-    }, "删除已不存在笔记的访问/复习记录（只动 cache/activity.json）。");
+      // Phase 25：只有索引健康才允许破坏性清理；否则跳过并说明原因（绝不误删 Activity/FSRS）
+      void (async () => {
+        try { await this.plugin.ensureIndexReady("diagnostics-prune-activity"); }
+        catch (err) { new Notice("索引未就绪，已跳过清理（不删除任何 Activity）：" + ((err as Error)?.message ?? String(err))); return; }
+        if (!this.plugin.isIndexHealthy()) {
+          new Notice("索引不健康，已跳过清理：" + (this.plugin.indexHealthReason() ?? "unknown") + "（保留现有 Activity）。");
+          return;
+        }
+        this.plugin.activity.prune(new Set(this.plugin.index.all().map((n) => n.path)));
+        new Notice("已清理不存在的笔记对应的 Activity 条目。");
+      })();
+    }, "删除已不存在笔记的访问/复习记录（只动 cache/activity.json；索引不健康时跳过）。");
     this.addRepairBtn(repairRow, "重建当前 Review Queue", () => {
       this.plugin.ensureReviewQueue(true);
       new Notice("今日复习队列已重建（本地计算，不调用 AI）。");
@@ -122,6 +159,34 @@ export class DiagnosticsModal extends Modal {
     row.createEl("button", { cls: "kg-btn", text: label }).addEventListener("click", () => {
       new RepairConfirmModal(this.app, { title: label, body: body + " 确认执行？", action }).open();
     });
+  }
+
+  /** Phase 25：启动性能 / 懒加载状态（只读；不含 API Key、不含笔记正文） */
+  private startupLines(): [string, string][] {
+    const p = this.plugin;
+    const d = p.startupDiagnostics();
+    const lines: [string, string][] = [];
+    lines.push(["onload Total", d.onloadDurationMs > 0 ? d.onloadDurationMs + "ms" : "NOT MEASURED"]);
+    for (const st of d.stages) {
+      lines.push(["stage " + st.id, st.durationMs + "ms" + (st.ok ? "" : " · FAILED · " + (st.error ?? "unknown") + "")]);
+    }
+    for (const t of d.tasks) {
+      lines.push(["task " + t.id, t.state + (t.durationMs !== undefined ? " · " + t.durationMs + "ms" : "") + (t.error ? " · " + t.error : "")]);
+    }
+    const rep = d.index.report;
+    lines.push(["NoteIndex", (d.index.ready && p.index.ready ? "ready" : "not ready") + (d.index.error ? " · error=" + d.index.error : "") + " · health=" + (d.index.health ?? "healthy")]);
+    lines.push(["NoteIndex Load", "total=" + rep.totalFiles + " cacheHits=" + rep.cacheHits + " reread=" + rep.rereadFiles + " new=" + rep.newFiles + " skipped=" + rep.skippedFiles + " failed=" + rep.failedFiles + " completed=" + rep.completed + " duration=" + rep.durationMs + "ms"]);
+    lines.push(["SearchIndex", (d.search.ready ? "ready " + d.search.count + " / " + d.search.total : "not ready") + (d.search.error ? " · error=" + d.search.error : "") + (p.searchIndexProgressText ? " · building " + p.searchIndexProgressText : "")]);
+    lines.push(["Skills", (d.skills.ready ? "ready" : "not ready") + " · cached=" + d.skills.cached + (d.skills.error ? " · error=" + d.skills.error : "")]);
+    lines.push(["Relationships", (d.relationships.ready ? "ready" : "not ready（按需）") + (d.relationships.error ? " · error=" + d.relationships.error : "")]);
+    // View 延迟状态（DeferredView 兼容性可观测；只报告 leaf 数量与 loadIfDeferred 能力，不断言实例化）
+    const defs: [string, string][] = [[VIEW_TYPE_KG, "Dashboard"], [VIEW_TYPE_CARDS, "Saved Cards"], [VIEW_TYPE_EXAM, "Exam Session"], [VIEW_TYPE_EXAM_REVIEW, "Exam Review"], [VIEW_TYPE_AI_WORKBENCH, "Workbench"]];
+    for (const [type, label] of defs) {
+      const leaves = this.app.workspace.getLeavesOfType(type);
+      const hasDeferredApi = leaves.some((l) => typeof (l as unknown as { loadIfDeferred?: unknown }).loadIfDeferred === "function");
+      lines.push(["View " + label, leaves.length === 0 ? "closed（下次打开时按需实例化）" : "leaves=" + leaves.length + " · loadIfDeferred=" + (hasDeferredApi ? "supported" : "legacy") + " · 刷新前均已做类型校验"]);
+    }
+    return lines;
   }
 
   /** 状态行（§四十一 列表，全部只读） */

@@ -1,6 +1,9 @@
 import { Plugin, WorkspaceLeaf, Notice, TFile, TFolder, normalizePath } from "obsidian";
 import { DEFAULT_SETTINGS, mergeSettings, type Period, type PluginSettings, type ReviewQueue, type ReviewQuestion, type ReviewQueueItem } from "./types";
-import { NoteIndex, type NoteMetadata } from "./noteIndex";
+import { NoteIndex, type IndexLoadProgress, type IndexLoadReport, type NoteMetadata } from "./noteIndex";
+/* Phase 25：启动性能与 DeferredView 安全 */
+import { StartupCoordinator, StartupAbortedError, STARTUP_ABORTED, type StartupTaskInfo } from "./startupCoordinator";
+import { forEachConcreteLeaf, resolveConcreteView, type DeferredWorkspaceLeaf } from "./deferredView";
 import { SearchIndex, extractAliases, extractHeadings, tokenizeText } from "./searchIndex";
 import { QueryHistoryStore } from "./queryHistory";
 import { QUERY_MAX_LENGTH, buildQueryCacheKey, parseQuery, queryScopePaths, rankSearchResults, selectQueryCandidates } from "./queryExplorer";
@@ -81,6 +84,13 @@ import { LatencyCollector } from "./latency";
 import * as path from "path";
 import { AIWorkbenchView, VIEW_TYPE_AI_WORKBENCH } from "./workbenchView";
 
+/** Phase 25：DeferredView 类型守卫（绝不把 leaf.view 直接 as 具体 View） */
+const isCardsView = (v: unknown): v is CardsView => v instanceof CardsView;
+const isExamSessionView = (v: unknown): v is ExamSessionView => v instanceof ExamSessionView;
+const isExamReviewView = (v: unknown): v is ExamReviewView => v instanceof ExamReviewView;
+const isReviewSessionView = (v: unknown): v is ReviewSessionView => v instanceof ReviewSessionView;
+const isWorkbenchView = (v: unknown): v is AIWorkbenchView => v instanceof AIWorkbenchView;
+
 /** Discovery Scope：discoveryPrep 的返回结构（AIPrep 的 Discovery 变体，含 scope 指纹 / 选择版本 / 展示上下文） */
 interface DiscoveryPrepResult {
   candidateLines: string[];
@@ -114,6 +124,41 @@ interface QueryExplorationState {
 export default class KnowledgeGardenPlugin extends Plugin {
   settings!: PluginSettings;
   index!: NoteIndex;
+
+  /* ================= Phase 25：启动状态（实例级，非全局） ================= */
+  /** 启动/懒加载任务编排：去重、状态、重试、并发上限 */
+  startup = new StartupCoordinator(2);
+  /** NoteIndex 是否就绪（独立于 index.ready，便于在 View 层判断） */
+  indexReady = false;
+  /** 唯一的索引初始化 Promise（并发 ensureIndexReady 共用） */
+  indexInitPromise: Promise<void> | null = null;
+  /** 上次初始化失败原因（诊断 + 重试入口；绝不假装成功） */
+  indexInitError: string | null = null;
+  /** 索引加载进度（Diagnostics / Notice 用） */
+  indexLoadProgress: IndexLoadProgress | null = null;
+  /** SearchIndex 是否已完整构建（searchIndex.ready() 只表示“不在构建中”，不足以判断） */
+  searchIndexReady = false;
+  searchIndexInitPromise: Promise<void> | null = null;
+  searchIndexInitError: string | null = null;
+  /** Skills 正文缓存是否已按需加载 */
+  skillsReady = false;
+  skillsInitPromise: Promise<void> | null = null;
+  skillsInitError: string | null = null;
+  /** 关系目录/恢复是否已按需处理 */
+  relationshipsReady = false;
+  relationshipsInitPromise: Promise<void> | null = null;
+  relationshipsInitError: string | null = null;
+  /** 关系索引损坏后才需要从 Markdown 恢复（正常启动不扫描） */
+  private relationshipsNeedRecovery = false;
+  /** Capture 目录是否已按需创建 */
+  private captureFoldersReady = false;
+  /** 本周演化快照是否已检查（避免重复计算） */
+  private weeklySnapshotChecked = false;
+  /** onload 各阶段耗时（Diagnostics 展示） */
+  startupStages: { id: string; durationMs: number; ok: boolean; error?: string }[] = [];
+  /** 本次 onload 总耗时（与“首次打开 Dashboard 的索引准备耗时”分开统计） */
+  onloadDurationMs = 0;
+
   ai!: AIService;
   reviews!: ReviewManager;
   activity!: ActivityStore;
@@ -201,7 +246,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
   workbenchToolLog: { toolId: string; ok: boolean; at: number }[] = [];
 
   async onload(): Promise<void> {
-    await this.loadSettings();
+    /* Phase 25：onload 只做必要、轻量的初始化；
+       全库索引 / SearchIndex / Skills / 关系恢复 / 周快照 / Capture 目录全部改为按需（见 ensureXxxReady）。 */
+    const onloadStarted = Date.now();
+    await this.stage("loadSettings", () => this.loadSettings());
     const manifest = this.manifest as unknown as { dir?: string };
     const vaultBase = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ?? ".";
     const relDir = manifest.dir ?? ".obsidian/plugins/knowledge-garden";
@@ -210,8 +258,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const baseDir = /^[A-Za-z]:[\\/]/.test(relDir) || relDir.startsWith("/")
       ? relDir
       : vaultBase.replace(/[\\/]+$/, "") + "/" + relDir.replace(/^[\\/]+/, "");
+    // Phase 25：只创建 NoteIndex 实例，绝不 await this.index.load()（不再阻塞 Obsidian 插件加载阶段）
     this.index = new NoteIndex(this.app, baseDir);
-    await this.index.load();
     this.searchIndex = new SearchIndex(this.app, (pathStr) => this.index.get(pathStr));
     this.queryHistory = new QueryHistoryStore(baseDir);
     const queryHistoryCorrupt = this.queryHistory.load();
@@ -221,7 +269,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
     const relCorrupt = this.relationships.load();
     this.activity = new ActivityStore(baseDir);
     const activityCorrupt = this.activity.load();
-    this.activity.prune(new Set(this.index.all().map((n) => n.path)));
+    // Phase 25：启动时索引为空，绝不能用空集合 prune（会把 Activity 全删）。
+    // Activity / FSRS / ReviewCenter / Discovery 的 prune 统一延后到索引就绪且健康检查通过后执行（pruneActivity）。
     this.cache = new AICache(baseDir);
     const cacheCorrupt = this.cache.load();
     this.evolution = new EvolutionStore(baseDir);
@@ -230,8 +279,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.reviewCenter = new ReviewCenterStore(baseDir);
     this.spaced = new SpacedReviewStore(baseDir);
     const spacedCorrupt = this.spaced.load();
-    // Phase 20：FSRS 卡/session 指向不存在的笔记 → 与 Activity 一样随索引清理（保持 O(note count)）
-    this.spaced.prune(new Set(this.index.all().map((n) => n.path)));
+    // Phase 25：FSRS 卡/session 的清理同样延后到索引就绪（见 pruneActivity 的健康检查）
     this.reviewScope = defaultReviewScope();
 
     this.examStore = new ExamStore(baseDir);
@@ -252,9 +300,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
     );
     this.toolbox = new NoteToolbox(this.app, this);
     this.addChild(this.toolbox);
-    // Phase 13 §二十三/一百四十八：启动时轻量预读 Skills（Knowledge Garden/Skills/<id>/SKILL.md + 资源）；
-    // 只读文件不扫描 Vault：workspace 切换不触发扫描。
-    void this.preloadSkills();
+    // Phase 25：Skills 不再在 onload 全目录预读 → 首个真正用到 Skill 的 AI 任务调用 ensureSkillsReady()。
     // Phase 15：Workbench 存储与服务（§五十/六十四/二百六十四；损坏隔离沿用 Recovery 模式）
     this.sourceLedger = new SourceLedger(baseDir);
     const workbenchCorrupt = this.sourceLedger.load();
@@ -290,6 +336,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
         ai: this.ai,
         runReview: (period, force, override) => this.runReview(period, force, override),
         rerenderDashboard: () => this.rerenderDashboard(),
+        // Phase 25：调度器到期时才按需加载索引（未到期不扫描全库）
+        ensureIndexReady: (reason) => this.ensureIndexReady(reason),
       },
       baseDir
     );
@@ -323,8 +371,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
       this.reindexSaved(); // 0 AI；Saved/*.md 是恢复源
     }
     if (relCorrupt) {
-      void this.scanRelationshipMarkdown(); // 0 AI；Relationships/*.md 是恢复源（§五十二/五十五）
-      new Notice("知识关系数据已损坏，已隔离并重建；已确认关系将从 Relationships/*.md 恢复（0 AI）。");
+      // Phase 25：关系索引损坏 → 标记为“待恢复”，由 ensureRelationshipsReady() 在执行关系相关操作时扫描 Markdown；
+      // 正常启动不扫描 Relationships/*.md。
+      this.relationshipsNeedRecovery = true;
+      new Notice("知识关系数据已损坏，已隔离；首次使用知识图/关系目录时将自动从 Relationships/*.md 恢复（0 AI）。");
     }
     this.scheduler.start(); // §36：load schedule + 启动检查（绝不无提示消耗 AI）
     // §8：用 Obsidian 生命周期 API 注册周期任务，插件卸载时自动清理
@@ -431,15 +481,12 @@ export default class KnowledgeGardenPlugin extends Plugin {
     }));
 
     // 增量索引：Vault 事件 → 单文件更新，不整库重扫
+    // Phase 25：索引未就绪时 NoteIndex 只记录 pendingIndexEvents（不丢用户改动，也不做 destructive 操作）
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile && file.extension === "md") {
-        void this.index.updateFile(file).then(() => { void this.searchIndex.updateFile(file.path); });
-      }
+      if (file instanceof TFile && file.extension === "md") this.onVaultDocumentChanged(file, "create");
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof TFile && file.extension === "md") {
-        void this.index.updateFile(file).then(() => { void this.searchIndex.updateFile(file.path); });
-      }
+      if (file instanceof TFile && file.extension === "md") this.onVaultDocumentChanged(file, "modify");
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (file instanceof TFile) {
@@ -459,7 +506,6 @@ export default class KnowledgeGardenPlugin extends Plugin {
       if (act) this.activity.set(file.path, act);
       this.reviewCenter.migratePaths(oldPath, file.path);
       this.spaced?.migratePaths(oldPath, file.path); // Phase 20：FSRS 卡/日志 path 随行更新（0 AI）
-      this.index.removeFile(oldPath);
       this.searchIndex.rename(oldPath, file.path);
       this.saved.migratePaths(oldPath, file.path); // §十八：收藏引用跟随 rename（0 AI）
 
@@ -467,7 +513,11 @@ export default class KnowledgeGardenPlugin extends Plugin {
     this.cards.migratePaths(oldPath, file.path);      // Phase 14：复习卡来源跟随 rename（0 AI）
       this.relationships.migratePaths(oldPath, file.path); // Phase 10：关系引用跟随 rename（0 AI，§五十九）
       if (file.extension === "md") {
-        void this.index.updateFile(file).then(() => { this.pruneActivity(); });
+        // Phase 25：索引未就绪时记录 rename 事件（旧路径 + 新路径都处理），就绪时增量读取
+        this.index.renameFile(oldPath, file).then(() => {
+          if (this.searchIndexReady) { void this.searchIndex.updateFile(file.path); }
+          this.pruneActivity();
+        }).catch((err) => console.error("[KnowledgeGarden][Index] rename event failed", err));
       } else {
         this.pruneActivity();
       }
@@ -482,31 +532,374 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
     this.addSettingTab(new KnowledgeGardenSettingTab(this.app, this));
 
-    if (this.settings.openOnStartup) {
-      this.app.workspace.onLayoutReady(() => { void this.activateView(); });
-    }
-    // 启动优化：索引构建/关系恢复/捕获目录/周快照全部延后到布局就绪后的空闲时段，
-    // 不与 Obsidian 启动争抢主线程与磁盘 IO（原先这些任务在 onload 里同步触发）。
-    this.app.workspace.onLayoutReady(() => this.runStartupTasksWhenIdle());
+    // Phase 25：布局就绪后只做两件轻量事——按配置处理被恢复的 Dashboard 标签、记录 onload 耗时。
+    // 绝不在这里触发全库扫描（SearchIndex / 关系恢复 / Capture 目录 / 周快照 已全部改为按需）。
+    this.app.workspace.onLayoutReady(() => {
+      this.handleRestoredDashboard();
+      if (this.settings.openOnStartup) { void this.activateView(); }
+    });
+    this.onloadDurationMs = Date.now() - onloadStarted;
+    this.markStage("onloadCompleted");
+    console.log("[KnowledgeGarden][Startup] onload completed " + this.onloadDurationMs + "ms（索引/Skills/关系/Capture/周快照均延后按需执行）");
   }
 
-  /** 启动后台任务：延后到浏览器空闲时段依次执行（requestIdleCallback 不可用时退化为短延时） */
-  private runStartupTasksWhenIdle(): void {
-    const tasks = (): void => {
-      // Query Explorer：后台分批构建搜索索引（§十二/十六/十七：不阻塞启动；增量由 NoteIndex 事件联动）
-      void this.searchIndex.buildFromList(this.index.all().map((n) => n.path), (st) => { if (!st.building) this.rerenderDashboard(); });
-      if (this.settings.evolution.enabled) this.updateWeeklySnapshot();
-      // Phase 10：确保关系目录 + 从 Relationships/*.md 恢复（0 AI，§五十二/五十五）
-      void this.ensureRelationshipFolder().then(() => void this.scanRelationshipMarkdown());
-      // Capture/Processing（本阶段）：确保目录可用 + 刷新计数（0 AI，§六十九/一百一十一）
-      void this.ensureCaptureFolders();
+  /* ================= Phase 25：启动编排与按需初始化 ================= */
+
+  private stageCursor = 0;
+
+  /** 记录一段 onload 同步阶段的耗时 */
+  private markStage(id: string): void {
+    const now = Date.now();
+    const durationMs = this.stageCursor ? now - this.stageCursor : 0;
+    this.stageCursor = now;
+    this.startup.recordStage(id, durationMs);
+    this.startupStages.push({ id, durationMs, ok: true });
+    console.log("[KnowledgeGarden][Startup] " + id + " completed " + durationMs + "ms");
+  }
+
+  /** 记录一段异步阶段（失败保留完整异常，绝不静默） */
+  private async stage<T>(id: string, fn: () => Promise<T>): Promise<T> {
+    const t0 = Date.now();
+    this.stageCursor = t0;
+    try {
+      const out = await fn();
+      const durationMs = Date.now() - t0;
+      this.stageCursor = Date.now();
+      this.startup.recordStage(id, durationMs);
+      this.startupStages.push({ id, durationMs, ok: true });
+      console.log("[KnowledgeGarden][Startup] " + id + " completed " + durationMs + "ms");
+      return out;
+    } catch (err) {
+      const durationMs = Date.now() - t0;
+      this.stageCursor = Date.now();
+      this.startup.recordStage(id, durationMs, err);
+      this.startupStages.push({ id, durationMs, ok: false, error: (err as Error)?.message ?? String(err) });
+      console.error("[KnowledgeGarden][Startup] stage=" + id, err);
+      throw err;
+    }
+  }
+
+  /**
+   * 索引健康检查（破坏性 prune 的前置条件）：
+   * 全库 Markdown 数量 vs 已索引数量 ≥ 95%，且失败文件为 0。
+   */
+  isIndexHealthy(): boolean {
+    if (!this.indexReady || !this.index.ready) return false;
+    const vaultCount = this.vaultMarkdownCount();
+    return this.index.isHealthy(vaultCount);
+  }
+
+  private vaultMarkdownCount(): number {
+    try {
+      return this.app.vault.getMarkdownFiles().filter((f) => !f.path.startsWith(".obsidian/")).length;
+    } catch (err) {
+      console.error("[KnowledgeGarden][Lazy] vault count failed", err);
+      return 0;
+    }
+  }
+
+  /** 不健康原因（Diagnostics 展示） */
+  indexHealthReason(): string | null {
+    if (!this.indexReady) return "索引尚未准备（按需加载未触发）";
+    return this.index.unhealthyReason(this.vaultMarkdownCount());
+  }
+
+  /**
+   * 确保全库索引就绪（唯一的懒初始化入口）。
+   * - 已就绪 → 直接返回
+   * - 正在初始化 → 等待同一个 Promise（绝不重复启动）
+   * - 上次失败 → 只有显式 retry:true 才重试（避免被动调用陷入失败循环）
+   */
+  async ensureIndexReady(reason: string, opts?: { retry?: boolean }): Promise<void> {
+    if (this.indexReady && this.index.ready) return;
+    if (this.indexInitPromise) return this.indexInitPromise;
+    if (this.indexInitError && !opts?.retry) throw new Error(this.indexInitError);
+    if (opts?.retry) {
+      this.indexInitError = null;
+      this.startup.resetFailed("noteIndex");
+    }
+
+    const job = this.startup.runOnce("noteIndex", async () => {
+      const startedAt = Date.now();
+      console.log("[KnowledgeGarden][Lazy] noteIndex start reason=" + reason);
+      const notice = this.persistentNotice("正在准备知识索引…");
+      try {
+        const report = await this.index.load((p) => {
+          this.indexLoadProgress = p;
+          this.persistentNoticeUpdate(notice, "正在准备知识索引… " + p.processed + " / " + p.total + (p.failedFiles > 0 ? "（失败 " + p.failedFiles + "）" : ""));
+        });
+        this.indexLoadProgress = null;
+        this.indexReady = true;
+        this.indexInitError = null;
+        console.log("[KnowledgeGarden][Lazy] noteIndex completed " + (report.durationMs ?? (Date.now() - startedAt)) + "ms files=" + report.totalFiles + " cacheHits=" + report.cacheHits + " failed=" + report.failedFiles);
+
+        // 加载期间积压的 Vault 事件已在 index.load 内部合并处理；这里把受影响路径同步给 SearchIndex
+        const affected = this.index.takePendingAffected();
+        if (this.searchIndexReady) {
+          for (const p of affected) await this.searchIndex.updateFile(p);
+        }
+
+        // 破坏性清理必须在“索引健康”之后（否则会把 Activity/FSRS 当成孤儿删掉）
+        if (this.isIndexHealthy()) {
+          this.pruneActivity();
+        } else {
+          console.warn("[KnowledgeGarden][Lazy] skip destructive prune：索引不健康 → " + (this.indexHealthReason() ?? "unknown"));
+        }
+
+        // 周快照：只在索引就绪后判断一次（已有本周快照则不重复计算）
+        this.updateWeeklySnapshotIfDue();
+      } finally {
+        this.persistentNoticeHide(notice);
+      }
+    });
+
+    this.indexInitPromise = job.then(
+      () => { /* 成功：保留 indexInitPromise 供并发调用复用，无需清空 */ },
+      (err) => {
+        this.indexReady = false;
+        this.indexLoadProgress = null;
+        this.indexInitError = (err as Error)?.message ?? String(err);
+        // 失败不伪装成功、不做任何 destructive prune、保留已有内存数据与磁盘缓存；允许用户显式重试
+        console.error("[KnowledgeGarden][Startup] stage=noteIndex", err);
+        this.indexInitPromise = null;
+        this.startup.resetFailed("noteIndex");
+        new Notice("知识索引准备失败：" + this.indexInitError + "。已保留现有缓存；可在「诊断」或 Dashboard 重试。");
+        throw err;
+      }
+    ).then(() => undefined);
+
+    return this.indexInitPromise;
+  }
+
+  /**
+   * 确保 SearchIndex 就绪（首次使用 Query Explorer / Workbench 检索时才构建全库检索索引）。
+   * 未就绪时绝不返回“空结果”冒充成功。
+   */
+  async ensureSearchIndexReady(reason: string, opts?: { retry?: boolean }): Promise<void> {
+    await this.ensureIndexReady(reason, opts);
+    if (this.searchIndexReady) return;
+    if (this.searchIndexInitPromise) return this.searchIndexInitPromise;
+    if (this.searchIndexInitError && !opts?.retry) throw new Error(this.searchIndexInitError);
+    if (opts?.retry) {
+      this.searchIndexInitError = null;
+      this.startup.resetFailed("searchIndex");
+    }
+
+    const job = this.startup.runOnce("searchIndex", async () => {
+      const startedAt = Date.now();
+      console.log("[KnowledgeGarden][Lazy] searchIndex start reason=" + reason);
+      const paths = this.index.all().map((n) => n.path);
+      await this.searchIndex.buildFromList(paths, (st) => {
+        this.searchIndexProgressText = st.building ? st.indexed + " / " + st.total : "";
+      });
+      this.searchIndexProgressText = "";
+      this.searchIndexReady = true;
+      this.searchIndexInitError = null;
+      console.log("[KnowledgeGarden][Lazy] searchIndex completed " + (Date.now() - startedAt) + "ms docs=" + paths.length);
+      this.rerenderDashboard();
+    });
+
+    this.searchIndexInitPromise = job.then(
+      () => undefined,
+      (err) => {
+        this.searchIndexReady = false;
+        this.searchIndexProgressText = "";
+        this.searchIndexInitError = (err as Error)?.message ?? String(err);
+        console.error("[KnowledgeGarden][Startup] stage=searchIndex", err);
+        this.searchIndexInitPromise = null;
+        this.startup.resetFailed("searchIndex");
+        throw err;
+      }
+    );
+    return this.searchIndexInitPromise;
+  }
+
+  /** SearchIndex 构建进度文案（Dashboard 展示「正在准备知识检索索引…」） */
+  searchIndexProgressText = "";
+
+  /** 全库重建索引后让 SearchIndex 失效（下次检索按需重建，绝不静默沿用旧结果） */
+  invalidateSearchIndex(): void {
+    this.searchIndexReady = false;
+    this.searchIndexInitError = null;
+    this.searchIndexInitPromise = null;
+    try { this.searchIndex.reset(); } catch (err) { console.warn("[KnowledgeGarden][Lazy] searchIndex reset failed", err); }
+    try { this.startup.resetFailed("searchIndex"); } catch { /* 状态重置失败不影响数据 */ }
+  }
+
+  /**
+   * Phase 25：诊断面板「重建索引」的懒加载安全实现——先确保索引可用，再删缓存重扫。
+   * 失败保持原缓存与数据，绝不半途清空；重建后 SearchIndex 失效（下次检索按需重建）。
+   */
+  async rebuildIndexFromScratch(): Promise<void> {
+    try {
+      await this.ensureIndexReady("diagnostics-rebuild");
+    } catch (err) {
+      new Notice("索引尚未就绪，已取消重建（不会删除现有缓存）：" + ((err as Error)?.message ?? String(err)));
+      return;
+    }
+    const notice = this.persistentNotice("正在重建索引…");
+    const report = await this.index.rescanAll((p) => {
+      this.indexLoadProgress = p;
+      this.persistentNoticeUpdate(notice, "正在重建索引… " + p.processed + " / " + p.total);
+    });
+    this.indexLoadProgress = null;
+    this.persistentNoticeHide(notice);
+    this.indexReady = true;
+    this.indexInitError = null;
+    this.invalidateSearchIndex();
+    if (this.isIndexHealthy()) this.pruneActivity();
+    else console.warn("[KnowledgeGarden][Lazy] rebuild done but unhealthy：" + (this.indexHealthReason() ?? "unknown") + "（跳过破坏性清理）");
+    this.updateWeeklySnapshotIfDue();
+    new Notice("索引已重建：" + report.totalFiles + " 篇（失败 " + report.failedFiles + "）。");
+    this.rerenderDashboard();
+  }
+
+  /** 确保 Skills 目录正文已按需读取（首个使用 Skill 的 AI 任务调用；同一轮只扫描一次） */
+  async ensureSkillsReady(reason: string): Promise<void> {
+    if (this.skillsReady) return;
+    if (this.skillsInitPromise) return this.skillsInitPromise;
+    const job = this.startup.runOnce("skills", async () => {
+      const startedAt = Date.now();
+      console.log("[KnowledgeGarden][Lazy] skills start reason=" + reason);
+      await this.preloadSkills();
+      this.skillsReady = true;
+      this.skillsInitError = null;
+      console.log("[KnowledgeGarden][Lazy] skills completed " + (Date.now() - startedAt) + "ms skills=" + this.skillFileCache.size);
+    });
+    this.skillsInitPromise = job.then(
+      () => undefined,
+      (err) => {
+        this.skillsReady = false;
+        this.skillsInitError = (err as Error)?.message ?? String(err);
+        console.error("[KnowledgeGarden][Startup] stage=skills", err);
+        // Skill 读取失败：回退内置 Skill（readSkill 返回 null 时调用方即使用内置正文），不阻塞 AI 任务
+        this.skillsInitPromise = null;
+        this.startup.resetFailed("skills");
+        throw err;
+      }
+    );
+    return this.skillsInitPromise;
+  }
+
+  /** 确保关系目录可用（损坏时才从 Markdown 恢复）；正常启动不扫描 */
+  async ensureRelationshipsReady(reason: string): Promise<void> {
+    if (this.relationshipsReady) return;
+    if (this.relationshipsInitPromise) return this.relationshipsInitPromise;
+    const job = this.startup.runOnce("relationships", async () => {
+      const startedAt = Date.now();
+      console.log("[KnowledgeGarden][Lazy] relationships start reason=" + reason);
+      await this.ensureRelationshipFolder();
+      if (this.relationshipsNeedRecovery) {
+        await this.scanRelationshipMarkdown();
+        this.relationshipsNeedRecovery = false;
+      }
+      this.relationshipsReady = true;
+      this.relationshipsInitError = null;
+      console.log("[KnowledgeGarden][Lazy] relationships completed " + (Date.now() - startedAt) + "ms");
+    });
+    this.relationshipsInitPromise = job.then(
+      () => undefined,
+      (err) => {
+        this.relationshipsReady = false;
+        this.relationshipsInitError = (err as Error)?.message ?? String(err);
+        console.error("[KnowledgeGarden][Startup] stage=relationships", err);
+        this.relationshipsInitPromise = null;
+        this.startup.resetFailed("relationships");
+        throw err;
+      }
+    );
+    return this.relationshipsInitPromise;
+  }
+
+  /** Capture 目录首次使用时创建（不在每次启动时创建四个目录） */
+  async ensureCaptureFoldersOnce(): Promise<void> {
+    if (this.captureFoldersReady) return;
+    await this.ensureCaptureFolders();
+    this.captureFoldersReady = true;
+  }
+
+  /** 周快照：索引就绪后判断一次；本周期已有快照则不重复计算；手动命令仍可立即执行 */
+  private updateWeeklySnapshotIfDue(): void {
+    if (!this.settings.evolution.enabled) return;
+    if (this.weeklySnapshotChecked) return;
+    this.weeklySnapshotChecked = true;
+    const period = monthlyPeriodLabel();
+    const latest = this.evolution.latest(1)[0];
+    if (latest && latest.periodKey && latest.periodKey.indexOf(period) >= 0) {
+      console.log("[KnowledgeGarden][Lazy] weeklySnapshot skipped（本周期已有快照 " + period + "）");
+      return;
+    }
+    const job = this.startup.runOnce("weeklySnapshot", async () => {
+      const startedAt = Date.now();
+      this.updateWeeklySnapshot();
+      console.log("[KnowledgeGarden][Lazy] weeklySnapshot completed " + (Date.now() - startedAt) + "ms");
+    });
+    job.catch((err) => { console.error("[KnowledgeGarden][Lazy] weeklySnapshot failed", err); });
+  }
+
+  /** 布局就绪：只关闭被工作区恢复的 Dashboard（openOnStartup=false 时），不启动任何全库扫描 */
+  private handleRestoredDashboard(): void {
+    if (this.settings.openOnStartup) return;
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_KG);
+    if (leaves.length === 0) return;
+    for (const leaf of leaves) {
+      // getLeavesOfType 已按 viewState.type 过滤；DeferredView 未实例化时没有 getViewType，不能直接调方法
+      const view = (leaf as unknown as DeferredWorkspaceLeaf).view;
+      if (view && typeof (view as { getViewType?: () => string }).getViewType === "function") {
+        const type = (view as { getViewType: () => string }).getViewType();
+        if (type !== VIEW_TYPE_KG) continue;
+      }
+      try {
+        leaf.detach();
+      } catch (err) {
+        console.error("[KnowledgeGarden][View] detach restored dashboard failed", err);
+      }
+    }
+    console.log("[KnowledgeGarden][Startup] closed restored dashboard leaf(s)=" + leaves.length + "（openOnStartup=false）");
+  }
+
+  /** Notice 持久提示（聚集索引进度；不支持 setMessage 时退化为普通 Notice） */
+  private persistentNotice(message: string): Notice {
+    try { return new Notice(message, 0); } catch { return new Notice(message); }
+  }
+  private persistentNoticeUpdate(notice: Notice, message: string): void {
+    const n = notice as unknown as { setMessage?: (m: string) => void };
+    if (typeof n.setMessage === "function") { n.setMessage(message); return; }
+    // 老版本 Notice 不支持原地更新：只在每 25% 进度时新弹一条，避免刷屏
+    const p = this.indexLoadProgress;
+    if (!p || p.total <= 0) return;
+    const pct = Math.floor((p.processed / p.total) * 100);
+    if (pct > 0 && pct % 25 === 0) new Notice("正在准备知识索引… " + pct + "%");
+  }
+  private persistentNoticeHide(notice: Notice): void {
+    const n = notice as unknown as { hide?: () => void };
+    if (typeof n.hide === "function") n.hide();
+  }
+
+  /** 启动诊断数据（Diagnostics / 报告用；不含 API Key、不含笔记正文） */
+  startupDiagnostics(): {
+    onloadDurationMs: number;
+    stages: { id: string; durationMs: number; ok: boolean; error?: string }[];
+    tasks: StartupTaskInfo[];
+    index: { ready: boolean; error: string | null; report: IndexLoadReport; health: string | null };
+    search: { ready: boolean; error: string | null; count: number; total: number };
+    skills: { ready: boolean; error: string | null; cached: number };
+    relationships: { ready: boolean; error: string | null };
+  } {
+    return {
+      onloadDurationMs: this.onloadDurationMs,
+      stages: this.startupStages.slice(),
+      tasks: this.startup.getAllStates(),
+      index: { ready: this.indexReady, error: this.indexInitError, report: this.index.report, health: this.indexHealthReason() },
+      search: { ready: this.searchIndexReady, error: this.searchIndexInitError, count: this.searchIndex.count(), total: this.searchIndex.getStatus().total },
+      skills: { ready: this.skillsReady, error: this.skillsInitError, cached: this.skillFileCache.size },
+      relationships: { ready: this.relationshipsReady, error: this.relationshipsInitError },
     };
-    const w = window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
-    if (typeof w.requestIdleCallback === "function") w.requestIdleCallback(tasks, { timeout: 5000 });
-    else window.setTimeout(tasks, 1500);
   }
 
   onunload(): void {
+    // Phase 25：停止尚未开始的懒加载任务（已经开始的任务允许跑完，避免持久化半途而废）
+    this.startup.dispose();
     this.scheduler?.stop();
     this.activity?.flush();
     this.queryHistory?.flush();
@@ -573,12 +966,18 @@ export default class KnowledgeGardenPlugin extends Plugin {
     };
     walk(folder);
     const next = new Map<string, string>();
+    let failed = 0;
     for (const f of files) {
       const rel = f.path.slice(root.length + 1);
       try {
         next.set(rel, await this.app.vault.cachedRead(f));
-      } catch { /* 读取失败视为未提供，回退内置 */ }
+      } catch (err) {
+        // Phase 25：读取失败回退内置 Skill，但绝不静默（记录路径与原因）
+        failed++;
+        console.warn("[KnowledgeGarden][Lazy] skill read failed path=" + f.path + "（回退内置 Skill）", err);
+      }
     }
+    if (failed > 0) console.warn("[KnowledgeGarden][Lazy] skills failed=" + failed + "/" + files.length);
     this.skillFileCache = next;
   }
 
@@ -808,6 +1207,18 @@ export default class KnowledgeGardenPlugin extends Plugin {
     };
     this.queryExplorerError = null;
     this.rerenderDashboard();
+    // Phase 25：全库检索是懒初始化的；未构建完成时显示「正在准备知识检索索引…」，
+    // 绝不返回空结果冒充“没有找到笔记”。
+    try {
+      await this.ensureSearchIndexReady("query-explorer");
+    } catch (err) {
+      this.queryExploration.status = "error";
+      this.queryExploration.error = "知识检索索引准备失败：" + ((err as Error)?.message ?? String(err));
+      this.queryExplorerError = this.queryExploration.error;
+      this.rerenderDashboard();
+      new Notice(this.queryExploration.error);
+      return;
+    }
     // 阶段 1：本地检索（内存索引「正在搜索知识库…」→「找到 N 篇」，§五十七/六十六/十二）
     const localLimit = Math.max(1, Math.min(200, cfg.localResultLimit ?? 50));
     const scopePaths = queryScopePaths(scopeMode, allNotes, wsScope ?? this.settings.discovery?.roaming?.scope, wsAreas);
@@ -1129,6 +1540,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   async runReview(period: Period, force = false, periodKeyOverride?: string): Promise<{ path: string; offline: boolean; fromCache: boolean } | null> {
     try {
+      // Phase 25：复盘依赖全库索引 → 按需准备（Scheduler 到期/手动命令都走这里）
+      await this.ensureIndexReady("review:" + period);
       const result = await this.reviews.generateReview(period, force, periodKeyOverride);
       if (result) this.openNote(result.path);
       // §29/30：手动 / 强制 / Scheduler 成功后统一写 ScheduleState=done（到点后 Scheduler 直接跳过）
@@ -1187,7 +1600,10 @@ export default class KnowledgeGardenPlugin extends Plugin {
   }
 
   /** Phase 11：状态随机浏览（§四~十六）：纯本地 0 AI；点击/命令共用同一逻辑（§十五） */
-  browseState(state: KGState): void {
+  async browseState(state: KGState): Promise<void> {
+    // Phase 25：状态推导依赖全库索引 → 首次使用时按需准备
+    try { await this.ensureIndexReady("state-browse"); }
+    catch (err) { new Notice("知识索引未就绪：" + ((err as Error)?.message ?? String(err)) + "（可在「诊断」重试）"); return; }
     const pool = resolveStateBrowseScope(this.settings.stateBrowse, this.index.all(), this.settings.knowledgeAreas, this.settings.discovery?.roaming?.scope);
     const notes = getNotesByState(pool, (p: string) => this.activity.get(p), this.settings.activity, state);
     const pick = pickRandomNote(notes, this.browseLastPath ?? undefined);
@@ -1266,6 +1682,13 @@ export default class KnowledgeGardenPlugin extends Plugin {
     });
     if (tokens.length === 0) { onUpdate({ status: "error", message: "无法从该笔记提取检索关键词。" }); return; }
     onUpdate({ status: "searching", message: "正在搜索候选知识…" });
+    // Phase 25：Anchor 探索依赖全库检索索引 → 按需准备（不返回空结果冒充“没有找到”）
+    try {
+      await this.ensureSearchIndexReady("anchor-exploration");
+    } catch (err) {
+      onUpdate({ status: "error", message: "知识检索索引准备失败：" + ((err as Error)?.message ?? String(err)) });
+      return;
+    }
     const allNotes = this.index.all();
     const noteMap = new Map(allNotes.map((n) => [n.path, n]));
     // Phase 13 §一百零五：Anchor 默认 Workspace Scope；用户可手动切「Entire Vault」
@@ -1354,6 +1777,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** 用户确认连接（§六/七）：创建长期 Relationship + 写 Relationships/*.md（§五十三/五十四）；0 AI */
   async confirmRelationship(input: { from: string; to: string; relation: string; reason?: string; direction?: 'forward' | 'bidirectional' }): Promise<void> {
+    // Phase 25：关系确认要用全库索引解析节点 → 按需准备
+    try { await this.ensureIndexReady("confirm-relationship"); }
+    catch (err) { new Notice("知识索引未就绪，暂时无法确认连接：" + ((err as Error)?.message ?? String(err))); return; }
     const from = this.resolveRelNode(input.from);
     const to = this.resolveRelNode(input.to);
     if (!from || !to || relNodeLabel(from) === relNodeLabel(to)) {
@@ -1425,6 +1851,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** 打开关系目录（§五十四；0 AI） */
   async openRelationshipFolder(): Promise<void> {
+    // Phase 25：关系相关操作时才确保目录/恢复（正常启动不扫描 Relationships/*.md）
+    try { await this.ensureRelationshipsReady("open-relationship-folder"); }
+    catch (err) { console.error("[KnowledgeGarden][Lazy] relationships not ready", err); }
     await this.ensureRelationshipFolder();
     const folder = this.settings.relationship.folder;
     const prefix = folder.replace(/[\\/]+$/, '').toLowerCase() + '/';
@@ -1505,6 +1934,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (!input.title.trim() && !input.body.trim() && !(input.sourceUrl ?? "").trim()) {
       new Notice("捕获内容为空，已取消。"); return;
     }
+    // Phase 25：Capture 目录按需创建（不在每次启动时建四个目录）；不改变任何 Capture 行为
+    await this.ensureCaptureFoldersOnce();
     await this.ensureVaultFolder(cap.inboxFolder);
     let dupPath: string | null = null;
     if ((input.sourceUrl ?? "").trim()) {
@@ -1662,6 +2093,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** §六十八/一百一十一：打开 Capture 目录（Inbox/候选/知识/归档） */
   async openCaptureFolder(folder: string): Promise<void> {
+    // Phase 25：仅在用户真正打开 Capture 目录时确保目录存在
+    await this.ensureCaptureFoldersOnce();
     await this.ensureVaultFolder(folder);
     const prefix = folder.replace(/[\\/]+$/, "").toLowerCase() + "/";
     const files = this.app.vault.getMarkdownFiles().filter((f) => f.path.toLowerCase().startsWith(prefix));
@@ -1685,7 +2118,17 @@ export default class KnowledgeGardenPlugin extends Plugin {
   viewForgotten(): void {
     const now = Date.now();
     const list = forgottenCandidates(this.index.all(), (p) => this.activity.get(p), this.settings.activity, now).slice(0, 8);
-    if (list.length === 0) { new Notice("暂无“可能正在被遗忘”的知识。"); return; }
+    if (list.length === 0) {
+      // Phase 25：索引尚未准备时，绝不把“空索引”当成“没有遗忘的知识”
+      if (!this.indexReady) {
+        new Notice("知识索引尚未准备。正在准备索引…");
+        void this.ensureIndexReady("view-forgotten").then(() => this.viewForgotten()).catch((err) => {
+          console.error("[KnowledgeGarden][Lazy] viewForgotten after index failed", err);
+        });
+        return;
+      }
+      new Notice("暂无“可能正在被遗忘”的知识。"); return;
+    }
     const lines = list.map((n) => {
       const days = Math.max(1, Math.round((now - n.modified) / 86400000));
       return n.title + "（" + days + " 天未修改 · 关联 " + (n.links.length + n.backlinks.length) + " 篇）";
@@ -2260,7 +2703,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (leaves.length > 0) {
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      (leaves[0].view as ReviewSessionView).refresh();
+      // Phase 25：DeferredView 未实例化时跳过 refresh（View 真正打开会自读最新状态）
+      const view = await this.resolveView(leaves[0], isReviewSessionView, "review-session");
+      if (view) view.refresh();
       return;
     }
     const leaf = this.app.workspace.getRightLeaf(false);
@@ -2268,8 +2713,21 @@ export default class KnowledgeGardenPlugin extends Plugin {
     await leaf.setViewState({ type: VIEW_TYPE_REVIEW, active: true });
     this.app.workspace.revealLeaf(leaf);
   }
-  /** 行为数据随索引清理：删除/改名/重建后，移除已不存在笔记的活动条目，保持 O(note count) */
+  /** Phase 25：Vault create/modify → 单文件增量（index 未就绪时自动转为 pending 事件） */
+  private onVaultDocumentChanged(file: TFile, kind: "create" | "modify"): void {
+    this.index.updateFile(file).then(() => {
+      if (this.searchIndexReady) { void this.searchIndex.updateFile(file.path); }
+    }).catch((err) => console.error("[KnowledgeGarden][Index] " + kind + " event failed", err));
+  }
+
+  /** 行为数据随索引清理：删除/改名/重建后，移除已不存在笔记的活动条目，保持 O(note count)。
+   *  Phase 25：只有「索引就绪 + 完整 + 失败为 0 + 覆盖 ≥95%」才允许 prune；
+   *  否则一律跳过（宁可暂时保留多余数据，也不能把 Activity / FSRS / Queue / Discovery 误删）。 */
   private pruneActivity(): void {
+    if (!this.isIndexHealthy()) {
+      console.warn("[KnowledgeGarden][Lazy] prune skipped（索引不健康：" + (this.indexHealthReason() ?? "unknown") + "）→ 保留 Activity / FSRS / Review Queue / Discovery");
+      return;
+    }
     const existing = new Set(this.index.all().map((n) => n.path));
     this.activity.prune(existing);
     this.reviewCenter.prunePaths(existing);
@@ -2494,6 +2952,31 @@ export default class KnowledgeGardenPlugin extends Plugin {
       cur = cur ? cur + "/" + part : part;
       if (this.app.vault.getAbstractFileByPath(cur)) continue;
       try { await this.app.vault.createFolder(cur); } catch { /* 并发已创建等场景忽略 */ }
+    }
+  }
+
+  /**
+   * Phase 25：拿到 leaf 的真实 View 实例（DeferredView 先 loadIfDeferred，再做 instanceof 校验）。
+   * 返回 null 表示「未实例化 / 类型不符」→ 调用方跳过刷新，绝不调用未知对象的方法。
+   */
+  private async resolveView<T>(leaf: WorkspaceLeaf, guard: (v: unknown) => v is T, label: string): Promise<T | null> {
+    return resolveConcreteView(leaf as unknown as DeferredWorkspaceLeaf, guard, this.viewError(label));
+  }
+
+  private viewError(label: string): (stage: string, err: unknown) => void {
+    return (stage, err) => console.error("[KnowledgeGarden][View] " + label + " deferred " + stage + " failed", err);
+  }
+
+  private async refreshConcreteLeaves<T>(
+    viewType: string,
+    guard: (v: unknown) => v is T,
+    apply: (v: T) => void | Promise<void>,
+    label: string
+  ): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(viewType);
+    const applied = await forEachConcreteLeaf(leaves as unknown as DeferredWorkspaceLeaf[], guard, apply, this.viewError(label));
+    if (applied === 0 && leaves.length > 0) {
+      console.log("[KnowledgeGarden][View] " + label + " deferred（未实例化，跳过刷新；View 打开时会读最新 Store）");
     }
   }
 
@@ -2801,7 +3284,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (leaves.length > 0) {
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      (leaves[0].view as ExamSessionView).refresh();
+      // Phase 25：先确保具体 ExamSessionView 再 refresh
+      const view = await this.resolveView(leaves[0], isExamSessionView, "exam-session");
+      if (view) view.refresh();
       return;
     }
     const leaf = this.app.workspace.getRightLeaf(false);
@@ -3121,12 +3606,9 @@ export default class KnowledgeGardenPlugin extends Plugin {
 
   /** Hotfix：通知已打开的 Exam Review / Exam Session 视图“考试已被删除”（§22/23；0 AI） */
   private notifyExamDeleted(sourcePath: string): void {
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW)) {
-      (leaf.view as ExamReviewView).notifyDeleted(sourcePath);
-    }
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM)) {
-      (leaf.view as ExamSessionView).notifyDeleted(sourcePath);
-    }
+    // Phase 25：只对“已实例化且类型正确”的 View 调用 notifyDeleted；DeferredView 跳过（打开时会读最新 Store）
+    void this.refreshConcreteLeaves(VIEW_TYPE_EXAM_REVIEW, isExamReviewView, (v) => v.notifyDeleted(sourcePath), "exam-review-notify");
+    void this.refreshConcreteLeaves(VIEW_TYPE_EXAM, isExamSessionView, (v) => v.notifyDeleted(sourcePath), "exam-session-notify");
   }
 
   /** 旧式记录复习卡复习（保留兼容入口；Phase 21 起路由到 FSRS rateSavedCard） */
@@ -3209,21 +3691,23 @@ export default class KnowledgeGardenPlugin extends Plugin {
     if (leaves.length > 0) {
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      (leaves[0].view as ExamReviewView).loadExam(examId);
+      // Phase 25：先确保 ExamReviewView 实例化，再 loadExam
+      const view = await this.resolveView(leaves[0], isExamReviewView, "exam-review");
+      if (view) view.loadExam(examId);
       return;
     }
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) { new Notice("无法创建回顾窗口。"); return; }
     await leaf.setViewState({ type: VIEW_TYPE_EXAM_REVIEW, active: true });
-    (leaf.view as ExamReviewView).loadExam(examId);
+    const view = await this.resolveView(leaf, isExamReviewView, "exam-review-new");
+    if (view) view.loadExam(examId);
     this.app.workspace.revealLeaf(leaf);
   }
 
   /** Exam Review 视图刷新（对外部变化响应；0 AI） */
   rerenderExamReview(): void {
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM_REVIEW)) {
-      (leaf.view as ExamReviewView).refresh();
-    }
+    // Phase 25：DeferredView 未实例化时跳过（View 打开时自读 Store），绝不 as 强制转换
+    void this.refreshConcreteLeaves(VIEW_TYPE_EXAM_REVIEW, isExamReviewView, (v) => v.refresh(), "exam-review-refresh");
   }
 
   /**
@@ -3276,9 +3760,8 @@ export default class KnowledgeGardenPlugin extends Plugin {
       if (okNow && (JSON.stringify(hc.options ?? null) !== JSON.stringify(before.get(c.id)?.options ?? null) || hc.correctAnswer !== before.get(c.id)?.correctAnswer)) repaired++;
       else if (!okNow) unavailable++;
     }
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS)) {
-      void (leaf.view as CardsView).refresh();
-    }
+    // Phase 25：DeferredView 未实例化时跳过刷新（View 打开时会读最新卡数据）
+    void this.refreshConcreteLeaves(VIEW_TYPE_CARDS, isCardsView, (v) => v.refresh(), "cards-refresh");
     return { found: candidates.length, repaired, unavailable };
   }
 
@@ -3329,9 +3812,7 @@ export default class KnowledgeGardenPlugin extends Plugin {
       });
       await this.updateSavedCardMarkdown(card, { ...next, editedAt: now });   // §57：同步 Markdown（失败会 Notice）
       this.rerenderDashboard();
-      for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS)) {
-        void (leaf.view as CardsView).refresh();
-      }
+      void this.refreshConcreteLeaves(VIEW_TYPE_CARDS, isCardsView, (v) => v.refresh(), "cards-refresh");
     } catch (e) {
       return { ok: false, message: "保存失败：" + ((e as Error)?.message ?? String(e)) };
     }
@@ -3366,25 +3847,27 @@ export default class KnowledgeGardenPlugin extends Plugin {
   async openCardsView(opts?: { scope?: SavedCardScope }): Promise<void> {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CARDS);
     if (leaves.length > 0) {
-      const view = leaves[0].view as CardsView;
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      if (opts?.scope) view.setScope(opts.scope);
-      else view.refresh();
+      // Phase 25：DeferredView 未实例化时不调用 setScope/refresh
+      const view = await this.resolveView(leaves[0], isCardsView, "cards");
+      if (view) {
+        if (opts?.scope) view.setScope(opts.scope);
+        else view.refresh();
+      }
       return;
     }
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: VIEW_TYPE_CARDS, active: true });
-    const view = leaf.view as CardsView;
-    if (opts?.scope) view.setScope(opts.scope);
+    const view = await this.resolveView(leaf, isCardsView, "cards-new");
+    if (view && opts?.scope) view.setScope(opts.scope);
     this.app.workspace.revealLeaf(leaf);
   }
 
   /** Exam 会话视图刷新 */
   rerenderExamSession(): void {
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_EXAM)) {
-      (leaf.view as ExamSessionView).refresh();
-    }
+    // Phase 25：先 loadIfDeferred + instanceof 校验；未实例化则跳过
+    void this.refreshConcreteLeaves(VIEW_TYPE_EXAM, isExamSessionView, (v) => v.refresh(), "exam-session-refresh");
   }
 
   /** 当前考试会话（视图读取） */
@@ -3410,19 +3893,22 @@ export default class KnowledgeGardenPlugin extends Plugin {
   }
 
   /** Phase 15：打开 AI 工作台（§二百七十二；mode=ask/research/project；initialText 预填） */
-  openWorkbenchView(mode?: "ask" | "research" | "project", initialText?: string): void {
+  async openWorkbenchView(mode?: "ask" | "research" | "project", initialText?: string): Promise<void> {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_WORKBENCH);
     if (leaves.length) {
       this.app.workspace.revealLeaf(leaves[0]);
       this.app.workspace.setActiveLeaf(leaves[0], { focus: true });
-      if (mode) (leaves[0].view as AIWorkbenchView).preset(mode, initialText ?? "");
+      if (mode) {
+        // Phase 25：DeferredView 未实例化时不调用 preset（View 打开时按自身状态初始化）
+        const view = await this.resolveView(leaves[0], isWorkbenchView, "workbench");
+        if (view) view.preset(mode, initialText ?? "");
+      }
       return;
     }
     const leaf = this.app.workspace.getLeaf("tab");
-    void leaf.setViewState({ type: VIEW_TYPE_AI_WORKBENCH, active: true }).then(() => {
-      const v = leaf.view;
-      if (v instanceof AIWorkbenchView && mode) v.preset(mode, initialText ?? "");
-    });
+    await leaf.setViewState({ type: VIEW_TYPE_AI_WORKBENCH, active: true });
+    const view = await this.resolveView(leaf, isWorkbenchView, "workbench-new");
+    if (view && mode) view.preset(mode, initialText ?? "");
     this.app.workspace.revealLeaf(leaf);
   }
 

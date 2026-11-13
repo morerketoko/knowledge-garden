@@ -836,6 +836,11 @@ class WritingAssistantModal extends Modal {
       // Phase 13 §十二/§一百零六：Workspace Instructions + Skill 自动加载（用户可关闭 Skill；§一百零六）
       const ws = this.wsId ? this.plugin.settings.workspaces.find((x) => x.id === this.wsId) : undefined;
       const wsInstr = workspaceInstructions(ws);
+      // Phase 25：Skill 正文改为按需加载（首次真正需要时扫描一次；失败回退内置并记录）
+      if (!isFast && typeof this.plugin.ensureSkillsReady === "function") {
+        try { await this.plugin.ensureSkillsReady("toolbox-writing"); }
+        catch (err) { console.error("[KnowledgeGarden][Toolbox] ensureSkillsReady failed（回退内置 Skill）", err); }
+      }
       const skillInstr = isFast ? "" : buildSkillInstructions(this.skills, this.plugin.settings.skillRegistry ?? [], (id) => this.plugin.readSkill(id));
       // Phase 13 §一百三十五：复杂任务 Plan Mode（只生成计划；确认后才执行；§七十二/一百三十六）
       let planInstr = "";

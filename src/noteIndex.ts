@@ -1,4 +1,4 @@
-import { App, TFile, TFolder, normalizePath, Notice } from "obsidian";
+import { App, TFile, TFolder, normalizePath } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
 import { atomicWriteJson, isolateCorruptFile } from "./migrations";
@@ -32,6 +32,43 @@ interface CandidateOptions {
   excludePaths?: Set<string>;
 }
 
+/** Phase 25：一次索引加载的可观测报告（Diagnostics 展示；不吞失败） */
+export interface IndexLoadReport {
+  totalFiles: number;
+  cacheHits: number;
+  rereadFiles: number;
+  newFiles: number;
+  skippedFiles: number;
+  failedFiles: number;
+  completed: boolean;
+  durationMs: number;
+}
+
+export interface IndexLoadProgress {
+  processed: number;
+  total: number;
+  cacheHits: number;
+  rereadFiles: number;
+  newFiles: number;
+  failedFiles: number;
+}
+
+/** Phase 25：索引加载期间发生的 Vault 事件（延迟合并处理，绝不丢用户改动） */
+export type PendingIndexEventType = "create" | "modify" | "delete" | "rename";
+
+export interface PendingIndexEvent {
+  path: string;
+  type: PendingIndexEventType;
+  /** rename 时的旧路径 */
+  oldPath?: string;
+  at: number;
+}
+
+/** 每批处理的文件数（32~64） */
+export const INDEX_BATCH_SIZE = 48;
+/** 每批内最大并发读取（8~16，绝不 Promise.all 全库） */
+export const INDEX_READ_CONCURRENCY = 8;
+
 const BACKLINK_RE = /\[\[([^\[\]#|]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/g;
 
 function stripMd(p: string): string {
@@ -44,6 +81,14 @@ function baseOf(p: string): string {
 function folderOf(p: string): string {
   const parts = p.replace(/\\/g, "/").split("/");
   return parts.length > 1 ? parts[0] : "";
+}
+
+/** 让出主线程（Obsidian 环境下 setTimeout(0) 足够；不依赖 Node Worker） */
+export function yieldToMainThread(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (typeof setTimeout === "function") setTimeout(resolve, 0);
+    else resolve();
+  });
 }
 
 function parseFrontmatter(content: string): Record<string, unknown> {
@@ -100,50 +145,155 @@ function titleFrom(fm: Record<string, unknown>, filePath: string): string {
   return baseOf(filePath);
 }
 
-/** 增量索引：首次全量扫描，之后跟随 vault 事件增量更新，并持久化缓存 */
+function emptyReport(): IndexLoadReport {
+  return { totalFiles: 0, cacheHits: 0, rereadFiles: 0, newFiles: 0, skippedFiles: 0, failedFiles: 0, completed: false, durationMs: 0 };
+}
+
+/**
+ * 增量索引（Phase 25 起改为分批异步加载）。
+ *
+ * 关键保证：
+ * - 缓存优先：index.json 里 path+size+mtime 全匹配的文件不重新读取正文。
+ * - 单次 vault.getMarkdownFiles() 拿候选列表（不再逐个 getAbstractFileByPath）。
+ * - 每批 INDEX_BATCH_SIZE 篇，批内并发 ≤ INDEX_READ_CONCURRENCY，批间 yield 主线程。
+ * - 原子替换：先构建 nextNotes，完整扫描成功后才替换 this.notes（绝不让半成品冒充完整索引）。
+ * - 加载期间的 create/modify/delete/rename 记入 pendingIndexEvents，加载完成后合并处理。
+ * - 单篇失败只计数不终止；failedFiles 会阻止破坏性 prune（见 isHealthy）。
+ */
 export class NoteIndex {
   /** Retrieval v3：文件新增/修改/删除计数器（参与 Ask cache key，文件变化 → cache miss） */
   revision = 0;
   private notes = new Map<string, NoteMetadata>();
   private cacheFile: string;
   private loaded = false;
+  private inflight: Promise<IndexLoadReport> | null = null;
+  private lastReport: IndexLoadReport = emptyReport();
+  private pending = new Map<string, PendingIndexEvent>();
+  private lastPendingAffected: string[] = [];
+  private saveTimer: number | null = null;
 
   constructor(private app: App, pluginDir: string) {
     this.cacheFile = path.join(pluginDir, "cache", "index.json");
   }
 
   get ready(): boolean { return this.loaded; }
+  get report(): IndexLoadReport { return { ...this.lastReport }; }
+  get pendingCount(): number { return this.pending.size; }
 
-  async load(): Promise<void> {
+  /**
+   * 加载索引（并发调用复用同一个 Promise）。
+   * 失败不伪装成功：completed=false 且抛出异常，已加载数据保持原状（下次可重试）。
+   */
+  async load(onProgress?: (p: IndexLoadProgress) => void): Promise<IndexLoadReport> {
+    if (this.loaded) return this.report;
+    if (this.inflight) return this.inflight;
+    this.inflight = this.loadInternal(onProgress).finally(() => { this.inflight = null; });
+    return this.inflight;
+  }
+
+  private async loadInternal(onProgress?: (p: IndexLoadProgress) => void): Promise<IndexLoadReport> {
+    const startedAt = Date.now();
+    const report = emptyReport();
+    let cacheDirty = false;
+    const next = new Map<string, NoteMetadata>();
+
+    // 1) 先读缓存（缺失/损坏 → 隔离坏文件后全量重建，绝不静默清空用户数据）
+    let cacheEntries: CacheEntry[] = [];
     try {
       if (fs.existsSync(this.cacheFile)) {
         const raw = fs.readFileSync(this.cacheFile, "utf8");
-        const entries = JSON.parse(raw) as CacheEntry[];
-        for (const e of entries) {
-          const file = this.app.vault.getAbstractFileByPath(normalizePath(e.path));
-          if (!(file instanceof TFile)) continue;
-          if (file.stat.size === e.size && file.stat.mtime === e.mtime) {
-            this.notes.set(e.path, { ...e, backlinks: [] } as NoteMetadata);
-          } else {
-            await this.readFile(file);
-          }
-        }
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) cacheEntries = parsed.filter((e): e is CacheEntry => !!e && typeof (e as CacheEntry).path === "string");
+        else throw new Error("index cache 结构异常");
       }
-    } catch {
-      // 缓存缺失/损坏 → 隔离损坏文件（保留可恢复副本）后直接全量扫描（index 可从 Vault 重建）
+    } catch (err) {
+      console.error("[KnowledgeGarden][Lazy] noteIndex cache unreadable, isolating", err);
       isolateCorruptFile(this.cacheFile);
+      cacheEntries = [];
+      cacheDirty = true;
     }
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      if (file.path.startsWith(".obsidian/")) continue;
-      if (!this.notes.has(file.path)) await this.readFile(file);
+    const cacheByPath = new Map(cacheEntries.map((e) => [e.path, e]));
+
+    // 2) 一次 getMarkdownFiles() 拿候选（过滤 .obsidian/）
+    const allFiles = this.app.vault.getMarkdownFiles();
+    const files = allFiles.filter((f) => !f.path.startsWith(".obsidian/"));
+    report.totalFiles = files.length;
+
+    const livePaths = new Set(files.map((f) => f.path));
+    for (const e of cacheEntries) {
+      if (!livePaths.has(e.path)) { report.skippedFiles++; cacheDirty = true; }
     }
-    this.rebuildBacklinks();
+
+    // 3) 逐文件对比缓存（只 stat，不读正文）
+    const toRead: { file: TFile; isNew: boolean }[] = [];
+    for (const file of files) {
+      const e = cacheByPath.get(file.path);
+      if (!e) { toRead.push({ file, isNew: true }); continue; }
+      if (e.size === file.stat.size && e.mtime === file.stat.mtime) {
+        next.set(file.path, { ...e, backlinks: [] } as NoteMetadata);
+        report.cacheHits++;
+      } else {
+        toRead.push({ file, isNew: false });
+      }
+    }
+
+    // 4) 分批读取（批内有限并发，批间 yield）
+    let processed = report.cacheHits;
+    for (let i = 0; i < toRead.length; i += INDEX_BATCH_SIZE) {
+      const batch = toRead.slice(i, i + INDEX_BATCH_SIZE);
+      await this.readBatch(batch, next, report);
+      processed = Math.min(report.totalFiles, processed + batch.length);
+      onProgress?.({
+        processed, total: report.totalFiles,
+        cacheHits: report.cacheHits, rereadFiles: report.rereadFiles,
+        newFiles: report.newFiles, failedFiles: report.failedFiles,
+      });
+      // 每批结束主动让出事件循环（不阻塞 Obsidian 交互）
+      await yieldToMainThread();
+    }
+
+    // 5) 全部成功扫描后才替换（原子一致性）
+    this.rebuildBacklinksOn(next);
+    this.notes = next;
     this.loaded = true;
     this.revision++;
-    await this.saveCache();
+    report.completed = report.failedFiles === 0;
+    report.durationMs = Date.now() - startedAt;
+    this.lastReport = { ...report };
+
+    // 6) 缓存无变化不写回；有新读/失败/删除才修复写回
+    if (cacheDirty || report.rereadFiles > 0 || report.newFiles > 0 || report.failedFiles > 0) {
+      await this.saveCache();
+    }
+
+    // 7) 处理加载期间积压的 Vault 事件（用户刚改的文件不会丢）
+    await this.applyPendingEvents();
+
+    return this.report;
   }
 
-  private async readFile(file: TFile): Promise<void> {
+  /** 批内有限并发：每批最多 INDEX_READ_CONCURRENCY 个 cachedRead 同时进行 */
+  private async readBatch(items: { file: TFile; isNew: boolean }[], target: Map<string, NoteMetadata>, report: IndexLoadReport): Promise<void> {
+    const queue = items.slice();
+    const workers: Promise<void>[] = [];
+    const workerCount = Math.min(INDEX_READ_CONCURRENCY, queue.length);
+    for (let w = 0; w < workerCount; w++) {
+      workers.push((async () => {
+        while (queue.length > 0) {
+          const item = queue.shift();
+          if (!item) break;
+          const meta = await this.buildMetadata(item.file);
+          if (!meta) { report.failedFiles++; continue; }
+          target.set(meta.path, meta);
+          if (item.isNew) report.newFiles++; else report.rereadFiles++;
+        }
+      })());
+    }
+    await Promise.all(workers);
+  }
+
+  /** 读取单个文件 → NoteMetadata（失败返回 null，由调用方计数，不静默） */
+  private async buildMetadata(file: TFile): Promise<NoteMetadata | null> {
     try {
       const content = await this.app.vault.cachedRead(file);
       const fm = parseFrontmatter(content);
@@ -151,7 +301,7 @@ export class NoteIndex {
         ? (content.indexOf("\n---", 3) >= 0 ? content.slice(content.indexOf("\n---", 3) + 4) : content)
         : content;
       const wordCount = body.trim() ? body.trim().split(/\s+/).filter(Boolean).length : 0;
-      this.notes.set(file.path, {
+      return {
         path: file.path,
         title: titleFrom(fm, file.path),
         folder: folderOf(file.path),
@@ -162,21 +312,22 @@ export class NoteIndex {
         modified: file.stat.mtime || Date.now(),
         size: file.stat.size || 0,
         wordCount,
-      });
-    } catch {
-      // 单文件读取失败不阻断索引
+      };
+    } catch (err) {
+      console.warn("[KnowledgeGarden][Lazy] noteIndex read failed path=" + file.path, err);
+      return null;
     }
   }
 
-  private rebuildBacklinks(): void {
+  private rebuildBacklinksOn(map: Map<string, NoteMetadata>): void {
     const inverted = new Map<string, string[]>();
-    for (const n of this.notes.values()) {
+    for (const n of map.values()) {
       for (const link of n.links) {
         if (!inverted.has(link)) inverted.set(link, []);
         inverted.get(link)!.push(n.path);
       }
     }
-    for (const n of this.notes.values()) {
+    for (const n of map.values()) {
       const hits = new Set<string>();
       for (const name of [baseOf(n.path), n.path]) {
         for (const src of inverted.get(name) ?? []) hits.add(src);
@@ -185,37 +336,192 @@ export class NoteIndex {
     }
   }
 
-  /** 更新单个文件（modify/create 事件） */
-  async updateFile(file: TFile): Promise<void> {
-    if (!this.loaded || file.path.startsWith(".obsidian/")) return;
-    const wasNew = !this.notes.has(file.path);
-    await this.readFile(file);
-    this.rebuildBacklinks();
-    this.revision++;
-    if (wasNew) await this.saveCache();
+  private rebuildBacklinks(): void {
+    this.rebuildBacklinksOn(this.notes);
   }
 
-  /** 删除（事件） */
+  /* ---------------- Phase 25：加载期间的 Vault 事件 ---------------- */
+
+  /** 记录最新事件（同一路径多次变化只保留最终状态，避免重复读取） */
+  private recordPending(ev: PendingIndexEvent): void {
+    const prev = this.pending.get(ev.path);
+    if (prev && prev.type === "delete" && (ev.type === "create" || ev.type === "modify")) {
+      // 删除后又出现 → 最终状态是“存在”
+      this.pending.set(ev.path, { path: ev.path, type: "create", at: ev.at });
+      return;
+    }
+    if (ev.type === "delete") {
+      this.pending.set(ev.path, { path: ev.path, type: "delete", at: ev.at });
+      return;
+    }
+    if (ev.type === "rename") {
+      this.pending.set(ev.path, { path: ev.path, type: "rename", oldPath: ev.oldPath, at: ev.at });
+      return;
+    }
+    // create/modify 合并：已存在 create 保留 create
+    const type: PendingIndexEventType = prev?.type === "create" ? "create" : ev.type;
+    this.pending.set(ev.path, { path: ev.path, type, at: ev.at });
+  }
+
+  /** 加载完成后按最终状态处理积压事件；返回受影响路径（供 SearchIndex 增量同步） */
+  async applyPendingEvents(): Promise<string[]> {
+    if (!this.loaded || this.pending.size === 0) {
+      this.lastPendingAffected = [];
+      return [];
+    }
+    const events = Array.from(this.pending.values()).sort((a, b) => a.at - b.at);
+    this.pending.clear();
+    const affected = new Set<string>();
+
+    for (const ev of events) {
+      try {
+        if (ev.type === "delete") {
+          this.notes.delete(ev.path);
+          affected.add(ev.path);
+          for (const n of this.notes.values()) n.backlinks = n.backlinks.filter((b) => b !== ev.path);
+          continue;
+        }
+        if (ev.type === "rename") {
+          const oldPath = ev.oldPath ?? "";
+          if (oldPath) {
+            const oldMeta = this.notes.get(oldPath);
+            this.notes.delete(oldPath);
+            affected.add(oldPath);
+            const file = this.app.vault.getAbstractFileByPath(normalizePath(ev.path));
+            if (file instanceof TFile) {
+              const meta = await this.buildMetadata(file);
+              if (meta) this.notes.set(meta.path, meta);
+            } else if (oldMeta) {
+              this.notes.set(ev.path, { ...oldMeta, path: ev.path });
+            }
+            affected.add(ev.path);
+          }
+          continue;
+        }
+        const file = this.app.vault.getAbstractFileByPath(normalizePath(ev.path));
+        if (file instanceof TFile) {
+          const meta = await this.buildMetadata(file);
+          if (meta) { this.notes.set(meta.path, meta); affected.add(meta.path); }
+        } else {
+          // 已经消失（合并后又被删除）
+          this.notes.delete(ev.path);
+          affected.add(ev.path);
+        }
+      } catch (err) {
+        console.error("[KnowledgeGarden][Lazy] noteIndex applyPending failed path=" + ev.path, err);
+      }
+    }
+
+    this.rebuildBacklinks();
+    this.revision++;
+    this.lastPendingAffected = Array.from(affected);
+    if (affected.size > 0) await this.saveCache();
+    return this.lastPendingAffected;
+  }
+
+  /** 取走最近一次 applyPendingEvents 的受影响路径 */
+  takePendingAffected(): string[] {
+    const out = this.lastPendingAffected;
+    this.lastPendingAffected = [];
+    return out;
+  }
+
+  /** 更新单个文件（modify/create 事件）：索引未就绪时只记录事件，不做破坏性动作 */
+  async updateFile(file: TFile): Promise<void> {
+    if (file.path.startsWith(".obsidian/")) return;
+    if (!this.loaded) {
+      this.recordPending({ path: file.path, type: "modify", at: Date.now() });
+      return;
+    }
+    const wasNew = !this.notes.has(file.path);
+    const meta = await this.buildMetadata(file);
+    if (!meta) return;    // 单文件失败：保留旧 metadata，不删除
+    this.notes.set(meta.path, meta);
+    this.rebuildBacklinks();
+    this.revision++;
+    if (wasNew) this.scheduleSaveCache();
+  }
+
+  /** 删除（事件）：索引未就绪时只记录，绝不触发全库 prune */
   removeFile(filePath: string): void {
-    if (!this.loaded) return;
+    if (!this.loaded) {
+      this.recordPending({ path: filePath, type: "delete", at: Date.now() });
+      return;
+    }
+    if (!this.notes.has(filePath)) return;
     this.notes.delete(filePath);
     this.revision++;
     for (const n of this.notes.values()) {
       n.backlinks = n.backlinks.filter((b) => b !== filePath);
     }
-    void this.saveCache();
+    this.scheduleSaveCache();
   }
 
-  async rescanAll(): Promise<void> {
-    this.notes.clear();
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      if (file.path.startsWith(".obsidian/")) continue;
-      await this.readFile(file);
+  /** 重命名（事件）：索引未就绪时记录 pending，就绪时先移除旧路径再读新文件 */
+  async renameFile(oldPath: string, file: TFile): Promise<void> {
+    if (!this.loaded) {
+      this.recordPending({ path: file.path, type: "rename", oldPath, at: Date.now() });
+      return;
     }
+    this.notes.delete(oldPath);
+    for (const n of this.notes.values()) n.backlinks = n.backlinks.filter((b) => b !== oldPath);
+    const meta = await this.buildMetadata(file);
+    if (meta) this.notes.set(meta.path, meta);
     this.rebuildBacklinks();
-    this.loaded = true;
     this.revision++;
-    await this.saveCache();
+    this.scheduleSaveCache();
+  }
+
+  /** 全量重建（手动命令）：同样分批 + yield，绝不一次性同步读全库 */
+  async rescanAll(onProgress?: (p: IndexLoadProgress) => void): Promise<IndexLoadReport> {
+    this.loaded = false;
+    this.notes.clear();
+    this.lastReport = emptyReport();
+    try {
+      if (fs.existsSync(this.cacheFile)) fs.rmSync(this.cacheFile, { force: true });
+    } catch { /* 缓存删不掉也要继续重建 */ }
+    return this.load(onProgress);
+  }
+
+  /* ---------------- 健康判定（破坏性 prune 的前置条件） ---------------- */
+
+  /**
+   * 索引是否健康到可以执行破坏性清理：
+   * - 已加载且本次加载 completed
+   * - 失败文件数为 0
+   * - 索引数量 ≥ max(1, floor(vaultMarkdownCount * 0.95))
+   */
+  isHealthy(vaultMarkdownCount: number): boolean {
+    if (!this.loaded) return false;
+    if (this.lastReport.completed !== true) return false;
+    if (this.lastReport.failedFiles > 0) return false;
+    const indexed = this.notes.size;
+    const floor = Math.max(1, Math.floor(vaultMarkdownCount * 0.95));
+    return indexed >= floor;
+  }
+
+  /** 不健康的原因（Diagnostics 展示；健康 → null） */
+  unhealthyReason(vaultMarkdownCount: number): string | null {
+    if (!this.loaded) return "索引尚未加载完成";
+    if (this.lastReport.completed !== true) return "上次索引加载未完整完成（failedFiles=" + this.lastReport.failedFiles + "）";
+    if (this.lastReport.failedFiles > 0) return "有 " + this.lastReport.failedFiles + " 篇读取失败";
+    const indexed = this.notes.size;
+    const floor = Math.max(1, Math.floor(vaultMarkdownCount * 0.95));
+    if (indexed < floor) return "索引数量不足（" + indexed + " / 至少 " + floor + "）";
+    return null;
+  }
+
+  /* ---------------- 缓存写回 ---------------- */
+
+  /** 事件驱动的写回做 2s 防抖，避免连续改文件时反复序列化 4600 条缓存 */
+  private scheduleSaveCache(): void {
+    if (this.saveTimer !== null) return;
+    const w = globalThis as unknown as { setTimeout?: (cb: () => void, ms: number) => number };
+    if (typeof w.setTimeout !== "function") { void this.saveCache(); return; }
+    this.saveTimer = w.setTimeout(() => {
+      this.saveTimer = null;
+      void this.saveCache();
+    }, 2000);
   }
 
   async saveCache(): Promise<void> {
@@ -223,9 +529,12 @@ export class NoteIndex {
       const dir = path.dirname(this.cacheFile);
       fs.mkdirSync(dir, { recursive: true });
       const entries: CacheEntry[] = [];
+      // 一次 getMarkdownFiles() 建 stat 表（避免每条 getAbstractFileByPath）
+      const stats = new Map<string, TFile>();
+      for (const f of this.app.vault.getMarkdownFiles()) stats.set(f.path, f);
       for (const n of this.notes.values()) {
-        const file = this.app.vault.getAbstractFileByPath(normalizePath(n.path));
-        if (!(file instanceof TFile)) continue;
+        const file = stats.get(n.path);
+        if (!file) continue;
         entries.push({
           path: n.path, title: n.title, folder: n.folder,
           tags: n.tags, links: n.links,
@@ -235,7 +544,7 @@ export class NoteIndex {
       }
       atomicWriteJson(this.cacheFile, entries);
     } catch (err) {
-      console.error("kg: 索引缓存写入失败", err);
+      console.error("[KnowledgeGarden] 索引缓存写入失败", err);
     }
   }
 

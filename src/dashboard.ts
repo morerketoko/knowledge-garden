@@ -42,20 +42,22 @@ export class DashboardView extends ItemView {
   /** Query Explorer：范围下拉当前选择（仅记住用户本次选择，不持久化到设置；§六十七） */
   private queryScopeMode: QueryScopeMode = "vault";
 
+  /** Phase 25：索引准备失败原因（View 内展示可重试错误，不假装成功） */
+  private loadError: string | null = null;
+  /** 是否已完成首帧渲染（日志/诊断用） */
+  private firstRendered = false;
+  private firstRenderStartedAt = 0;
+
   async onOpen(): Promise<void> {
     this.closed = false;
     this.containerEl.empty();
     this.containerEl.addClass("kg-dashboard");
     this.inner = this.containerEl.createDiv({ cls: "kg-inner" });
-    // Hero / Music 生命周期由 Component 管理（addChild → 卸载时自动 onunload）
-    if (!this.hero) {
-      this.hero = new HeroWall(this.plugin, this.inner);
-      this.addChild(this.hero);
-    }
-    if (!this.music) {
-      this.music = new MusicPlayer(this.plugin, this.inner);
-      this.addChild(this.music);
-    }
+    // Phase 25：onOpen 只建轻量容器 + loading 占位。
+    // HeroWall / MusicPlayer 不再无条件创建（showHero=false 时根本不创建，避免打开即扫描壁纸/音频）；
+    // 完整渲染 / 全库统计 / 知识图全部等到「索引按需就绪 + 浏览器空闲」之后。
+    this.showLoading("正在准备知识花园…");
+    console.log("[KnowledgeGarden][View] dashboard onOpen");
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof TFile && file.extension === "md") this.scheduleRender();
     }));
@@ -65,14 +67,43 @@ export class DashboardView extends ItemView {
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (file instanceof TFile) this.scheduleRender();
     }));
-    // 启动期被 workspace 恢复的标签页：先渲染占位，等布局就绪且浏览器空闲后再做首帧渲染，
-    // 避免 Dashboard（壁纸扫描 + 统计 + 知识图）与 Obsidian 启动抢主线程，拖慢整个启动。
-    if (this.app.workspace.layoutReady) {
-      this.render();
-    } else {
-      this.inner.createDiv({ cls: "kg-loading", text: "知识花园将在启动完成后加载…" });
-      this.app.workspace.onLayoutReady(() => { if (!this.closed) this.renderWhenIdle(); });
+    // 关键：无论 layout 是否 ready，都不在 onOpen 同步渲染（layoutReady=true 时同样延迟到 idle）
+    void this.bootstrap();
+  }
+
+  /** 按需准备索引 → 空闲首帧渲染（失败展示重试条，绝不把空索引当成“没有知识”） */
+  private async bootstrap(): Promise<void> {
+    if (this.closed) return;
+    this.showLoading("正在准备知识索引…");
+    try {
+      await this.plugin.ensureIndexReady("dashboard");
+      this.loadError = null;
+    } catch (err) {
+      this.loadError = (err as Error)?.message ?? String(err);
+      console.error("[KnowledgeGarden][View] dashboard index not ready", err);
+      if (!this.closed && this.containerEl.isConnected) this.renderLoadError();
+      return;
     }
+    if (this.closed || !this.containerEl.isConnected) return;
+    this.renderWhenIdle();
+  }
+
+  /** 轻量 loading 占位（不创建 Hero/Music/Graph，不跑统计） */
+  private showLoading(text: string): void {
+    if (!this.inner) return;
+    this.inner.empty();
+    this.inner.createDiv({ cls: "kg-loading", text });
+  }
+
+  private renderLoadError(): void {
+    if (!this.inner) return;
+    this.inner.empty();
+    const box = this.inner.createDiv({ cls: "kg-error" });
+    box.createDiv({ text: "知识索引尚未就绪" });
+    box.createDiv({ cls: "kg-error-detail", text: this.loadError ?? "未知错误" });
+    box.createDiv({ cls: "kg-error-note", text: "已保留现有缓存与数据；可重试准备索引（不会清空任何数据）。" });
+    const retry = box.createEl("button", { cls: "kg-btn kg-btn-primary", text: "重试准备索引" });
+    retry.addEventListener("click", () => { void this.plugin.ensureIndexReady("dashboard", { retry: true }).then(() => this.bootstrap()).catch(() => { /* 错误已在 bootstrap 内展示 */ }); });
   }
 
   /** 首帧渲染延后到浏览器空闲时段（不支持 requestIdleCallback 时退化为短延时） */
@@ -106,6 +137,16 @@ export class DashboardView extends ItemView {
   }
 
   render(): void {
+    // Phase 25：三重守卫——View 已关闭 / 容器脱离文档 / 索引未就绪，都不做整页渲染
+    if (this.closed || !this.containerEl.isConnected || !this.inner) {
+      console.log("[KnowledgeGarden][View] dashboard render skipped（closed / detached）");
+      return;
+    }
+    if (!this.plugin.indexReady) {
+      this.showLoading("正在准备知识索引…");
+      return;
+    }
+    const t0 = Date.now();
     if (this.graph) { this.graph.destroy(); this.graph = null; }
     const inner = this.inner;
     inner.empty();
@@ -116,11 +157,29 @@ export class DashboardView extends ItemView {
     const header = inner.createDiv({ cls: "kg-header" });
     const refreshBtn = header.createEl("button", { cls: "kg-btn kg-btn-icon", attr: { title: "刷新", "aria-label": "刷新 Dashboard" } });
     setIcon(refreshBtn, "refresh-cw");
-    refreshBtn.addEventListener("click", () => { void this.plugin.index.rescanAll(); this.render(); });
+    refreshBtn.addEventListener("click", () => {
+      // Phase 25：rescanAll 已异步分批；完成后才重绘
+      void this.plugin.index.rescanAll()
+        .then(() => { this.plugin.invalidateSearchIndex?.(); if (!this.closed && this.containerEl.isConnected) this.render(); })
+        .catch((err) => console.error("[KnowledgeGarden][View] dashboard rescan failed", err));
+    });
 
     // ---- 1. Hero（+ 下方音乐播放器，§25 / §15/19）----
-    if (s.dashboard.showHero && this.hero) this.hero.render();
-    if (s.dashboard.showMusic && this.music) this.music.render();
+    // Phase 25：只有功能开启时才创建组件（隐藏时不创建、不扫描壁纸/音频）
+    if (s.dashboard.showHero) {
+      if (!this.hero) {
+        this.hero = new HeroWall(this.plugin, inner);
+        this.addChild(this.hero);
+      }
+      this.hero.render();
+    }
+    if (s.dashboard.showMusic) {
+      if (!this.music) {
+        this.music = new MusicPlayer(this.plugin, inner);
+        this.addChild(this.music);
+      }
+      this.music.render();
+    }
 
     // ---- 2. 今日状态（§26：大数字卡片，视觉重点；本地规则推导，AI 不参与判定） ----
 
@@ -618,8 +677,10 @@ export class DashboardView extends ItemView {
       retry.addEventListener("click", () => { this.plugin.connectionError = null; this.render(); void this.generateConnections(retry, true); });
     }
     const box = expSection.createDiv({ cls: "kg-graph-box" });
-    const layout = computeGraphLayout(model, box.clientWidth || 760, box.clientHeight || 380);
-    this.graph = new GraphSvg(box, model, layout, { onOpenNote: (p) => this.openNote(p) });
+    this.mountGraphWhenVisible(box, () => {
+      const layout = computeGraphLayout(model, box.clientWidth || 760, box.clientHeight || 380);
+      return new GraphSvg(box, model, layout, { onOpenNote: (p) => this.openNote(p) });
+    });
     const toolbar = expSection.createDiv({ cls: "kg-graph-toolbar" });
     const zoom = toolbar.createDiv({ cls: "kg-graph-zoom" });
     const plus = zoom.createEl("button", { cls: "kg-btn kg-btn-icon", text: "+", attr: { title: "放大", "aria-label": "放大" } });
@@ -648,7 +709,43 @@ export class DashboardView extends ItemView {
       row.createSpan({ cls: "kg-note-meta", text: e.relation + (e.reason ? " · " + e.reason : "") });
       row.addEventListener("click", () => this.openNote(from.path));
     }
-  }  /** Query Explorer 区块（§六十八/七十二/一百二十三）：输入 + 范围 + 最近探索 + 两阶段状态 + 结果图/观察。
+  }  /**
+   * Phase 25：知识图按需挂载——滚动到可视区域或用户点击「展开知识图」时才创建 SVG。
+   * 折叠状态下不计算布局、不建 DOM/SVG（大幅降低首次渲染与刷新成本）。
+   */
+  private mountGraphWhenVisible(box: HTMLElement, build: () => GraphSvg | null): void {
+    let built = false;
+    const placeholder = box.createDiv({ cls: "kg-loading", text: "知识图已折叠（滚动到此处或点击「展开知识图」）" });
+    const btn = box.createEl("button", { cls: "kg-btn kg-btn-sm", text: "展开知识图" });
+    let observer: IntersectionObserver | null = null;
+    const cleanup = (): void => {
+      try { observer?.disconnect(); } catch { /* 忽略 */ }
+      observer = null;
+    };
+    this.register(cleanup);
+    const run = (): void => {
+      if (built || this.closed || !this.containerEl.isConnected) return;
+      built = true;
+      cleanup();
+      if (placeholder.isConnected) placeholder.remove();
+      if (btn.isConnected) btn.remove();
+      try {
+        const g = build();
+        if (g) this.graph = g;
+      } catch (err) {
+        console.error("[KnowledgeGarden][View] graph build failed", err);
+        box.createDiv({ cls: "kg-error-detail", text: "知识图加载失败：" + ((err as Error)?.message ?? String(err)) });
+      }
+    };
+    btn.addEventListener("click", (e) => { e.preventDefault(); run(); });
+    const w = window as unknown as { IntersectionObserver?: typeof IntersectionObserver };
+    if (typeof w.IntersectionObserver === "function") {
+      observer = new w.IntersectionObserver((entries) => { if (entries.some((en) => en.isIntersecting)) run(); }, { threshold: 0.1 });
+      observer.observe(box);
+    }
+  }
+
+  /** Query Explorer 区块（§六十八/七十二/一百二十三）：输入 + 范围 + 最近探索 + 两阶段状态 + 结果图/观察。
    *  结果图复用现有 GraphSvg（§四十二：不复制 GraphModel/SVG 一套）；点击 Query 中心节点 → 重新运行查询。
    *  打开 Dashboard 只读状态，绝不自动请求 AI（§五十/五十六）。 */
   private renderQueryExplorer(section: HTMLElement): void {
@@ -729,12 +826,14 @@ export class DashboardView extends ItemView {
       this.plugin.decorateGraphEdges(model);
 
       const box = section.createDiv({ cls: "kg-graph-box" });
-      const layout = computeGraphLayout(model, box.clientWidth || 760, box.clientHeight || 380);
-      this.graph = new GraphSvg(box, model, layout, {
-        onOpenNote: (p) => {
-          if (p === QUERY_NODE_PATH) { runQuery(); return; }
-          this.openNote(p);
-        },
+      this.mountGraphWhenVisible(box, () => {
+        const layout = computeGraphLayout(model, box.clientWidth || 760, box.clientHeight || 380);
+        return new GraphSvg(box, model, layout, {
+          onOpenNote: (p) => {
+            if (p === QUERY_NODE_PATH) { runQuery(); return; }
+            this.openNote(p);
+          },
+        });
       });
       const toolbar = section.createDiv({ cls: "kg-graph-toolbar" });
       const zoom = toolbar.createDiv({ cls: "kg-graph-zoom" });
@@ -771,6 +870,17 @@ export class DashboardView extends ItemView {
   /** 本地检索命中的笔记列表（AI 失败/弱相关时展示，§六十六：明确“本地找到”） */
   private renderQueryLocalList(section: HTMLElement, st: { rawQuery: string; scopeMode: QueryScopeMode; localCount: number }): void {
     const plugin = this.plugin;
+    // Phase 25：检索索引按需构建；未就绪时显示准备中，绝不展示“没有找到笔记”
+    if (!plugin.searchIndexReady) {
+      section.createDiv({ cls: "kg-query-state", text: "正在准备知识检索索引… " + (plugin.searchIndexProgressText || "") });
+      const prep = section.createEl("button", { cls: "kg-btn kg-btn-sm", text: "立即准备检索索引" });
+      prep.addEventListener("click", () => {
+        void plugin.ensureSearchIndexReady("dashboard-local-list")
+          .then(() => { if (!this.closed && this.containerEl.isConnected) this.render(); })
+          .catch((err) => console.error("[KnowledgeGarden][View] searchIndex not ready", err));
+      });
+      return;
+    }
     const parsed = parseQuery(st.rawQuery);
     const allNotes = plugin.index.all();
     const notesById = new Map(allNotes.map((n) => [n.path, n]));

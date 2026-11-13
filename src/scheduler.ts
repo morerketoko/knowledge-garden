@@ -31,6 +31,8 @@ export interface SchedulerHost {
   ai: AIService;
   runReview(period: Period, force: boolean, periodKeyOverride?: string): Promise<SchedulerReviewResult | null>;
   rerenderDashboard(): void;
+  /** Phase 25：到期任务执行前按需准备全库索引（未到期时绝不加载） */
+  ensureIndexReady?(reason: string): Promise<void>;
 }
 
 /** 任意周期配置的公共形态（用于统一读取） */
@@ -401,6 +403,22 @@ export class ReviewScheduler {
     const cur = this.store.get(period, periodKey);
     if (cur && (cur.status === "done" || cur.status === "skipped")) return;
     const now = Date.now();
+
+    // Phase 25：只有「确实到期」才会走到这里 → 此刻才按需加载全库索引；
+    // 用到期为条件避免了启动即全库扫描，同时不丢失任何到期复盘。
+    if (typeof this.host.ensureIndexReady === "function") {
+      try {
+        await this.host.ensureIndexReady("scheduler:" + period);
+      } catch (err) {
+        console.error("[KnowledgeGarden][Scheduler] ensureIndexReady failed period=" + period, err);
+        // 索引没准备好 → 绝不静默跳过这个到期任务：按重试策略记录，索引可重试后再执行
+        this.maybeRetry(period, periodKey, rec, (rec.attempts ?? 0) + 1, {
+          code: "INDEX_NOT_READY",
+          message: "知识索引准备失败：" + ((err as Error)?.message ?? String(err)),
+        }, true);
+        return;
+      }
+    }
 
     // §25：缓存预检（只算指纹元数据，不读笔记内容）
     const meta = this.host.reviews.prepareCacheMeta(period, periodKey);

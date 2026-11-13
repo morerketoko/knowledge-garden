@@ -107,6 +107,38 @@ Knowledge Garden 的做法不同。它把知识的**发现 → 确认 → 连接
 
 ---
 
+## 四之二、启动性能与按需加载（Phase 25）
+
+这一版的目标是**不牺牲任何功能，只把重型初始化从「启动时」挪到「你真正需要时」**。
+
+### Startup performance（启动性能）
+
+- `onload` 只做必要工作：读设置、建 Store、注册 View / 命令 / 事件 / Ribbon / 设置页。
+- **不再**在启动阶段读全库 Markdown、不再构建全库检索索引、不再预读 Skills、不再扫关系目录、不再自动建 Capture 目录、不再立刻算周快照。
+- 启动阶段每个步骤都会打耗时日志（控制台搜索 `[KnowledgeGarden][Startup]`），诊断面板可看完整耗时表。
+
+### Lazy indexing（按需索引）
+
+- 索引在**第一次真正需要它**的功能被打开时才加载（Dashboard / 搜索 / 复盘 / Workbench / 状态浏览 / 关系确认…），并能看到进度提示。
+- 加载是**分批 + 有限并发**的（每批 48 篇、批内 8 个读取、批间让出主线程），不会长时间卡住 Obsidian 界面。
+- 缓存优先：`cache/index.json` 里 `path + size + mtime` 全匹配的文件**不重新读正文**。
+- 加载期间你新建 / 修改 / 删除 / 改名的笔记会进入队列，加载完成后合并处理，**不会丢改动**。
+- 单篇读取失败只计数，不中断全库；失败文件数会阻止一切破坏性清理。
+
+### Dashboard on demand（Dashboard 按需渲染）
+
+- Dashboard 打开时先显示轻量占位，等索引就绪 + 浏览器空闲才做首帧渲染。
+- 壁纸（Hero）与音乐播放器只在对应开关开启时才创建；隐藏时不扫描壁纸/音频。
+- 知识图默认折叠，滚动到该区域或点击「展开知识图」才创建 SVG。
+- 关闭的 Dashboard 不会被延迟回调重新渲染。
+
+### Deferred View compatibility（延迟视图兼容）
+
+- Obsidian 1.7.2+ 的隐藏标签页可能是延迟实例化的 View。本插件所有 `getLeavesOfType` 之后的刷新/传参都先 `loadIfDeferred()` + `instanceof` 校验，拿不到具体 View 就跳过（View 真正打开时自己读最新状态）。
+- 不提高 `minAppVersion`，旧版本 Obsidian 走原路径。
+
+---
+
 ## 五、核心功能使用说明书
 
 ### 5.1 今日知识奇想（AI 发问）

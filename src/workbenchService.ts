@@ -166,13 +166,32 @@ export class WorkbenchService {
     return fallbackSearch(query, paths, limit, folder);
   }
 
-  /** Index Ready Guard（Retrieval v3）：SearchIndex 构建中最多等 1500ms；exact path/folder 由调用方跳过等待 */
+  /** Index Ready Guard（Retrieval v3 / Phase 25）：按需准备 NoteIndex + SearchIndex（并发复用同一 Promise）
+   *  - 绝不返回空检索结果冒充“没有找到笔记”：未就绪时等待初始化完成再检索。 */
   private async waitForIndexReady(): Promise<void> {
+    try {
+      if (typeof this.plugin.ensureSearchIndexReady === "function") {
+        await this.plugin.ensureSearchIndexReady("workbench-search");
+        return;
+      }
+    } catch (err) {
+      console.error("[KnowledgeGarden][Workbench] ensureSearchIndexReady failed", err);
+    }
+    // 兜底：老路径（插件未提供 ensure 时）仍做有限等待
     const idx = this.plugin.searchIndex;
     if (!idx || typeof idx.ready !== "function" || idx.ready()) return;
     const deadline = Date.now() + 1500;
     while (!idx.ready() && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /** Phase 25：Skills 正文按需加载（首轮只扫描一次；失败回退内置 Skill 并记录原因） */
+  private async ensureSkills(reason: string): Promise<void> {
+    try {
+      if (typeof this.plugin.ensureSkillsReady === "function") await this.plugin.ensureSkillsReady(reason);
+    } catch (err) {
+      console.error("[KnowledgeGarden][Workbench] ensureSkillsReady failed（回退内置 Skill）", err);
     }
   }
 
@@ -291,6 +310,9 @@ export class WorkbenchService {
   /* ================= Ask（§十一~十九） ================= */
 
   async ask(question: string, opts?: WorkbenchAskOptions): Promise<WorkbenchAskResult> {
+    // Phase 25：Ask 依赖全库索引/检索索引/Skills → 首次使用时按需准备（不阻塞 Obsidian 启动）
+    await this.waitForIndexReady();
+    await this.ensureSkills("workbench-ask");
     // Phase 16 §33-38：Knowledge Agent——本地分类（不先调 AI）→ 检索 → 阅读 → 证据 → 综合 → 校验
     const complexity = classifyTaskComplexity(question);
     const budget = contextBudgetFor(complexity);
@@ -523,6 +545,9 @@ export class WorkbenchService {
 
   /** 第一步：生成研究计划（不搜索、不执行，§二十一/二十二） */
   async makeResearchPlan(question: string): Promise<WorkbenchResearchResult> {
+    // Phase 25：研究计划同样需要检索索引 + Skills
+    await this.waitForIndexReady();
+    await this.ensureSkills("workbench-research-plan");
     const enableWeb = this.enableWeb();
     const vaultCtx = this.vaultSearch(question, 10)
       .map((h) => h.path + " | " + h.snippet)
@@ -661,6 +686,9 @@ export class WorkbenchService {
 
   /** 生成项目定义（§三十一：先出定义 → Preview → 用户确认 → 建目录） */
   async makeProjectDefinition(topic: string): Promise<WorkbenchProjectFormResult> {
+    // Phase 25：项目定义同样需要检索索引 + Skills
+    await this.waitForIndexReady();
+    await this.ensureSkills("workbench-project");
     const vaultCtx = this.vaultSearch(topic, 8)
       .map((h) => h.path + " | " + h.snippet)
       .join("\n");
